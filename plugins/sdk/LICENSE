@@ -1,0 +1,19 @@
+7-Zip plugin SDK headers (vendored)
+====================================
+
+Copyright (c) 1999-2025 Igor Pavlov.
+
+The files in this directory tree are an unmodified subset of the 7-Zip
+source distribution, as needed to compile a third-party codec plugin
+DLL. They are vendored here verbatim so that this monorepo can build
+without a separate 7-Zip checkout.
+
+Per `7-Zip/License.txt`, these files are licensed under:
+
+  - The "GNU LGPL" (version 2.1 or later) as the main license.
+  - The "BSD 2-Clause License" or "BSD 3-Clause License" for some files.
+
+The wrapper code in `plugins/<name>/` that uses these headers can pick
+its own compatible license; see each plugin's own LICENSE.
+
+Source: https://www.7-zip.org/   (the 7zip/CPP and 7zip/C trees)
