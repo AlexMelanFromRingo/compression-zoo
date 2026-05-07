@@ -30,3 +30,8 @@ Thumbs.db
 # Vendored upstream sources extracted at build time
 plugins/*/upstream-build/
 third_party/build/
+
+# Plugin build outputs and tests
+plugins/*/build/
+plugins/*/tests/test_zpaq.exe
+plugins/*/tests/test_linux
