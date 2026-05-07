@@ -1,0 +1,16 @@
+[package]
+name = "sevenz-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Memory-safe Rust port of the 7-Zip / LZMA SDK algorithms"
+license = "Public-Domain"
+
+[lib]
+name = "sevenz"
+path = "src/lib.rs"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"

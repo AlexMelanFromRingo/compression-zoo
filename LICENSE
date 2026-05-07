@@ -1,0 +1,45 @@
+compression-zoo — license overview
+==================================
+
+This repository aggregates code under several upstream licenses. The
+"project glue" — top-level build scripts, this file, the root README,
+docs, and other untargeted helper files — is licensed as MIT (text
+below). Subdirectories carry their own LICENSE file; that file governs
+everything in the subdirectory and overrides this top-level notice.
+
+Per-component licenses
+----------------------
+
+  plugins/sdk/         LGPL-2.1+ / BSD-3-Clause (vendored from 7-Zip,
+                       Igor Pavlov; see plugins/sdk/LICENSE)
+  plugins/zpaq/        MIT for our wrapper code; the bundled libzpaq is
+                       public domain (Matt Mahoney). See plugins/zpaq/LICENSE.
+  plugins/bsc/         Apache-2.0 (Ilya Grebnov, libbsc). See plugins/bsc/LICENSE.
+  plugins/cmix/        GPL-3.0-or-later (Byron Knoll, CMIX). See plugins/cmix/LICENSE.
+  rust/sevenz-rs/      LGPL-2.1+ for files that derive from 7-Zip core,
+                       public domain for files that derive from the LZMA SDK
+                       only. See rust/sevenz-rs/LICENSE.
+
+
+MIT License (top-level glue)
+----------------------------
+
+Copyright (c) 2026 the compression-zoo authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.

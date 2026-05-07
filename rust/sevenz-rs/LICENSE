@@ -1,0 +1,44 @@
+sevenz-rs — memory-safe Rust port of the 7-Zip / LZMA SDK algorithms.
+
+This crate is a derivative work of the C reference implementations
+shipped in the 7-Zip source distribution by Igor Pavlov. The upstream
+licensing is, per `7-Zip/License.txt`:
+
+  - GNU LGPL (version 2.1 or later) for most of the 7-Zip codebase.
+  - BSD 2-Clause / BSD 3-Clause for some files.
+  - Public domain for files that originate in the LZMA SDK only
+    (the LZMA encoder/decoder, the BCJ family, the SHA / CRC tables,
+    the PPMd codecs).
+
+We mirror that structure:
+
+  - Files in this crate that are direct ports of LZMA-SDK code are
+    public domain.
+  - All other Rust files (the crate-level glue, tests, binaries,
+    cross-check harnesses) are licensed under the GNU LGPL, version
+    2.1 or, at your option, any later version.
+
+When in doubt, treat the crate as LGPL-2.1+.
+
+GNU LGPL v2.1
+=============
+
+This library is free software; you can redistribute it and/or modify it
+under the terms of the GNU Lesser General Public License as published
+by the Free Software Foundation; either version 2.1 of the License, or
+(at your option) any later version.
+
+This library is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser
+General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License
+along with this library; if not, see <https://www.gnu.org/licenses/>.
+
+Public-domain files (LZMA SDK origin)
+=====================================
+
+The author of the LZMA SDK, Igor Pavlov, has placed it in the public
+domain. The corresponding Rust files in this crate carry no additional
+restrictions beyond their upstream public-domain dedication.
