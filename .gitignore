@@ -35,3 +35,5 @@ third_party/build/
 plugins/*/build/
 plugins/*/tests/test_zpaq.exe
 plugins/*/tests/test_linux
+plugins/*/tests/zpaq_cli
+plugins/*/tests/bsc_cli
