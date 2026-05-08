@@ -5,17 +5,20 @@
 //! context manager, etc.) and full of file-scope mutable globals; a
 //! straight port has to refactor those into properly-scoped state.
 //!
-//! Status: skeleton only.
+//! Status: foundation in place — arith coder, sigmoid table, two
+//! state machines (Nonstationary / RunMap). The mixer, predictor,
+//! context manager, and per-component models are out of scope for
+//! this crate's first cut and tracked in `HANDOFF.md`.
 //!
 //! [CMIX]: https://github.com/byronknoll/cmix
 
 #![forbid(unsafe_code)]
 
-// pub mod arith;       // arithmetic coder (encoder.cpp / decoder.cpp)
-// pub mod predictor;   // top-level mixer
-// pub mod context_manager;
-// pub mod contexts;    // bit/bracket/combined/context-hash/...
-// pub mod mixer;       // byte-mixer, lstm, mixer, sigmoid, sse
-// pub mod models;      // bracket, byte-model, direct, indirect, fxcmv1,
-//                      // match, paq8, ppmd
-// pub mod states;      // nonstationary, run-map
+pub mod coder;     // arithmetic coder (encoder.cpp / decoder.cpp)
+pub mod mixer;     // mixer + mixer-input
+pub mod sigmoid;   // mixer/sigmoid table
+pub mod state;     // State trait
+pub mod states;    // nonstationary, run-map
+
+// TODO (multi-week scope): predictor, context_manager, contexts/*,
+// mixer/{byte-mixer,lstm,sse}, models/*. See HANDOFF.

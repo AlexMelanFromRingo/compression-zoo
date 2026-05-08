@@ -258,9 +258,30 @@ Method IDs (community-aligned):
    algorithmic rework (bit-packed L/S backed by SIMD shuffles, the
    gap-array trick to skip already-sorted bucket regions). Neither
    fits the cleanliness goal of this crate; future work, deferred.
-4. **CMIX-rs.** Multi-session per the original handoff. Start from
-   `predictor.cpp` (per-byte mix entry) and bisect against the
-   upstream binary. ~30 K lines of intricate C++ — multi-week.
+4. **CMIX-rs.** Foundation in place this session:
+     - `coder.rs` — float-probability arithmetic encoder/decoder
+       with `Predictor` trait. Round-trip-tested via stub predictor.
+     - `sigmoid.rs` — Logit table + scalar Logistic.
+     - `state.rs` + `states/{run_map, nonstationary}.rs` — both
+       PAQ-derived state machines, transition tables verbatim from
+       upstream. Anchor values cross-checked.
+     - `mixer.rs` — `MixerInput` + `Mixer` (per-context weight maps,
+       online SGD with global + per-context decay). Learning
+       smoke-test passes.
+   Tests: 12/12 in cmix-rs.
+   Remaining (multi-week per the original handoff):
+     - `contexts/*` (~10 small files: bit-context, bracket-context,
+       interval, sparse, indirect-hash, …).
+     - `models/*` — the big chunk. `paq8.cpp` alone is multi-kLOC,
+       and `ppmd.cpp` re-ports an entire PPMd implementation.
+     - `predictor.cpp` — top-level orchestrator that wires every
+       sub-model into the mixer.
+     - `mixer/{byte-mixer, lstm, lstm-layer, sse}` — the LSTM-based
+       refinement layer plus the SSE smoothing pass.
+     - `runner.cpp` / `context-manager.cpp` — top-level driver.
+   The shape of the work is mostly mechanical (one module at a
+   time, with cross-validation via per-byte trace bisection against
+   the upstream binary), but the size is real.
 
 ## Tests at handoff
 
