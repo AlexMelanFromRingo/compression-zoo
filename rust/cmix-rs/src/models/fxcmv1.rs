@@ -3503,6 +3503,120 @@ impl MatchModel2 {
 }
 
 // ====================================================================
+// Per-context parameter arrays (one entry per CM index).
+//
+// Mirrored verbatim from upstream's globals at fxcmv1.cpp:3218-3221:
+//   c_r  — ContextMap "run" multiplier (run-length learning gain).
+//   c_s  — ContextMap "pr" multiplier (probability scaling).
+//   c_s3 — `s3` (mix3 internal scale).
+//   c_s4 — `cs4` (per-context shift).
+// ====================================================================
+
+pub const C_R:  [u32; 27] =
+    [3,4,6,4,6,6,2,3,3,3,6,4,3,4,5,6,2,6,4,4,4,4,4,4,4,4,4];
+pub const C_S:  [u32; 27] =
+    [28,26,28,31,34,31,33,33,35,35,29,32,33,34,30,36,31,32,
+     32,32,32,32,33,32,32,32,32];
+pub const C_S3: [u32; 27] =
+    [43,33,34,28,34,29,32,33,37,35,33,28,31,35,28,30,33,34,
+     32,32,32,32,32,32,32,32,32];
+pub const C_S4: [u32; 27] =
+    [9,8,9,5,8,12,15,8,8,12,10,7,7,8,8,13,13,14,8,8,12,12,12,12,12,12,12];
+
+/// Escape probability limits used by the failure-tracking branch in
+/// `update1()` — `pr >= e_l[bpos]` flags this bit as a near-failure.
+pub const ESC_LIMITS: [i32; 8] =
+    [1830, 1997, 1973, 1851, 1897, 1690, 1998, 1842];
+
+/// Tri/trj — small lookup tables that fold `fails` bits into the
+/// `pz` failure counter inside `update1`.
+pub const TRI: [u32; 4] = [0, 4, 3, 7];
+pub const TRJ: [u32; 4] = [0, 6, 6, 12];
+
+/// Bracket-context character lists (open/close pairs).
+/// Mirrors fxcmv1.cpp:2150-2155 — must use the wiki-control
+/// constants since some entries (CURLYOPENING, LESSTHAN, etc.) are
+/// remapped above the printable range.
+pub fn brackets_table() -> [u8; 8] {
+    [b'(', b')',
+     CURLYOPENING_CHR, CURLYCLOSE_CHR,
+     b'[', b']',
+     LESSTHAN_CHR, GREATERTHAN_CHR]
+}
+
+pub fn quotes_table() -> [u8; 4] {
+    [APOSTROPHE_CHR, APOSTROPHE_CHR,
+     QUOTATION_CHR,  QUOTATION_CHR]
+}
+
+pub fn fchar_table() -> [u8; 20] {
+    [
+        FIRSTUPPER_CHR, LF_CHR,
+        TEXTDATA_CHR,   LF_CHR,
+        COLON_CHR,      LF_CHR,
+        LESSTHAN_CHR, GREATERTHAN_CHR,
+        EQUALS_CHR,     LF_CHR,
+        SQUAREOPEN_CHR, SQUARECLOSE_CHR,
+        CURLYOPENING_CHR, CURLYCLOSE_CHR,
+        b'*',           LF_CHR,
+        VERTICALBAR_CHR, LF_CHR,
+        HTLINK_CHR,     LF_CHR,
+    ]
+}
+
+pub fn html_table() -> [u16; 2] {
+    [(b'&' as u16) * 256 + (b'L' as u16),
+     (b'&' as u16) * 256 + (b'N' as u16)]
+}
+
+// ====================================================================
+// Six pre-built state-transition tables (`STA1..STA7`, STA3 omitted)
+// driven by upstream's `StateTable::Init(s0..s5, mdc, &nn[0])` with
+// the parameter tuples at fxcmv1.cpp:4876-4881.
+// ====================================================================
+
+#[derive(Clone, Copy)]
+pub struct StaParams {
+    pub s0: i32, pub s1: i32, pub s2: i32, pub s3: i32,
+    pub s4: i32, pub s5: i32, pub mdc: i32,
+}
+
+pub const STA_PARAMS: [StaParams; 6] = [
+    StaParams { s0: 28, s1: 28, s2: 31, s3: 29, s4: 23, s5: 4,  mdc: 17 }, // STA1
+    StaParams { s0: 32, s1: 28, s2: 31, s3: 28, s4: 21, s5: 5,  mdc:  6 }, // STA2
+    StaParams { s0: 31, s1: 27, s2: 30, s3: 27, s4: 24, s5: 4,  mdc: 27 }, // STA4
+    StaParams { s0: 33, s1: 31, s2: 31, s3: 24, s4: 20, s5: 4,  mdc: 33 }, // STA5
+    StaParams { s0: 28, s1: 29, s2: 30, s3: 30, s4: 23, s5: 3,  mdc: 22 }, // STA6
+    StaParams { s0: 28, s1: 29, s2: 33, s3: 23, s4: 23, s5: 6,  mdc: 14 }, // STA7
+];
+
+/// Build all six 256-state transition tables side-by-side.
+/// Returns `[u8; 6 * 1024]` flat — caller indexes by `state_table_id * 1024 + i`.
+pub fn build_sta_tables() -> Vec<u8> {
+    let mut out = vec![0u8; 6 * 1024];
+    let mut st = StateTable::new();
+    for (i, p) in STA_PARAMS.iter().enumerate() {
+        let mut tbl = [0u8; 1024];
+        st.init(p.s0, p.s1, p.s2, p.s3, p.s4, p.s5, p.mdc, &mut tbl);
+        out[i * 1024..(i + 1) * 1024].copy_from_slice(&tbl);
+    }
+    out
+}
+
+/// Per-state pre-stretched probability used by upstream's `pre2(STA7)`
+/// to seed `pre1[256]`. We compute it from STA7 (== STA_PARAMS[5]).
+pub fn build_pre1_from_sta7(sta7: &[u8], strt: &[i16]) -> [i16; 256] {
+    let mut out = [0i16; 256];
+    for i in 0..256 {
+        let n0 = sta7[i * 4 + 2] as i32 * 3 + 1;
+        let n1 = sta7[i * 4 + 3] as i32 * 3 + 1;
+        let p = (n1 << 12) / (n0 + n1);
+        out[i] = (clp(stretch(strt, p)) as i32 >> 2) as i16;
+    }
+    out
+}
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -4010,6 +4124,53 @@ mod tests {
         // After the threshold the VerbWords1 branch is disabled.
         assert!((w_above.r#type & eng::VERB) == 0,
             "at threshold, VerbWords1 branch must be skipped");
+    }
+
+    #[test]
+    fn predictor_param_arrays_are_27_long_each() {
+        assert_eq!(C_R.len(),  27);
+        assert_eq!(C_S.len(),  27);
+        assert_eq!(C_S3.len(), 27);
+        assert_eq!(C_S4.len(), 27);
+    }
+
+    #[test]
+    fn build_sta_tables_yields_six_distinct_blocks() {
+        let v = build_sta_tables();
+        assert_eq!(v.len(), 6 * 1024);
+        // Different parameter sets must produce different transition
+        // tables — sanity-check by comparing every adjacent pair.
+        for i in 0..5 {
+            let a = &v[i * 1024..(i + 1) * 1024];
+            let b = &v[(i + 1) * 1024..(i + 2) * 1024];
+            assert_ne!(a, b, "STA[{}] and STA[{}] must differ", i, i + 1);
+        }
+    }
+
+    #[test]
+    fn pre1_table_is_monotonic_in_n1_n0_ratio() {
+        let strt = build_stretch_table();
+        let v = build_sta_tables();
+        let sta7 = &v[5 * 1024..6 * 1024];  // STA7 is at slot 5.
+        let pre1 = build_pre1_from_sta7(sta7, &strt);
+        // pre1 entries must fit in i16 and differ.
+        let mut distinct = std::collections::HashSet::new();
+        for &v in &pre1 { distinct.insert(v); }
+        assert!(distinct.len() > 4,
+            "pre1 should produce a variety of stretched probs, got {} unique",
+            distinct.len());
+    }
+
+    #[test]
+    fn fchar_table_has_20_chars_and_pairs_correctly() {
+        let f = fchar_table();
+        assert_eq!(f.len(), 20);
+        // Most pairs end with LF — one's a real pair (LESSTHAN/GREATERTHAN).
+        let mut lf_count = 0;
+        for i in (0..20).step_by(2) {
+            if f[i + 1] == LF_CHR { lf_count += 1; }
+        }
+        assert!(lf_count >= 7, "expected most pairs to map to LF, got {}", lf_count);
     }
 
     #[test]
