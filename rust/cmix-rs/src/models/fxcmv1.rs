@@ -1616,6 +1616,233 @@ impl<T> BracketContextFx<T>
 }
 
 // ====================================================================
+// Wikipedia control-character constants (mirror upstream). Not all
+// of these appear in the FXCMv1 control flow yet, but they read
+// cleaner alongside the `ColumnContext` port.
+// ====================================================================
+
+pub const COLON_CHR:        u8 = b'J';
+pub const SEMICOLON_CHR:    u8 = b'K';
+pub const LESSTHAN_CHR:     u8 = b'L';
+pub const EQUALS_CHR:       u8 = b'M';
+pub const GREATERTHAN_CHR:  u8 = b'N';
+pub const QUESTION_CHR:     u8 = b'O';
+pub const FIRSTUPPER_CHR:   u8 = 64;
+pub const SQUAREOPEN_CHR:   u8 = 91;
+pub const BACKSLASH_CHR:    u8 = 92;
+pub const SQUARECLOSE_CHR:  u8 = 93;
+pub const CURLYOPENING_CHR: u8 = b'P';
+pub const VERTICALBAR_CHR:  u8 = b'Q';
+pub const CURLYCLOSE_CHR:   u8 = b'R';
+
+pub const APOSTROPHE_CHR: u8 = 39;
+pub const QUOTATION_CHR:  u8 = 34;
+pub const SPACE_CHR:      u8 = 32;
+pub const HTLINK_CHR:     u8 = 31;
+pub const HTML_CHR:       u8 = 30;
+pub const LF_CHR:         u8 = 10;
+pub const ESCAPE_CHR:     u8 = 12;
+pub const UPPER_CHR:      u8 = 7;
+pub const TEXTDATA_CHR:   u8 = 96;
+
+pub const WIKIHEADER_CHR: u8 = GREATERTHAN_CHR;
+pub const WIKITABLE_CHR:  u8 = b'-';
+
+// ====================================================================
+// `Column` / `ColumnContext` — track the last few rows of the input
+// stream as character columns, plus wiki-table cell positions.
+// Mirrors upstream's `Column` and `ColumnContext` structs.
+// ====================================================================
+
+#[derive(Clone)]
+pub struct Column {
+    pub linepos: u32,
+    pub fc: u8,
+    pub bytes: CmixVec<u8>,
+}
+
+impl Column {
+    pub fn new() -> Self {
+        Self { linepos: 0, fc: 0, bytes: CmixVec::new(2048) }
+    }
+}
+
+impl Default for Column { fn default() -> Self { Self::new() } }
+
+pub struct ColumnContext {
+    pub col: [Column; 4],
+    pub cell: [CmixVec<u32>; 4],
+    pub rows: usize,
+    pub cell_count: i32,
+    pub cells: usize,
+    pub abovecellpos: u32,
+    pub abovecellpos1: u32,
+    pub nl: bool,
+    pub is_temp: bool,
+    pub limit: i32,
+    pub nl_char: u8,
+}
+
+impl ColumnContext {
+    pub fn new(limit: i32) -> Self {
+        Self {
+            col: [Column::new(), Column::new(), Column::new(), Column::new()],
+            cell: [
+                CmixVec::new(32), CmixVec::new(32),
+                CmixVec::new(32), CmixVec::new(32),
+            ],
+            rows: 0, cell_count: 0, cells: 0,
+            abovecellpos: 0, abovecellpos1: 0,
+            nl: false, is_temp: false,
+            limit,
+            nl_char: LF_CHR,
+        }
+    }
+
+    pub fn lastfc(&self, i: usize) -> u8 {
+        self.col[(self.rows.wrapping_sub(i)) & 3].fc
+    }
+    pub fn is_new_line(&self) -> bool { self.nl }
+
+    pub fn collen(&self, i: usize, l: i32) -> i32 {
+        let l = if l != 0 { l } else { self.limit };
+        l.min(self.col[(self.rows.wrapping_sub(i)) & 3].bytes.len() as i32 + 1)
+    }
+    pub fn nlpos(&self, i: usize) -> u32 {
+        self.col[(self.rows.wrapping_sub(i)) & 3].linepos
+    }
+    pub fn colb(&self, i: usize, j: i32, l: i32) -> u8 {
+        if self.collen(0, l) < self.collen(i, l) {
+            let idx = (self.collen(0, 0) - (1 + j)).max(0) as usize;
+            self.col[(self.rows.wrapping_sub(i)) & 3].bytes.at(idx)
+        } else { 0 }
+    }
+
+    fn reset_cells(&mut self) {
+        for c in self.cell.iter_mut() { c.clear(); }
+    }
+
+    /// `byte` = current byte, `b2` = the upstream's `(b3<<16) |
+    /// (b2<<8) | b1` packed-3-byte history, `blpos` = block
+    /// position (from BlockData), `is_pre` = upstream's preformatted
+    /// flag.
+    pub fn update(&mut self, byte: u8, b2: u32, blpos: u32, is_pre: bool) {
+        // Wiki-table fence detection.
+        if b2 == ((CURLYOPENING_CHR as u32) << 16
+                  | (CURLYOPENING_CHR as u32) << 8
+                  | (VERTICALBAR_CHR as u32))
+        {
+            self.nl_char = WIKITABLE_CHR;
+        } else if b2 == ((VERTICALBAR_CHR as u32) << 16
+                         | (CURLYCLOSE_CHR as u32) << 8
+                         | (CURLYCLOSE_CHR as u32))
+        {
+            self.nl_char = LF_CHR;
+            self.reset_cells();
+        }
+        if byte != CURLYOPENING_CHR
+            && (b2 & 0xFF00) == ((CURLYOPENING_CHR as u32) << 8)
+            && (b2 & 0xFF0000) != ((CURLYOPENING_CHR as u32) << 16)
+        {
+            self.is_temp = true;
+        } else if self.is_temp && byte == CURLYCLOSE_CHR {
+            self.is_temp = false;
+        }
+
+        self.nl = false;
+        if byte == LF_CHR {
+            self.col[self.rows].bytes.push(byte);
+            self.rows = (self.rows + 1) & 3;
+            self.col[self.rows].bytes.clear();
+            self.col[self.rows].fc = 0;
+            self.col[self.rows].linepos = blpos.wrapping_sub(1);
+        } else {
+            self.col[self.rows].bytes.push(byte);
+            if self.collen(0, 0) == 2 {
+                self.col[self.rows].fc = byte.min(TEXTDATA_CHR);
+                self.nl = true;
+                if self.col[self.rows].fc == GREATERTHAN_CHR && !is_pre {
+                    self.nl_char = WIKIHEADER_CHR;
+                }
+                if self.col[self.rows].fc == SQUAREOPEN_CHR && self.nl_char == WIKIHEADER_CHR {
+                    self.nl_char = LF_CHR;
+                }
+            }
+        }
+
+        // Wiki-table cell tracking.
+        if self.nl_char == WIKITABLE_CHR {
+            if (b2 & 0xFFFF)
+                == (WIKITABLE_CHR as u32 + (VERTICALBAR_CHR as u32) * 256)
+            {
+                self.cells = (self.cells + 1) & 3;
+                self.cell[self.cells].clear();
+                self.cell[self.cells].push(blpos);
+                self.cell_count = 0;
+                self.abovecellpos = 0;
+                self.abovecellpos1 = 0;
+            }
+            let mut newcell = false;
+            if (b2 & 0xFFFF) == (VERTICALBAR_CHR as u32 + (VERTICALBAR_CHR as u32) * 256)
+                || (b2 & 0xFFFF00)
+                   == ((VERTICALBAR_CHR as u32 + (LF_CHR as u32) * 256) * 256)
+            {
+                self.cell[self.cells].push(blpos);
+                self.cell_count += 1;
+                newcell = true;
+            }
+            if self.abovecellpos != 0 {
+                self.abovecellpos = self.abovecellpos.wrapping_add(1);
+                if self.abovecellpos > self.abovecellpos1 {
+                    self.abovecellpos = 0;
+                    self.abovecellpos1 = 0;
+                }
+            }
+            if newcell && self.cells_count(1) > 0 {
+                self.abovecellpos = self.cell_pos(self.cell_count - 1, 1);
+                self.abovecellpos1 = self.cell_pos(self.cell_count, 1);
+            }
+        }
+        if self.nl_char == WIKIHEADER_CHR {
+            if (b2 & 0xFFFF) == (WIKIHEADER_CHR as u32 + (LF_CHR as u32) * 256) {
+                self.cells = (self.cells + 1) & 3;
+                self.cell[self.cells].clear();
+                self.cell[self.cells].push(blpos);
+                self.cell_count = 0;
+                self.abovecellpos = 0;
+                self.abovecellpos1 = 0;
+            } else {
+                let mut newcell = false;
+                if (b2 & 0xFF) == (WIKIHEADER_CHR as u32) {
+                    self.cell[self.cells].push(blpos);
+                    self.cell_count += 1;
+                    newcell = true;
+                }
+                if self.abovecellpos != 0 {
+                    self.abovecellpos = self.abovecellpos.wrapping_add(1);
+                    if self.abovecellpos > self.abovecellpos1 {
+                        self.abovecellpos = 0;
+                        self.abovecellpos1 = 0;
+                    }
+                }
+                if newcell && self.cells_count(1) > 0 {
+                    self.abovecellpos = self.cell_pos(self.cell_count - 1, 1);
+                    self.abovecellpos1 = self.cell_pos(self.cell_count, 1);
+                }
+            }
+        }
+    }
+
+    pub fn cells_count(&self, row: usize) -> i32 {
+        self.cell[(self.cells.wrapping_sub(row)) & 3].len() as i32
+    }
+    pub fn cell_pos(&self, cell_id: i32, row: usize) -> u32 {
+        let total = (self.cells_count(row) - 1).max(0).min(cell_id) as usize;
+        self.cell[(self.cells.wrapping_sub(row)) & 3].at(total)
+    }
+}
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -1915,6 +2142,22 @@ mod tests {
         assert_eq!(v.last(), 8);
         assert_eq!(v.pop(), 8);
         assert_eq!(v.last(), 7);
+    }
+
+    #[test]
+    fn column_context_tracks_rows() {
+        let mut c = ColumnContext::new(31);
+        // Feed "ab\ncd\n" — 3 lines worth of state.
+        let mut blpos = 0u32;
+        for &b in b"ab\ncd\n" {
+            c.update(b, 0, blpos, false);
+            blpos += 1;
+        }
+        // After two newlines we've advanced the rows ring.
+        assert!(c.rows == 2);
+        // The most-recent committed line had a first byte 'c'
+        // (= 99); upstream clamps fc to min(byte, TEXTDATA=96).
+        assert_eq!(c.lastfc(1), TEXTDATA_CHR);
     }
 
     #[test]
