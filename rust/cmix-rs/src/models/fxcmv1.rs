@@ -3551,6 +3551,12 @@ pub const C_S4: [u32; 27] =
 pub const ESC_LIMITS: [i32; 8] =
     [1830, 1997, 1973, 1851, 1897, 1690, 1998, 1842];
 
+/// 14-entry prime multipliers used by the order-X hash table `t[]`.
+/// Verbatim from fxcmv1.cpp:3213. Slot 0 is unused (the table starts
+/// folding at index 1).
+pub const PRIMES: [u32; 14] =
+    [0, 257, 251, 241, 239, 233, 229, 227, 223, 211, 199, 197, 193, 191];
+
 /// Tri/trj — small lookup tables that fold `fails` bits into the
 /// `pz` failure counter inside `update1`.
 pub const TRI: [u32; 4] = [0, 4, 3, 7];
@@ -3859,6 +3865,66 @@ impl FxcmState {
 }
 
 impl Default for FxcmState { fn default() -> Self { Self::new() } }
+
+impl FxcmState {
+    /// First-stage byte-boundary side effects from `modelPrediction`
+    /// (fxcmv1.cpp:3803-3859, before the wiki/word handling).
+    ///
+    /// Cycles c3/c2/c1, refreshes the 2/3/4-bit byte classifiers,
+    /// pushes to the buffer, advances `pos`, and folds the new byte
+    /// into the order-X hash table `t[1..=13]`.
+    ///
+    /// `c4` is the most recent 4 packed bytes (BlockData::c4) — only
+    /// its low byte is consulted here.
+    pub fn byte_boundary_step(&mut self, c4: u32, buf: &mut Buffer) {
+        self.c3 = self.c2;
+        self.c2 = self.c1;
+        self.c1 = (c4 & 0xff) as u8;
+
+        self.n2b_state = WRT_2B[self.c1 as usize] as u32;
+        self.n3b_state = WRT_3B[self.c1 as usize] as u32;
+        self.n4b_state = WRT_4B[self.c1 as usize] as u32;
+
+        self.stream2b = self.stream2b
+            .wrapping_mul(4)
+            .wrapping_add(self.n2b_state);
+        self.stream4b = self.stream4b
+            .wrapping_mul(16)
+            .wrapping_add(self.n4b_state);
+
+        buf.push(self.c1);
+        self.pos = self.pos.wrapping_add(1);
+
+        // x4-end markers: $, ], |, ), [
+        if self.c1 == b'$' || self.c1 == SQUARECLOSE_CHR
+            || self.c1 == VERTICALBAR_CHR || self.c1 == b')'
+            || self.c1 == SQUAREOPEN_CHR
+        {
+            if self.c1 != self.c2 {
+                for i in (1..=13).rev() {
+                    self.t[i] = self.t[i - 1].wrapping_mul(PRIMES[i]);
+                }
+            }
+            self.x4 = (self.x4 << 8).wrapping_add(self.c2 as u32);
+            self.stream2b = self.stream2b
+                .wrapping_mul(4)
+                .wrapping_add(self.n2b_state);
+            self.stream2b_r = (self.stream2b_r << 2)
+                .wrapping_add(self.n2b_state);
+            self.stream3b_r = (self.stream3b_r << 3)
+                .wrapping_add(self.n3b_state);
+        }
+
+        // Fold c1 into the order-X hash table.
+        self.x4 = (self.x4 << 8).wrapping_add(self.c1 as u32);
+        for i in (1..=13).rev() {
+            self.t[i] = self.t[i - 1]
+                .wrapping_mul(PRIMES[i])
+                .wrapping_add(self.c1 as u32)
+                .wrapping_add((i as u32) * 256);
+        }
+    }
+}
 
 // ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
@@ -4368,6 +4434,52 @@ mod tests {
         // After the threshold the VerbWords1 branch is disabled.
         assert!((w_above.r#type & eng::VERB) == 0,
             "at threshold, VerbWords1 branch must be skipped");
+    }
+
+    #[test]
+    fn primes_table_starts_with_zero_then_decreasing_primes() {
+        assert_eq!(PRIMES.len(), 14);
+        assert_eq!(PRIMES[0], 0);
+        // The remaining 13 are strictly decreasing primes.
+        for i in 2..14 {
+            assert!(PRIMES[i] < PRIMES[i - 1],
+                "PRIMES[{}]={} should be < PRIMES[{}]={}",
+                i, PRIMES[i], i - 1, PRIMES[i - 1]);
+        }
+    }
+
+    #[test]
+    fn fxcm_state_byte_boundary_advances_state() {
+        let mut s = FxcmState::new();
+        let mut buf = Buffer::new();
+        s.byte_boundary_step(/*c4=*/0x68, &mut buf); // 'h'
+        assert_eq!(s.c1, b'h');
+        assert_eq!(s.pos, 1);
+        assert_eq!(buf.buf(1), b'h');
+        // Hash table should now be non-zero in slots 1..=13.
+        let any_nonzero = s.t.iter().skip(1).any(|&v| v != 0);
+        assert!(any_nonzero, "t[1..=13] should fold in c1");
+
+        s.byte_boundary_step(0x65, &mut buf); // 'e'
+        assert_eq!(s.c1, b'e');
+        assert_eq!(s.c2, b'h'); // c2 was cycled.
+        assert_eq!(s.pos, 2);
+    }
+
+    #[test]
+    fn fxcm_state_marker_byte_resets_t() {
+        let mut s = FxcmState::new();
+        let mut buf = Buffer::new();
+        // Feed a few normal bytes.
+        s.byte_boundary_step(0x68, &mut buf);
+        s.byte_boundary_step(0x69, &mut buf);
+        let t_before = s.t;
+        // Feed a marker byte ($).
+        s.byte_boundary_step(b'$' as u32, &mut buf);
+        // The marker shifts twice (once from the c1!=c2 path, once
+        // from the always-fold path), so t differs.
+        assert_ne!(s.t, t_before);
+        assert!(s.x4 != 0, "x4 must accumulate the marker byte");
     }
 
     #[test]
