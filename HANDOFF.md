@@ -213,19 +213,23 @@ Method IDs (community-aligned):
       buffer the whole input before emitting OUT bytes.
    ✅ LZBuffer level 1 (variable-bit Elias-gamma LZ77) + level 2
       (byte LZ77) + level 3 (BWT, via `bsc-rs::sais`).
-   ✅ `compress_method` high-level API: `"0"` (store), `"x4,3"`
-      (BWT), `"x4,2,M"` (byte-aligned LZ77, min match `M`), and
-      `"x4,1,M"` (variable-bit LZ77, min match `M`) all work
-      end-to-end; output decompresses correctly under both
-      `zpaq_decompress` (Rust) and the upstream libzpaq decoder,
-      validated on random binaries 100B..100KB plus the 273 KB
-      `libzpaq.cpp` source. Compression ratio on libzpaq.cpp:
-      37.4% with byte LZ77, 30.4% with var-bit LZ77, 100% with
-      BWT-only (no model on top — see "ci1" component spec, TODO).
-   ⏳ Remaining: digit method entry points (`"1".."5"`) that pick
-      among the `"x..."` variants based on data statistics, plus
-      the four E8E9 variants (`x4,5..7`). Once `makeConfig` lands
-      the full upstream compression menu is reachable.
+   ✅ `compress_method` high-level API supports:
+      `"0"` (store), `"1"` / `"2"` / `"3"` (digit aliases),
+      `"x4,1,M"` (variable-bit LZ77, min match `M`),
+      `"x4,2,M"` (byte-aligned LZ77, min match `M`),
+      `"x4,3"`   (BWT, 16 MiB block),
+      `"x4,7"`   (BWT + E8E9 prefilter).
+      All decompress correctly under both `zpaq_decompress` and the
+      upstream libzpaq decoder, validated on random binaries
+      100B..100KB plus the 273 KB `libzpaq.cpp` source.
+      Ratio on libzpaq.cpp: byte LZ77 = 37.4%, var-bit LZ77 = 30.4%.
+   ⏳ Remaining: E8E9-enabled LZ77 variants (`"x4,5,M"`, `"x4,6,M"`)
+      need their own E8E9-decode PCOMP textual templates. Component
+      specs (`"ci1"`, `"i"`, `"m"`, `"s"`, ...) that stack a context
+      model on top of the LZ77/BWT preproc — that's where upstream's
+      best-ratio methods live, requires porting the model spec
+      branches of `makeConfig`. Once those land the full upstream
+      compression menu is reachable.
 3. **libsais cache-aware optimisations.** Reference SA-IS landed +
    small single-pass refactor. Real 2-3× wins need bit-packed L/S,
    prefetching, libsais's specific algorithmic improvements —

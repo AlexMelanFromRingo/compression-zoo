@@ -380,20 +380,35 @@ pub fn compress_with_config<W: Writer>(
 }
 
 /// High-level entry point — mirrors upstream's `compress(in, out,
-/// method, ...)` for a small subset of methods.
+/// method, ...)` for a curated subset of methods.
 ///
-/// Supported methods today:
+/// Supported method strings:
 ///   * `"0"` — stored mode (no model, no preprocessing).
-///   * `"x4,3"` — BWT level 3, 16 MiB block, no E8E9. Uses
-///     [`crate::lzbuffer::preprocess`] to BWT-encode the input and
-///     [`crate::models::BWT_CFG`] as the IBWT post-processor.
+///   * `"1"` — alias for `"x4,1,4"` (variable-bit LZ77, min match 4).
+///   * `"2"` — alias for `"x4,2,4"` (byte-aligned LZ77, min match 4).
+///   * `"3"` — alias for `"x4,3"`   (BWT, 16 MiB block).
+///   * `"x4,1,M"` — variable-bit LZ77 with min match `M ∈ [4..64]`.
+///   * `"x4,2,M"` — byte-aligned LZ77 with min match `M ∈ [1..64]`.
+///   * `"x4,3"`   — BWT.
+///   * `"x4,5,M"` / `"x4,6,M"` / `"x4,7"` — same as `1`/`2`/`3`
+///     plus E8E9 (Intel/AMD CALL/JMP `rel32 → abs32`) prefilter.
 ///
-/// Unsupported method strings return [`CompressError::InvalidHeader`].
+/// Unsupported strings return [`CompressError::InvalidHeader`].
 pub fn compress_method<W: Writer>(
     out: W,
     data: &[u8],
     method: &str,
 ) -> Result<W, CompressError> {
+    // Resolve digit-method aliases up-front so the rest of the
+    // function works on a single canonical "x..." form.
+    let resolved: &str = match method {
+        "1" => "x4,1,4",
+        "2" => "x4,2,4",
+        "3" => "x4,3",
+        other => other,
+    };
+    let method = resolved;
+
     let mut c = Compresser::new(out);
     c.write_tag()?;
 
@@ -407,11 +422,12 @@ pub fn compress_method<W: Writer>(
         return Ok(c.into_inner());
     }
 
-    if method == "x4,3" {
-        // args[0]=4 (log block-MiB), args[1]=3 (BWT).
+    // BWT, with or without E8E9 prefilter.
+    if method == "x4,3" || method == "x4,7" {
+        let doe8 = method == "x4,7";
         let mut args = [0i32; 9];
         args[0] = 4;
-        args[1] = 3;
+        args[1] = if doe8 { 7 } else { 3 };
         let cc = crate::compiler::compile_with_args(crate::models::BWT_CFG, args)
             .map_err(|_| CompressError::InvalidHeader)?;
         let pcomp = cc.pcomp.clone()
@@ -422,7 +438,7 @@ pub fn compress_method<W: Writer>(
         c.post_process_prog(&pcomp)?;
         let bwt_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
             log_block_mib: 4,
-            level_flag: 3,
+            level_flag: if doe8 { 7 } else { 3 },
             min_match: 0, min_match2: 0, log_bucket: 0, log_ht_size: 0,
         });
         c.write_bytes(&bwt_bytes)?;
@@ -563,6 +579,22 @@ mod tests {
         let mut w = VecWriter::new();
         decompress(&mut r, &mut w).unwrap();
         assert_eq!(w.into_inner(), inp);
+    }
+
+    /// Digit-method aliases ("1", "2", "3") should resolve to the
+    /// same `"x4,..."` paths and round-trip identically.
+    #[test]
+    fn compress_method_digit_aliases() {
+        let inp = b"the quick brown fox jumps over the lazy dog. ".repeat(20);
+        for method in ["1", "2", "3"] {
+            let out = compress_method(VecWriter::new(), &inp, method).unwrap();
+            let wire = out.into_inner();
+            let mut r = SliceReader::new(&wire);
+            let mut w = VecWriter::new();
+            decompress(&mut r, &mut w).unwrap();
+            assert_eq!(w.into_inner(), inp,
+                "round-trip failed for method='{}'", method);
+        }
     }
 
     /// `x4,1,M` — variable-bit Elias-gamma LZ77. Validates the
