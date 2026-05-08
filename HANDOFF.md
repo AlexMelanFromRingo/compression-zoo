@@ -243,10 +243,21 @@ Method IDs (community-aligned):
       type=binary/text/exe inference) before picking the `"x..."`
       shape. Without that, `"4"` and `"5"` stay aliases; the user
       has to pass `"x4,..."` explicitly for the heavy methods.
-3. **libsais cache-aware optimisations.** Reference SA-IS landed +
-   small single-pass refactor. Real 2-3× wins need bit-packed L/S,
-   prefetching, libsais's specific algorithmic improvements —
-   sizeable rewrite, deferred.
+3. **libsais cache-aware optimisations.** Beyond the reference
+   Nong-2009 SA-IS port, this session added:
+     - single-pass classify+count+lms-collect (one fewer scan of t).
+     - `Vec<u32>` for `lms_positions` instead of `Vec<usize>`
+       (halves footprint on 64-bit hosts, n_lms fits comfortably).
+   Bench delta on `sais::sais_u8` over random inputs:
+     - 1 MiB:  115 ms → 85 ms  (-26 %)
+     - 4 MiB:  789 ms → 755 ms (-4 %)
+     - 16 MiB: 4477 ms → 3914 ms (-13 %)
+   Real 2-3× wins past this point need either software prefetching
+   (`core::intrinsics::prefetch_*` is unsafe + nightly, conflicts
+   with `bsc-rs`'s `#![forbid(unsafe_code)]`) or libsais's heavier
+   algorithmic rework (bit-packed L/S backed by SIMD shuffles, the
+   gap-array trick to skip already-sorted bucket regions). Neither
+   fits the cleanliness goal of this crate; future work, deferred.
 4. **CMIX-rs.** Multi-session per the original handoff. Start from
    `predictor.cpp` (per-byte mix entry) and bisect against the
    upstream binary. ~30 K lines of intricate C++ — multi-week.

@@ -60,7 +60,11 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
     // Replaces three separate passes in the textbook reference.
     let mut is_s = vec![false; n];
     let mut counts = vec![0i32; k];
-    let mut lms_positions: Vec<usize> = Vec::new();
+    // LMS positions store as u32 — saves 4 bytes/entry on 64-bit hosts
+    // and keeps the typical n_lms ~ n/2 array half the cache footprint
+    // of the equivalent Vec<usize>. Inputs > 2³² aren't supported by
+    // the rest of the SA-IS pipeline (i32 SA), so this is safe.
+    let mut lms_positions: Vec<u32> = Vec::new();
 
     is_s[n - 1] = true;
     counts[t[n - 1] as usize] += 1;
@@ -78,19 +82,20 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
         // LMS at position i+1 ⇔ is_s[i+1] && !is_s[i]
         // (we know prev_s = is_s[i+1] from the previous iteration).
         if prev_s && !s {
-            lms_positions.push(i + 1);
+            lms_positions.push((i + 1) as u32);
         }
         prev_s = s;
     }
-    // Fix order: we pushed LMS positions back-to-front while scanning
-    // right-to-left. Reverse for input-order.
+    // Reverse to input order: needed because `sub_sa` from the
+    // recursion indexes back into `lms_positions` and expects
+    // input-order entries.
     lms_positions.reverse();
 
     // ------- Place LMS positions at bucket tails (any order), induce.
     let mut sa = vec![-1i32; n];
     let mut tails_buf = bucket_tails(&counts);
     for &i in &lms_positions {
-        let c = t[i] as usize;
+        let c = t[i as usize] as usize;
         sa[tails_buf[c]] = i as i32;
         if tails_buf[c] > 0 { tails_buf[c] -= 1; }
     }
@@ -124,7 +129,7 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
     let n_lms = lms_positions.len();
     let mut named: Vec<i32> = Vec::with_capacity(n_lms);
     for &p in &lms_positions {
-        named.push(name_of[p]);
+        named.push(name_of[p as usize]);
     }
 
     // ------- Recurse if any two LMS substrings shared a name.
@@ -148,7 +153,7 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
         tails_buf[c] = (sum - 1) as usize;
     }
     for i in (0..n_lms).rev() {
-        let p = lms_positions[sub_sa[i] as usize];
+        let p = lms_positions[sub_sa[i] as usize] as usize;
         let c = t[p] as usize;
         sa[tails_buf[c]] = p as i32;
         if tails_buf[c] > 0 { tails_buf[c] -= 1; }
