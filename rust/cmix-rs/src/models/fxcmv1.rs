@@ -1147,6 +1147,113 @@ impl<const A: usize, const B: usize> ContextMap<A, B> {
 }
 
 // ====================================================================
+// `APM<S>` — Adaptive Probability Map. Each (S, cxt) pair owns 33
+// interpolation points; `p(pr, cxt, rate, y)` looks up the
+// interpolated probability and SGD-updates the two surrounding
+// points.
+// ====================================================================
+
+pub struct ApmDyn {
+    pub s: usize,
+    pub index: usize,
+    pub t: Vec<u16>,
+}
+
+impl ApmDyn {
+    pub fn new(s: usize, sqt: &[i16]) -> Self {
+        let mut t = vec![0u16; s * 33];
+        for j in 0..33 {
+            let v = squash(sqt, ((j as i32 - 16) * 128)) * 16;
+            t[j] = v as u16;
+        }
+        for i in 33..s * 33 { t[i] = t[i - 33]; }
+        Self { s, index: 0, t }
+    }
+
+    /// `pr` is the input probability (0..4095), `cxt` is the
+    /// context index (< s), `rate` is the SGD step shift, `y` is
+    /// the just-decoded bit.
+    pub fn p(&mut self, pr: i32, cxt: usize, rate: u32, y: i32, strt: &[i16]) -> i32 {
+        let pr_s = stretch(strt, pr);
+        let g = (y << 16) + (y << rate) - y * 2;
+        let idx = self.index;
+        let v0 = self.t[idx] as i32;
+        let v1 = self.t[idx + 1] as i32;
+        self.t[idx]     = (v0 + ((g - v0) >> rate)) as u16;
+        self.t[idx + 1] = (v1 + ((g - v1) >> rate)) as u16;
+        let w = pr_s & 127;
+        self.index = (((pr_s + 2048) >> 7) + cxt as i32 * 33) as usize;
+        let nv0 = self.t[self.index] as i32;
+        let nv1 = self.t[self.index + 1] as i32;
+        (nv0 * (128 - w) + nv1 * w) >> 11
+    }
+}
+
+// ====================================================================
+// `DirectStateMap` — direct-lookup state machine with c parallel
+// slots. Used by the FXCMv1 Predictor for short-range bit history.
+// `set(cx, y)` advances the active slot's state and emits two
+// stretched-logit inputs into `out`. Mirrors upstream's struct.
+// ====================================================================
+
+pub struct DirectStateMap {
+    pub mask: u32,
+    pub count: usize,
+    pub cxt: Vec<u32>,
+    pub cxt_state: Vec<u8>,
+    pub sm: Vec<StateMap>,
+    pub index: usize,
+    pub pre1: [i16; 256],
+}
+
+impl DirectStateMap {
+    pub fn new(m: u32, c: usize, nn: &[u8], strt: &[i16]) -> Self {
+        let mut sm = Vec::with_capacity(c);
+        for _ in 0..c { sm.push(StateMap::new(256, nn)); }
+        let mask = (1u32 << m) - 1;
+        let mut pre1 = [0i16; 256];
+        for i in 0..256 {
+            let n0 = nn[i * 4 + 2] as u32 * 3 + 1;
+            let n1 = nn[i * 4 + 3] as u32 * 3 + 1;
+            let p = ((n1 << 12) / (n0 + n1).max(1)) as i32;
+            pre1[i] = clp(stretch(strt, p)) >> 2;
+        }
+        Self {
+            mask, count: c,
+            cxt: vec![0u32; c],
+            cxt_state: vec![0u8; (mask + 1) as usize],
+            sm,
+            index: 0,
+            pre1,
+        }
+    }
+
+    pub fn next(&self, nn: &[u8], state: u8, y: i32) -> u8 {
+        nn[(state as usize) * 4 + y as usize]
+    }
+
+    /// Advance the active slot and emit two stretched-logit inputs.
+    pub fn set(&mut self, cx: u32, y: i32, nn: &[u8], strt: &[i16],
+               out: &mut Vec<i16>)
+    {
+        // Update state at the previous slot's context.
+        let prev_cxt = self.cxt[self.index] as usize;
+        let cur_state = self.cxt_state[prev_cxt];
+        self.cxt_state[prev_cxt] = self.next(nn, cur_state, y);
+        // Advance to new context.
+        self.cxt[self.index] = cx & self.mask;
+        let new_cxt = self.cxt[self.index] as usize;
+        self.sm[self.index].set(y, self.cxt_state[new_cxt] as usize);
+        let p = self.sm[self.index].pr;
+        out.push((stretch(strt, p) >> 2) as i16);
+        out.push(self.pre1[self.cxt_state[new_cxt] as usize]);
+        self.index += 1;
+    }
+
+    pub fn end_byte(&mut self) { self.index = 0; }
+}
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -1385,6 +1492,36 @@ mod tests {
         cm.mix1(/*cc=*/1, /*bp=*/0, /*c1=*/0, /*y=*/0, &mut out, 0, 7, &nn);
         // Each context emits 5+1 inputs (skip2=1 ⇒ 5 from mix3, +1 run-context).
         assert_eq!(out.len(), cm.cn * 6);
+    }
+
+    #[test]
+    fn apm_dyn_returns_finite_predictions() {
+        let sqt = build_squash_table();
+        let strt = build_stretch_table();
+        let mut a = ApmDyn::new(/*s=*/4, &sqt);
+        let mut last = 0;
+        for _ in 0..50 {
+            last = a.p(/*pr=*/2048, /*cxt=*/0, /*rate=*/8, /*y=*/1, &strt);
+        }
+        // After 50 training calls on bit=1, the prediction must
+        // have moved upward from the initial 2048 baseline.
+        assert!(last > 2048,
+            "after training APM toward bit=1, p={} should exceed 2048", last);
+    }
+
+    #[test]
+    fn direct_state_map_emits_two_inputs() {
+        let strt = build_stretch_table();
+        let mut nn = vec![0u8; 1024];
+        let mut st = StateTable::new();
+        let mut tbl = [0u8; 1024];
+        st.init(18, 12, 8, 6, 4, 43, 5, &mut tbl);
+        nn.copy_from_slice(&tbl);
+        let mut dsm = DirectStateMap::new(/*m=*/12, /*c=*/2, &nn, &strt);
+        let mut out: Vec<i16> = Vec::new();
+        dsm.set(0xCAFE, 1, &nn, &strt, &mut out);
+        dsm.set(0xBABE, 0, &nn, &strt, &mut out);
+        assert_eq!(out.len(), 4);
     }
 
     #[test]
