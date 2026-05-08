@@ -5244,6 +5244,94 @@ impl Predictor {
     }
 }
 
+impl Predictor {
+    /// Per-bit mixer-context derivation — fxcmv1.cpp:4642-4757. Each
+    /// of the 12 mixers gets its `cxt` set as a function of (bpos,
+    /// c0, stream2b/3b/3bR, words/numbers, BrFcIdx/FcIdx, ordX/ordW
+    /// etc.). Pure integer math; runs once per bit before `mix()`.
+    ///
+    /// `c0_b` is upstream's `c0 << (8 - bpos)` — pass in from
+    /// BlockData::c0/bpos.
+    /// `is_match` is the latest length returned by `MatchModel2.mix`
+    /// (0 when no active candidate).
+    pub fn set_mixer_contexts(&mut self, c0_b: u32, is_match: u32) {
+        let s    = &self.state;
+        let bpos = self.block.bpos as u32;
+        let words   = s.words as u32;
+        let nums    = s.numbers as u32;
+        let c2_3b   = s.stream3b & 7;
+        let c2_3b_r = s.stream3b_r & 7;
+        let stream2b = s.stream2b;
+
+        // Mixer 0.
+        self.mixers[0].cxt = if bpos == 0 {
+            ((stream2b & 255) * 8 + c2_3b) as usize
+        } else if bpos > 3 {
+            let c = WRT_2B[(c0_b & 255) as usize] as u32;
+            ((((stream2b << 2) & 255) + c) * 8 + s.br_fc_idx) as usize
+        } else {
+            ((stream2b & 255) * 8 + s.br_fc_idx) as usize
+        };
+
+        // Mixer 1.
+        let mx1_c: u32 = if bpos != 0 {
+            let mut c = c0_b;
+            if bpos == 1 {
+                c = c.wrapping_add(16u32 * (words.wrapping_mul(2) & 4));
+            } else if bpos > 3 {
+                c = (WRT_2B[(c0_b & 255) as usize] as u32) * 64;
+            }
+            (bpos.min(5)).wrapping_mul(256)
+                .wrapping_add(c2_3b_r)
+                .wrapping_add(s.fc_idx.wrapping_mul(8))
+                .wrapping_add(c & 192)
+        } else {
+            (words & 12).wrapping_mul(16)
+                .wrapping_add(c2_3b_r)
+                .wrapping_add(s.br_fc_idx.wrapping_mul(8))
+        };
+        self.mixers[1].cxt = mx1_c as usize;
+
+        // Mixer 2.
+        self.mixers[2].cxt = (((4 * words) & 0xf0) * 4
+            + (s.ord_x as u32) * 256 * 4
+            + (stream2b & 63)) as usize;
+
+        // Mixer 6.
+        self.mixers[6].cxt = ((s.stream3b_r & 0xff8) * 4
+            + ((2 * words) & 0x1c)
+            + (stream2b & 3)) as usize;
+
+        // Mixer 3.
+        self.mixers[3].cxt = (bpos * 256
+            + ((((nums | words) << bpos) & 255) >> bpos | (c0_b & 255))) as usize;
+
+        // Mixer 10 (final).
+        self.mixers[10].cxt = (((s.ord_x as u32) * 8
+            + (if s.br_fc_idx != 0 { 1 } else { 0 }) * 4
+            + (stream2b & 3)) * 2
+            + (words & 1)) as usize;
+
+        // Mixer 4 — heavy bpos branching.
+        let last_word_type = self.worcxt.types(1);
+        let last_word_capital = self.worcxt.capital_at(1) as u32;
+        let mut mx4 = c0_b & 255;
+        match bpos {
+            0 => mx4 |= ((last_word_capital & 1) << 3) | (((words >> 4) & 0xf) << 4),
+            1 => mx4 |= ((last_word_capital & 1) << 3) | ((c2_3b_r) << 4) | (bpos & 7),
+            2 => mx4 |= ((last_word_capital & 1) << 3) | ((stream2b & 3) << 4) | (bpos & 7),
+            3 => mx4 |= ((last_word_capital & 1) << 3) | ((words & 1) << 4) | (bpos & 7),
+            4 => mx4 |= ((last_word_capital & 1) << 3) | (bpos & 7),
+            _ => mx4 |= (last_word_capital & 1) << 3,
+        }
+        // Plus the upper 8 bits: ordX clamped × isMatch(0/1).
+        mx4 |= ((s.ord_x as u32) & 0x1f) << 8
+             | (if is_match != 0 { 0x2000 } else { 0 });
+        let _ = last_word_type;  // (not yet folded in this stub)
+        self.mixers[4].cxt = mx4 as usize;
+    }
+}
+
 impl Default for Predictor { fn default() -> Self { Self::new() } }
 
 // ====================================================================
@@ -5313,6 +5401,33 @@ mod tests {
         let p = Predictor::new();
         assert_eq!(p.predict(), 0.5);
         let _ = E; // silence unused
+    }
+
+    #[test]
+    fn set_mixer_contexts_assigns_cxt_for_each_bit_position() {
+        let mut p = Predictor::new();
+        p.state.stream2b = 0xAB;
+        p.state.stream3b = 0x55;
+        p.state.stream3b_r = 0x33;
+        p.state.words   = 0xfc;
+        p.state.numbers = 5;
+        p.state.fc_idx  = 3;
+        p.state.br_fc_idx = 2;
+        p.state.ord_x   = 4;
+
+        // Run for bpos=0..=7 to cover every branch.
+        for bpos in 0..=7 {
+            p.block.bpos = bpos;
+            p.set_mixer_contexts(/*c0_b=*/0xC0, /*is_match=*/0);
+            // Mixers 0/1/2/3/4/6/10 should all have a `cxt` assigned
+            // within their `m` range.
+            assert!(p.mixers[0].cxt < p.mixers[0].m);
+            assert!(p.mixers[1].cxt < p.mixers[1].m);
+            assert!(p.mixers[2].cxt < p.mixers[2].m);
+            assert!(p.mixers[3].cxt < p.mixers[3].m);
+            assert!(p.mixers[6].cxt < p.mixers[6].m);
+            assert!(p.mixers[10].cxt < p.mixers[10].m);
+        }
     }
 
     #[test]
