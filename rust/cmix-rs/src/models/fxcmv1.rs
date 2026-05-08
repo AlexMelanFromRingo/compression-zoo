@@ -3720,6 +3720,27 @@ pub fn build_small_scm() -> Vec<SmallStationaryContextMap> {
     SCM_BITS.iter().map(|&b| SmallStationaryContextMap::new(b as u32, 8)).collect()
 }
 
+/// `st2_p1[i] = clp(sc(12*(i - 2048)))` — prior-init lookup table
+/// passed to ContextMap2 instances. Verbatim from
+/// fxcmv1.cpp:4867-4868.
+pub fn build_st2_p1() -> Vec<i16> {
+    (0..4096)
+        .map(|i| clp(sc(12 * (i as i32 - 2048))))
+        .collect()
+}
+
+/// `st2_p2[i] = clp(sc(14*(i - 2048)))` — same shape with a
+/// steeper slope (used by `cmC[3]`). fxcmv1.cpp:4869.
+pub fn build_st2_p2() -> Vec<i16> {
+    (0..4096)
+        .map(|i| clp(sc(14 * (i as i32 - 2048))))
+        .collect()
+}
+
+/// `st2_p0` is left at upstream's BSS zero-init — used when a
+/// ContextMap wants the "no prior" path.
+pub fn build_st2_p0() -> Vec<i16> { vec![0i16; 4096] }
+
 /// Per-state pre-stretched probability used by upstream's `pre2(STA7)`
 /// to seed `pre1[256]`. We compute it from STA7 (== STA_PARAMS[5]).
 pub fn build_pre1_from_sta7(sta7: &[u8], strt: &[i16]) -> [i16; 256] {
@@ -3832,6 +3853,8 @@ pub struct FxcmState {
     pub is_text:        bool,
     pub is_paragraph:   i32,
     pub is_now_iki:     bool,
+    pub is_math:        bool,
+    pub is_pre:         bool,
     pub last_art:       bool,
     pub utf8_left:      i32,
 
@@ -3890,6 +3913,7 @@ impl FxcmState {
             stream2b_mask: 0,
             ord_x: 0, ord_w: 0,
             is_text: false, is_paragraph: 0, is_now_iki: false,
+            is_math: false, is_pre: false,
             last_art: false, utf8_left: 0,
             sscm_rate: 0, rate: 6,
             last_wt: 0,
@@ -4450,6 +4474,14 @@ pub struct Predictor {
     // Match model + sparse match.
     pub match_model: MatchModel2,
     pub smatch:      SparseMatchModel,
+
+    // ContextMap arrays — three width tiers per upstream:
+    //   * cm_c2  (18) — large state memory  (`<14, 128>`)
+    //   * cm_c1  (8)  — small state memory  (`<3, 32>`)
+    //   * cm_c   (6)  — medium state memory (`<7, 64>`)
+    pub cm_c2: Vec<ContextMap<14, 128>>,
+    pub cm_c1: Vec<ContextMap<3,  32>>,
+    pub cm_c:  Vec<ContextMap<7,  64>>,
 }
 
 impl Predictor {
@@ -4504,6 +4536,90 @@ impl Predictor {
         let match_model = MatchModel2::new(/*log2_size=*/21, /*sm_n=*/1 << 9,
                                            /*sm_limit=*/1023);
 
+        // ContextMap arrays — STA tables are slot-indexed:
+        //   STA1 → 0, STA2 → 1, STA4 → 2, STA5 → 3, STA6 → 4, STA7 → 5.
+        let sta1 = sta_tables[0 * 1024..1 * 1024].to_vec();
+        let sta2 = sta_tables[1 * 1024..2 * 1024].to_vec();
+        let sta4 = sta_tables[2 * 1024..3 * 1024].to_vec();
+        let sta5 = sta_tables[3 * 1024..4 * 1024].to_vec();
+        let sta6 = sta_tables[4 * 1024..5 * 1024].to_vec();
+        let sta7 = sta_tables[5 * 1024..6 * 1024].to_vec();
+
+        let st2_p0 = build_st2_p0();
+        let st2_p1 = build_st2_p1();
+        let st2_p2 = build_st2_p2();
+
+        // c packs (max-contexts | (c_r << 8) | (c_s << 16)).
+        let pack_c = |max_ctx: i32, idx: usize| -> i32 {
+            max_ctx | ((C_R[idx] as i32) << 8) | ((C_S[idx] as i32) << 16)
+        };
+
+        // cmC2 — 18 entries — large state memory.
+        // (m, max_ctx, sta_table, k, u_skip2, st2_p, c_idx)
+        let cm_c2_specs: &[(u32, i32, &Vec<u8>, u8, i32, &Vec<i16>, usize)] = &[
+            ( 8 * 4096 * 4096,      3, &sta6, 0xf0, 1, &st2_p1, 0),
+            (16 * 4096 * 4096,      1, &sta6, 0xf0, 1, &st2_p1, 1),
+            ( 8 * 4096 * 4096,      1, &sta6, 0xf0, 1, &st2_p1, 2),
+            ( 8 * 4096 * 4096,      1, &sta6, 0xf0, 1, &st2_p1, 3),
+            ( 8 * 4096 * 4096,      2, &sta6, 0xf0, 1, &st2_p1, 4),
+            ( 8 * 4096 * 4096,      6, &sta6, 0xf0, 1, &st2_p1, 5),
+            ( 1 * 4096 * 4096 / 64, 1, &sta1, 0,    1, &st2_p1, 6),
+            ( 2 * 4096 * 4096,      1, &sta5, 0xf0, 1, &st2_p1, 7),
+            ( 8 * 4096 * 4096 / 2,  4, &sta4, 0,    1, &st2_p1, 8),
+            ( 8 * 4096 * 4096,      4, &sta6, 0xf0, 1, &st2_p1, 17),
+            ( 8 * 4096 * 4096,      6, &sta5, 0xf0, 1, &st2_p1, 18),
+            ( 8 * 4096 * 4096,      5, &sta5, 0xf0, 1, &st2_p1, 19),
+            ( 8 * 4096 * 4096,      2, &sta6, 0xf0, 1, &st2_p1, 20),
+            (16 * 4096 * 4096,      2, &sta6, 0xf0, 1, &st2_p1, 21),
+            ( 4 * 4096 * 4096 / 2,  1, &sta6, 0xf0, 1, &st2_p1, 23),
+            ( 8 * 64   * 4096,      1, &sta1, 0,    0, &st2_p0, 24),
+            ( 1 * 4096 * 4096 / 2,  1, &sta6, 0xf0, 1, &st2_p1, 17),
+            ( 2 * 4096 * 4096,      2, &sta6, 0xf0, 1, &st2_p1, 17),
+        ];
+        let cm_c2: Vec<ContextMap<14, 128>> = cm_c2_specs.iter().map(
+            |&(m, max_ctx, nn, k, u_skip2, st2_p, idx)| {
+                ContextMap::new(
+                    m, pack_c(max_ctx, idx), C_S3[idx] as i32,
+                    nn, C_S4[idx] as i32, k, u_skip2, st2_p, &ilog,
+                )
+            }).collect();
+
+        // cmC1 — 8 entries — small state memory.
+        let cm_c1_specs: &[(u32, i32, &Vec<u8>, u8, i32, &Vec<i16>, usize)] = &[
+            (    32 * 4096, 2, &sta6, 0,    0, &st2_p0,  9),
+            ( 2 * 32 * 4096, 3, &sta7, 0,    1, &st2_p1, 10),
+            (    32 * 4096, 4, &sta2, 0,    1, &st2_p1, 11),
+            (   128 * 4096, 2, &sta1, 0,    0, &st2_p0, 16),
+            (    16 * 4096, 5, &sta7, 0,    1, &st2_p1, 12),
+            (    32 * 4096, 2, &sta7, 0,    1, &st2_p1, 11),  // upstream cmC1[5] absent → fill placeholder
+            ( 1 * 16 * 4096, 1, &sta6, 0,    0, &st2_p1,  5),
+            (    16 * 4096, 4, &sta2, 0,    1, &st2_p1, 12),
+        ];
+        let cm_c1: Vec<ContextMap<3, 32>> = cm_c1_specs.iter().map(
+            |&(m, max_ctx, nn, k, u_skip2, st2_p, idx)| {
+                ContextMap::new(
+                    m, pack_c(max_ctx, idx), C_S3[idx] as i32,
+                    nn, C_S4[idx] as i32, k, u_skip2, st2_p, &ilog,
+                )
+            }).collect();
+
+        // cmC — 6 entries — medium state memory.
+        let cm_c_specs: &[(u32, i32, &Vec<u8>, u8, i32, &Vec<i16>, usize)] = &[
+            (   16 * 4096, 7, &sta2, 0,    1, &st2_p1, 13),
+            (64 * 2 * 4096, 3, &sta5, 0xf0, 0, &st2_p0, 14),
+            (    2 * 4096, 2, &sta2, 0xf0, 0, &st2_p0, 15),
+            (   32 * 4096, 2, &sta2, 0x00, 1, &st2_p2, 22),
+            (  512 * 4096, 1, &sta1, 0xf0, 1, &st2_p1, 25),
+            (  512 * 4096, 1, &sta1, 0xf0, 1, &st2_p1, 26),
+        ];
+        let cm_c: Vec<ContextMap<7, 64>> = cm_c_specs.iter().map(
+            |&(m, max_ctx, nn, k, u_skip2, st2_p, idx)| {
+                ContextMap::new(
+                    m, pack_c(max_ctx, idx), C_S3[idx] as i32,
+                    nn, C_S4[idx] as i32, k, u_skip2, st2_p, &ilog,
+                )
+            }).collect();
+
         Self {
             model_predictions: vec![0.5f32; NUM_MODELS],
             prediction_index: 0,
@@ -4519,6 +4635,7 @@ impl Predictor {
             worcxt2: WordsContext::new(),
             match_model,
             smatch: SparseMatchModel::new(),
+            cm_c2, cm_c1, cm_c,
         }
     }
 
@@ -4632,6 +4749,10 @@ mod tests {
         // FxcmState boot constants reachable via predictor.
         assert_eq!(p.state.ah2, 0x765BA55C);
         assert_eq!(p.state.pr,  2048);
+        // ContextMap arrays match upstream's cmC2[18], cmC1[8], cmC[6].
+        assert_eq!(p.cm_c2.len(), 18);
+        assert_eq!(p.cm_c1.len(),  8);
+        assert_eq!(p.cm_c.len(),   6);
     }
 
     #[test]
