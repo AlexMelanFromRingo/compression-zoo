@@ -33,29 +33,59 @@ need to be GPL-3.0 compatible.
 
 ## Status
 
-Not implemented yet. CMIX is the hardest to wrap because:
+Implemented and built. The DLL ships as a 7-Zip codec plugin and works
+correctly for the typical "compress in one process, extract in another"
+workflow.
 
-1. Its source tree contains many submodels (text, image, audio, jpeg,
-   x86), each with its own initialisation cost. We need to vendor the
-   whole tree (`upstream/cmix/`).
-2. The CLI driver in CMIX uses stdin/stdout; the codec interfaces are
-   there but not really designed as a library.
+**Known limitation: same-process round-trip does not work.** CMIX is built
+around many `static`-scope mutable variables in `paq8.cpp`, `fxcmv1.cpp`
+and other models (e.g. `paq8::y`, `paq8::bpos`, `paq8::blpos`,
+`paq8::c4`, `paq8::col`, `paq8::x4`, dozens of function-local `static`s).
+These are not reset between `Predictor` instances, so encoding then
+decoding inside the same process gets the decoder Predictor a non-zero
+starting state and round-trips fail starting from byte 1.
 
-Plan:
+In practice this means:
 
-1. `git submodule add https://github.com/byronknoll/cmix
-   plugins/cmix/upstream`.
-2. Build `libcmix.a` from the upstream `Makefile` cross-compiled with
-   MinGW-w64, with `-DSTANDALONE_LIB` style flags so we don't pull the
-   `main()` driver in.
-3. Implement `CCmixEncoder` / `CCmixDecoder` in `src/CmixCoder.cpp`,
-   buffering each input block (CMIX needs a known total size to model
-   well) and calling `cmix::compress` / `cmix::decompress`.
-4. Document RAM/time expectations *prominently* in the 7-Zip method
-   description string (the plugin name itself can include `(slow,
-   needs RAM)`).
+  * `7z a archive.7z -m0=cmix file` — works (encode-only, fresh process)
+  * `7z x archive.7z` later in a new 7-Zip invocation — works
+  * Re-using a single 7-Zip process to encode then test the archive — fails
+
+Fixing this for in-process reuse would require a significant CMIX
+refactor (resetting every static state across all 30+ source files).
+The Linux test harness (`tests/run.sh`) drives encode and decode as
+two separate `test_linux` processes for that reason.
+
+## What's vendored
+
+`upstream/` is a snapshot of <https://github.com/byronknoll/cmix> with
+two small modifications, marked `// CMIX-MOD:` in the source:
+
+  * `src/coder/encoder.{h,cpp}` — `std::ofstream*` → `std::ostream*`.
+  * `src/coder/decoder.{h,cpp}` — `std::ifstream*` → `std::istream*`.
+
+Those let our wrapper feed CMIX from a `std::ostringstream` /
+`std::istringstream` instead of demanding a real file. We also omit the
+preprocessor (`src/preprocess/`) and the enwik9-specific tools
+(`src/enwik9-preproc/`); only the core context-mixing predictor + arith
+coder are linked in.
 
 ## Build
 
-Same pattern as `plugins/zpaq/Makefile`. Will be added once the codec
-source is in place.
+```bash
+make -C plugins/cmix
+make -C plugins/cmix install      # copies build/cmix.dll to $CODECS_DIR
+```
+
+The DLL is large (~150 MiB) because of the static PAQ8 tables.
+
+## Test
+
+```bash
+make -C plugins/cmix
+plugins/cmix/tests/run.sh tiny   # 8 bytes
+plugins/cmix/tests/run.sh small  # 64 bytes; ~10 s wall clock
+```
+
+`run.sh` deliberately spawns separate processes for encode and decode
+to side-step the same-process global-state bug.
