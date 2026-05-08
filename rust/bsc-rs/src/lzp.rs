@@ -69,6 +69,121 @@ fn ctx_hash(context: u32, mask: u32) -> usize {
     (((context >> 15) ^ context ^ (context >> 3)) & mask) as usize
 }
 
+/// Encode `input` with LZP and append the encoded bytes to `output`.
+/// Returns the number of bytes appended.
+///
+/// Mirrors the scalar slow-path of `bsc_lzp_encode_block` from upstream
+/// (we deliberately do NOT replicate the SSE/AArch64 fast paths — they
+/// produce identical wire output, just faster). The encoder finds
+/// matches by walking forward from the previously-recorded position
+/// `value` and comparing bytes; if `match_len >= min_len` the byte
+/// stream gets `FLAG, len_bytes...`, where `len_bytes` encodes
+/// `match_len - min_len` as a sequence terminated by any byte != 254.
+/// A literal `FLAG` byte in the input that would otherwise be confused
+/// with a match is escaped as `FLAG, 255`.
+pub fn encode_block(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    hash_size: i32,
+    min_len: i32,
+) -> Result<usize, LzpError> {
+    validate_params(hash_size, min_len)?;
+    if input.len() < 4 {
+        return Err(LzpError::UnexpectedEob);
+    }
+
+    let mask: u32 = (1u32 << hash_size as u32) - 1;
+    let mut lookup: Vec<i32> = vec![0; (mask as usize) + 1];
+
+    let out_start = output.len();
+    output.extend_from_slice(&input[..4]);
+    let mut ip = 4usize;
+
+    while ip < input.len() {
+        // Predictor sees the last 4 bytes of decoder-mirror, which
+        // equals input[..ip] by construction (decoder reconstructs
+        // input exactly).
+        let context = build_context(&input[ip - 4..ip]);
+        let index = ctx_hash(context, mask);
+        let value = lookup[index];
+        lookup[index] = ip as i32;
+
+        if value > 0 {
+            let v = value as usize;
+            // Find longest match starting at ip vs v. Overlap (v+m
+            // crossing ip) is fine: the decoder copies byte-by-byte,
+            // so a periodic pattern like "ABCDABCD..." encodes as one
+            // big match — the standard LZ77 run-length idiom.
+            let mut m = 0usize;
+            let max = input.len() - ip;
+            while m < max && v + m < input.len() && input[v + m] == input[ip + m] {
+                m += 1;
+            }
+            if (m as i32) >= min_len {
+                output.push(LZP_MATCH_FLAG);
+                let mut k = m as i32 - min_len;
+                while k >= 254 {
+                    output.push(254);
+                    k -= 254;
+                }
+                output.push(k as u8);
+                ip += m;
+                continue;
+            }
+            if input[ip] == LZP_MATCH_FLAG {
+                // Escape: literal flag in original.
+                output.push(LZP_MATCH_FLAG);
+                output.push(0xFF);
+                ip += 1;
+                continue;
+            }
+        }
+        output.push(input[ip]);
+        ip += 1;
+    }
+
+    Ok(output.len() - out_start)
+}
+
+/// Wire-format compatible with libbsc's `bsc_lzp_compress` for the
+/// single-block case: prepends a 1-byte `nBlocks=1` header before the
+/// LZP block bytes.
+///
+/// Returns the number of bytes appended to `output`.
+pub fn compress(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    hash_size: i32,
+    min_len: i32,
+) -> Result<usize, LzpError> {
+    let start = output.len();
+    output.push(1u8); // nBlocks = 1
+    encode_block(input, output, hash_size, min_len)?;
+    Ok(output.len() - start)
+}
+
+/// Inverse of [`compress`]. Reads the leading `nBlocks` byte and then
+/// decodes a single block. Multi-block inputs (nBlocks > 1) are not
+/// supported yet.
+pub fn decompress(
+    input: &[u8],
+    output: &mut Vec<u8>,
+    hash_size: i32,
+    min_len: i32,
+) -> Result<usize, LzpError> {
+    if input.is_empty() {
+        return Err(LzpError::UnexpectedEob);
+    }
+    let n_blocks = input[0];
+    if n_blocks == 1 {
+        decode_block(&input[1..], output, hash_size, min_len)
+    } else {
+        // TODO: multi-block split; libbsc switches to it for very
+        // large inputs. We keep single-block for now.
+        Err(LzpError::BadParameter)
+    }
+}
+
 /// Decode an LZP-encoded block into `output`. Returns the number of
 /// bytes written.
 ///
@@ -154,74 +269,15 @@ pub fn decode_block(
 mod tests {
     use super::*;
 
-    /// Round-trip helper: encode `input` with the given (hash_size,
-    /// min_len) using a small reference encoder (defined below in this
-    /// test module), then decode through our port and verify the
-    /// output matches.
-    fn round_trip(input: &[u8], hash_size: i32, min_len: i32) {
-        let encoded = reference_encode(input, hash_size, min_len);
+    /// Round-trip helper: encode `input` with our port, decode with
+    /// our port, verify the output matches.
+    fn round_trip(input: &[u8], hash_size: i32, min_len: i32) -> usize {
+        let mut encoded = Vec::with_capacity(input.len() + 64);
+        encode_block(input, &mut encoded, hash_size, min_len).expect("encode");
         let mut decoded = Vec::with_capacity(input.len());
         decode_block(&encoded, &mut decoded, hash_size, min_len).expect("decode");
         assert_eq!(&decoded[..], input, "lzp round-trip differs");
-    }
-
-    /// Trivially correct (slow) reference encoder used to exercise our
-    /// decoder. The encoder maintains two parallel streams:
-    /// `encoded` (what we return — flag + length tokens, literals) and
-    /// `mirror` (what the decoder will reconstruct — exactly == input
-    /// up to the current position). Hash table lookups use `mirror`,
-    /// not `encoded`.
-    fn reference_encode(input: &[u8], hash_size: i32, min_len: i32) -> Vec<u8> {
-        if input.len() < 5 {
-            return input.to_vec();
-        }
-        let mask: u32 = (1u32 << hash_size as u32) - 1;
-        let mut lookup: Vec<i32> = vec![0; (mask as usize) + 1];
-        let mut encoded = Vec::with_capacity(input.len() + 64);
-
-        // Mirror "what the decoder has emitted so far" — we keep this
-        // as a slice into `input` because by construction it equals
-        // `input[..ip]`.
-        encoded.extend_from_slice(&input[..4]);
-        let mut ip = 4usize;
-
-        while ip < input.len() {
-            let mirror = &input[..ip];
-            let context = build_context(&mirror[mirror.len() - 4..]);
-            let index = ctx_hash(context, mask);
-            let value = lookup[index];
-            lookup[index] = ip as i32;
-
-            let mut matched = 0usize;
-            if value > 0 {
-                let v = value as usize;
-                while matched < input.len() - ip
-                    && v + matched < mirror.len()
-                    && mirror[v + matched] == input[ip + matched]
-                {
-                    matched += 1;
-                }
-            }
-
-            if (matched as i32) >= min_len {
-                encoded.push(LZP_MATCH_FLAG);
-                let mut len = matched as i32 - min_len;
-                while len >= 254 {
-                    encoded.push(254);
-                    len -= 254;
-                }
-                encoded.push(len as u8);
-                ip += matched;
-            } else if input[ip] == LZP_MATCH_FLAG && value > 0 {
-                encoded.push(LZP_MATCH_FLAG);
-                encoded.push(0xFF);
-                ip += 1;
-            } else {
-                encoded.push(input[ip]);
-                ip += 1;
-            }
-        }
-        encoded
+        encoded.len()
     }
 
     #[test]
@@ -277,5 +333,54 @@ mod tests {
         input.push(LZP_MATCH_FLAG);
         input.extend_from_slice(b"after the flag");
         round_trip(&input, 15, 6);
+    }
+
+    #[test]
+    fn round_trip_lots_of_repetition() {
+        // 4 KiB of repeating ASCII. LZP should knock this down a lot.
+        let mut input = Vec::with_capacity(4096);
+        while input.len() < 4096 {
+            input.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+        }
+        input.truncate(4096);
+        let encoded_size = round_trip(&input, 15, 6);
+        // LZP after the first occurrence of the phrase should turn the
+        // remainder mostly into match tokens. Sanity-check that we got
+        // *some* compression.
+        assert!(encoded_size < input.len() / 2,
+            "expected significant LZP compression, got {} -> {}",
+            input.len(), encoded_size);
+    }
+
+    #[test]
+    fn round_trip_random_no_compression() {
+        // Pseudo-random bytes have effectively zero LZP-detectable
+        // structure; output should be roughly size-of-input with a few
+        // escapes for incidental 0xF2 bytes.
+        let mut input = vec![0u8; 4096];
+        let mut x = 0x9E3779B1u32;
+        for b in input.iter_mut() {
+            x = x.wrapping_mul(2654435769).wrapping_add(1);
+            *b = (x >> 24) as u8;
+        }
+        let encoded_size = round_trip(&input, 15, 6);
+        // Random data shouldn't grow by more than ~5% (escape bytes).
+        assert!(encoded_size < input.len() + input.len() / 16,
+            "random grew too much: {} -> {}", input.len(), encoded_size);
+    }
+
+    #[test]
+    fn long_match_crosses_254_boundary() {
+        // Force a >= 254-byte match so the length encoding chains
+        // 254-bytes. Pattern: 8-byte prefix to fill the hash, then a
+        // long run of identical "ABCD" so the encoder finds a huge
+        // match shortly after the first occurrence.
+        let mut input = Vec::with_capacity(2048);
+        input.extend_from_slice(b"PREFIX..");
+        for _ in 0..512 {
+            input.extend_from_slice(b"ABCD");
+        }
+        let encoded_size = round_trip(&input, 15, 6);
+        assert!(encoded_size < 200, "long-match encoding should compress hard, got {}", encoded_size);
     }
 }
