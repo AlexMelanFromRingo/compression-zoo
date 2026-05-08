@@ -216,6 +216,126 @@ impl<S: State> Indirect<S> {
     }
 }
 
+// ---------------- Bracket ---------------------------------------------
+
+use std::collections::HashMap;
+
+/// `ByteModel` subclass that tracks open/close bracket pairs and
+/// emits a probability boost for the matching close character at
+/// each step. Mirrors `models/bracket.{h,cpp}`.
+pub struct Bracket {
+    pub byte_model: ByteModel,
+    /// Open → close char map. Includes quotes (where open == close).
+    brackets: HashMap<u8, u8>,
+    distance_limit: u32,
+    stack_limit: u32,
+    stats_limit: u32,
+    /// Stack of currently-open brackets.
+    active: Vec<u32>,
+    /// Per-stack-entry distance counter.
+    distance: Vec<u32>,
+    /// `stats[open][distance] = (matched_close_count, total_close_count)`.
+    /// Initialised to (1, 256).
+    stats: Vec<Vec<(u32, u32)>>,
+    vocab: Vec<bool>,
+}
+
+impl Bracket {
+    pub fn new(distance_limit: u32, stack_limit: u32, stats_limit: u32, vocab: Vec<bool>) -> Self {
+        let mut brackets = HashMap::new();
+        brackets.insert(b'(', b')');
+        brackets.insert(b'{', b'}');
+        brackets.insert(b'[', b']');
+        brackets.insert(b'<', b'>');
+        brackets.insert(b'\'', b'\'');
+        brackets.insert(b'"', b'"');
+
+        let stats = (0..256).map(|_| {
+            (0..distance_limit as usize).map(|_| (1u32, 256u32)).collect()
+        }).collect();
+
+        Self {
+            byte_model: ByteModel::new(),
+            brackets,
+            distance_limit,
+            stack_limit,
+            stats_limit,
+            active: Vec::new(),
+            distance: Vec::new(),
+            stats,
+            vocab,
+        }
+    }
+
+    fn vocab_array(&self) -> [bool; 256] {
+        let mut a = [false; 256];
+        for i in 0..256.min(self.vocab.len()) { a[i] = self.vocab[i]; }
+        a
+    }
+
+    fn write_probs(&mut self, open: u8, distance: usize) {
+        let (matched, total) = self.stats[open as usize][distance];
+        let p = matched as f32 / total as f32;
+        let close = self.brackets[&open];
+        for i in 0..256 { self.byte_model.probs[i] = (1.0 - p) / 255.0; }
+        self.byte_model.probs[close as usize] = p;
+    }
+
+    pub fn byte_update(&mut self, byte: u8) {
+        // Reset to uniform first.
+        for i in 0..256 { self.byte_model.probs[i] = 1.0 / 256.0; }
+
+        let is_open_or_quote = self.brackets.contains_key(&byte);
+        let stack_top_is_self_quote = !self.active.is_empty()
+            && (self.active[self.active.len() - 1] as u8) == byte
+            && self.brackets.get(&byte) == Some(&byte);
+
+        if self.active.is_empty() || (is_open_or_quote && !stack_top_is_self_quote) {
+            // Push a new opener (if it is one).
+            if is_open_or_quote {
+                self.active.push(byte as u32);
+                self.distance.push(0);
+                if self.active.len() as u32 > self.stack_limit {
+                    self.active.remove(0);
+                    self.distance.remove(0);
+                }
+                self.write_probs(byte, 0);
+            }
+        } else {
+            let active = self.active[self.active.len() - 1] as u8;
+            let mut distance = self.distance[self.distance.len() - 1];
+
+            // Bump total; bump matched if `byte` closes `active`.
+            self.stats[active as usize][distance as usize].1 += 1;
+            if self.brackets[&active] == byte {
+                self.stats[active as usize][distance as usize].0 += 1;
+            }
+            // Periodic halving when totals overflow stats_limit.
+            if self.stats[active as usize][distance as usize].1 > self.stats_limit {
+                self.stats[active as usize][distance as usize].0 /= 2;
+                self.stats[active as usize][distance as usize].1 /= 2;
+            }
+
+            if self.brackets[&active] == byte || distance >= self.distance_limit - 1 {
+                self.active.pop();
+                self.distance.pop();
+                if !self.active.is_empty() {
+                    let active = self.active[self.active.len() - 1] as u8;
+                    let distance = self.distance[self.distance.len() - 1] as usize;
+                    self.write_probs(active, distance);
+                }
+            } else {
+                let n = self.distance.len();
+                self.distance[n - 1] += 1;
+                distance += 1;
+                self.write_probs(active, distance as usize);
+            }
+        }
+        let vocab = self.vocab_array();
+        self.byte_model.byte_update(&vocab);
+    }
+}
+
 // ---------------- ByteModel -------------------------------------------
 
 /// Byte-level model — maintains a 256-entry probability vector per
@@ -461,6 +581,32 @@ mod tests {
         // After 8 binary-search narrowings, bot == top == target.
         assert_eq!(bm.bot, target as i32);
         assert_eq!(bm.top, target as i32);
+    }
+
+    #[test]
+    fn bracket_pushes_and_pops() {
+        let vocab = vec![true; 256];
+        let mut b = Bracket::new(64, 16, 1000, vocab);
+        // Train: 50 immediate open-close pairs at distance=0.
+        // After this stats[`(`][0] should be ≈ (51, 306) so p ≈ 0.16.
+        for _ in 0..50 {
+            b.byte_update(b'(');
+            b.byte_update(b')');
+        }
+        // Now open another bracket; the boosted-close prob must be
+        // well above the uniform 1/256 baseline.
+        b.byte_update(b'(');
+        let p_close = b.byte_model.probs[b')' as usize];
+        assert!(p_close > 0.1,
+            "matching close prob should be boosted, got {}", p_close);
+        let p_other: f32 = (0..256).filter(|&i| i != b')' as usize)
+            .map(|i| b.byte_model.probs[i]).sum();
+        assert!((p_close + p_other - 1.0).abs() < 1e-3,
+            "bracket probs should sum to ~1, got {}", p_close + p_other);
+        // Closing bracket: stack pops and probs reset to ~uniform.
+        b.byte_update(b')');
+        let p0 = b.byte_model.probs[0];
+        assert!((p0 - 1.0/256.0).abs() < 1e-3, "p0 = {}", p0);
     }
 
     #[test]
