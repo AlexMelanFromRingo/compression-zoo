@@ -1843,6 +1843,166 @@ impl ColumnContext {
 }
 
 // ====================================================================
+// `WordsContext` — sentence/word state. Tracks a sliding window of
+// recent words plus their types, stems, and capitalisation.
+// ====================================================================
+
+pub struct WordsContext {
+    pub sbytes: CmixVec<u16>,
+    pub r#type: CmixVec<u32>,
+    pub stem: CmixVec<u32>,
+    pub capital: CmixVec<u8>,
+    pub fword: u32,
+    pub ftype: u32,
+    pub pbyte: u8,
+    pub wordcount: i32,
+    pub upper: i32,
+    pub r#ref: i32,
+}
+
+impl WordsContext {
+    pub fn new() -> Self {
+        Self {
+            sbytes: CmixVec::new(64 * 4),
+            r#type: CmixVec::new(64 * 4),
+            stem:   CmixVec::new(64 * 4),
+            capital: CmixVec::new(64 * 4),
+            fword: 0, ftype: 0, pbyte: 0,
+            wordcount: 0, upper: 0, r#ref: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.sbytes.clear(); self.r#type.clear();
+        self.stem.clear(); self.capital.clear();
+        self.fword = 0; self.pbyte = 0; self.wordcount = 0;
+        self.upper = 0; self.ftype = 0; self.r#ref = 0;
+    }
+
+    pub fn set(&mut self, b: u8, a: i32) { self.pbyte = b; self.upper = a; }
+
+    pub fn update(&mut self, w: u32, b: u8, t: u32, s: u32) {
+        if self.fword == 0 { self.fword = w; }
+        self.sbytes.push((self.pbyte as u16) * 256 + b as u16);
+        self.r#type.push(t);
+        self.stem.push(s);
+        self.capital.push(self.upper as u8);
+        self.pbyte = 0;
+        self.wordcount += 1;
+        if self.ftype == 0 && t != 0 { self.ftype = t; }
+    }
+
+    pub fn remove(&mut self) {
+        if !self.stem.is_empty() {
+            self.sbytes.pop();
+            self.r#type.pop();
+            self.stem.pop();
+            self.capital.pop();
+            self.wordcount -= 1;
+        }
+    }
+
+    pub fn word(&self, i: usize) -> u32 {
+        let n = self.stem.len();
+        if n >= i && i > 0 { self.stem.at(n - i) } else { 0 }
+    }
+    pub fn s_bytes(&self, i: usize) -> u16 {
+        let n = self.sbytes.len();
+        if n >= i && i > 0 { self.sbytes.at(n - i) } else { 0 }
+    }
+    pub fn types(&self, i: usize) -> u32 {
+        let n = self.r#type.len();
+        if n >= i && i > 0 { self.r#type.at(n - i) } else { 0 }
+    }
+    pub fn capital_at(&self, i: usize) -> u8 {
+        let n = self.capital.len();
+        if n >= i && i > 0 { self.capital.at(n - i) } else { 0 }
+    }
+
+    pub fn last(&self, j: usize, t: u32) -> u32 {
+        let num = self.r#type.len();
+        if t == 0 { return self.word(j); }
+        if num >= j {
+            for i in j..=num {
+                if (self.types(i) & t) != 0 { return self.word(i); }
+            }
+        }
+        self.word(j)
+    }
+
+    pub fn last_if(&self, j: usize, t: u32) -> u32 {
+        let num = self.r#type.len();
+        if t == 0 { return self.word(j); }
+        if num >= j {
+            for i in j..=num {
+                if (self.types(i) & t) != 0 { return self.word(i); }
+            }
+        }
+        0
+    }
+
+    pub fn last_idx(&self, j: usize, t: u32) -> u32 {
+        let num = self.r#type.len();
+        if t == 0 { return 0; }
+        if num >= j {
+            for i in j..=num {
+                if (self.types(i) & t) != 0 { return i as u32; }
+            }
+        }
+        0
+    }
+
+    pub fn remove_words_l(&mut self, len: usize, c: u8, d: u8, f: bool) {
+        if (self.s_bytes(1) & 0xFF) as u8 == d {
+            for i in 1..len {
+                if ((self.s_bytes(i) >> 8) as u8) == c {
+                    while ((self.s_bytes(1) >> 8) as u8) != c { self.remove(); }
+                    if f { self.remove(); }
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn remove_words_r(&mut self, len: usize, c: u8, d: u8, f: bool) {
+        if (self.s_bytes(1) & 0xFF) as u8 == d {
+            for i in 1..len {
+                if ((self.s_bytes(i) & 0xFF) as u8) == c {
+                    while ((self.s_bytes(1) & 0xFF) as u8) != c { self.remove(); }
+                    if f { self.remove(); }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+impl Default for WordsContext { fn default() -> Self { Self::new() } }
+
+// ====================================================================
+// Inline hash helper used throughout FXCMv1.
+// ====================================================================
+
+#[inline]
+pub fn fxcm_hash3(a: u32, b: u32, c: u32) -> u32 {
+    let h = a.wrapping_mul(110_002_499)
+        .wrapping_add(b.wrapping_mul(30_005_491))
+        .wrapping_add(c.wrapping_mul(50_004_239));
+    h ^ (h >> 9) ^ (a >> 3) ^ (b >> 3) ^ (c >> 4)
+}
+
+#[inline]
+pub fn char_swap(c: i32) -> i32 {
+    let mut c = c;
+    if c >= b'{' as i32 && c < 127 { c += b'P' as i32 - b'{' as i32; }
+    else if c >= b'P' as i32 && c < b'T' as i32 { c -= b'P' as i32 - b'{' as i32; }
+    else if (c >= b':' as i32 && c <= b'?' as i32)
+        || (c >= b'J' as i32 && c <= b'O' as i32) { c ^= 0x70; }
+    if c == b'X' as i32 || c == b'`' as i32 { c ^= b'X' as i32 ^ b'`' as i32; }
+    c
+}
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -2142,6 +2302,27 @@ mod tests {
         assert_eq!(v.last(), 8);
         assert_eq!(v.pop(), 8);
         assert_eq!(v.last(), 7);
+    }
+
+    #[test]
+    fn words_context_tracks_recent_words() {
+        let mut w = WordsContext::new();
+        w.update(0xCAFE, b'a', 0x01, 0x100);
+        w.update(0xBEEF, b'b', 0x02, 0x200);
+        w.update(0x1234, b'c', 0x04, 0x300);
+        // Most-recent word is index 1.
+        assert_eq!(w.word(1), 0x300);
+        assert_eq!(w.word(2), 0x200);
+        // First word fills `fword`.
+        assert_eq!(w.fword, 0xCAFE);
+        // type[1] & 0x04 → return that word.
+        assert_eq!(w.last(1, 0x04), 0x300);
+    }
+
+    #[test]
+    fn fxcm_hash_is_deterministic() {
+        assert_eq!(fxcm_hash3(1, 2, 3), fxcm_hash3(1, 2, 3));
+        assert_ne!(fxcm_hash3(1, 2, 3), fxcm_hash3(3, 2, 1));
     }
 
     #[test]
