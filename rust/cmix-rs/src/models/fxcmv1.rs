@@ -5314,6 +5314,26 @@ impl Predictor {
 }
 
 impl Predictor {
+    /// Sentence-cleanup pass over the WordsContext stacks — port of
+    /// fxcmv1.cpp:4280-4287. Removes word pairs surrounded by:
+    ///   * parentheses `( )`,
+    ///   * wiki internal-link brackets `[|`,
+    ///   * `< :` (html-link prefix),
+    ///   * template `= |` (only when colcxt is in template mode),
+    ///   * `< >` (html tag).
+    pub fn cleanup_worcxt_brackets(&mut self) {
+        self.worcxt .remove_words_l(8, b'(', b')', false);
+        self.worcxt1.remove_words_l(8, b'(', b')', false);
+        self.worcxt .remove_words_l(8, SQUAREOPEN_CHR, VERTICALBAR_CHR, false);
+        self.worcxt1.remove_words_l(8, SQUAREOPEN_CHR, VERTICALBAR_CHR, false);
+        self.worcxt .remove_words_l(8, LESSTHAN_CHR,   COLON_CHR,       false);
+        if self.colcxt.is_temp {
+            self.worcxt.remove_words_r(10, EQUALS_CHR, VERTICALBAR_CHR, false);
+        }
+        self.worcxt .remove_words_l(8, LESSTHAN_CHR, GREATERTHAN_CHR, false);
+        self.worcxt1.remove_words_l(8, LESSTHAN_CHR, GREATERTHAN_CHR, false);
+    }
+
     /// Per-bit ContextMap mix chain — fxcmv1.cpp:4581-4629. Calls
     /// every `cm.mix1(...)` (32 ContextMaps total) plus the seven
     /// SmallStationaryContextMap predictors and the MatchModel /
