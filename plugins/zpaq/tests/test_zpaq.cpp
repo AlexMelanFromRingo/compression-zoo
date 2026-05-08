@@ -116,8 +116,9 @@ typedef HRESULT (STDAPICALLTYPE *PFN_GetNumberOfMethods)(UInt32 *);
 typedef HRESULT (STDAPICALLTYPE *PFN_GetMethodProperty)(UInt32, PROPID, PROPVARIANT*);
 
 static GUID make_clsid(UInt16 data3, UInt64 methodId) {
+    // 7-Zip uses SetUi64 to pack the method ID into Data4 — little-endian.
     GUID g = { 0x23170F69, 0x40C1, data3, { 0,0,0,0, 0,0,0,0 } };
-    for (int i = 0; i < 8; i++) g.Data4[i] = (Byte)(methodId >> ((7 - i) * 8));
+    for (int i = 0; i < 8; i++) g.Data4[i] = (Byte)(methodId >> (i * 8));
     return g;
 }
 
@@ -180,8 +181,23 @@ int main(int argc, char **argv) {
 
     // Encode.
     ICompressCoder *enc = NULL;
-    if (pCreateObject(&encClsid, &kIIDCoder, (void**)&enc) != S_OK || !enc) {
-        fprintf(stderr, "CreateObject(encoder) failed\n"); return 1;
+    {
+        HRESULT hr = pCreateObject(&encClsid, &kIIDCoder, (void**)&enc);
+        fprintf(stderr, "CreateObject(encoder): hr=0x%08lx enc=%p\n",
+            (long)hr, (void*)enc);
+        // Dump GUIDs for diagnosis.
+        auto dump_guid = [](const char* lbl, const GUID *g) {
+            fprintf(stderr, "  %s = %08lx-%04x-%04x-%02x%02x%02x%02x%02x%02x%02x%02x\n",
+                lbl, (long)g->Data1, g->Data2, g->Data3,
+                g->Data4[0], g->Data4[1], g->Data4[2], g->Data4[3],
+                g->Data4[4], g->Data4[5], g->Data4[6], g->Data4[7]);
+        };
+        dump_guid("encClsid ", &encClsid);
+        dump_guid("kIIDCoder", &kIIDCoder);
+        if (hr != S_OK || !enc) {
+            fprintf(stderr, "CreateObject(encoder) failed\n");
+            return 1;
+        }
     }
     CMemReader  encIn(input.data(), input.size());
     CMemWriter  encOut;
