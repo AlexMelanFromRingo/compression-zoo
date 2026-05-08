@@ -19,7 +19,7 @@ SDK        := ../sdk
 CXXFLAGS   += -I$(SDK) -I$(SDK)/CPP -include $(SDK)/StdAfx.h
 LDFLAGS    := -shared -static-libgcc -static-libstdc++ \
               -Wl,--kill-at -Wl,--gc-sections
-LIBS       := -loleaut32 -luuid -lstdc++
+LIBS       := -loleaut32 -luuid
 
 BUILD      := build
 TARGET     := $(BUILD)/bsc.dll
