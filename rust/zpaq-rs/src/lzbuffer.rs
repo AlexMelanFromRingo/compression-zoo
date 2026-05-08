@@ -57,10 +57,189 @@ pub fn preprocess(input: &[u8], args: LzArgs) -> Vec<u8> {
     }
 
     match level {
+        1 => preprocess_lz77_var(&buf, args),
         2 => preprocess_lz77_byte(&buf, args),
         3 => preprocess_bwt(&buf),
-        _ => panic!("level 1 (variable-bit LZ77) not yet ported"),
+        _ => panic!("invalid level {}", level),
     }
+}
+
+/// `floor(log2(x)) + 1` — number of bits to represent `x`. Mirrors
+/// upstream `int lg(unsigned x)` from libzpaq.cpp:6566.
+fn lg(mut x: u32) -> u32 {
+    let mut r = 0u32;
+    if x >= 1 << 16 { r += 16; x >>= 16; }
+    if x >= 1 << 8  { r += 8;  x >>= 8;  }
+    if x >= 1 << 4  { r += 4;  x >>= 4;  }
+    static TBL: [u32; 16] = [0,1,2,2,3,3,3,3,4,4,4,4,4,4,4,4];
+    TBL[x as usize] + r
+}
+
+/// Bit-level writer that packs k-bit values LSB-first into bytes.
+/// Mirrors upstream's `void putb(unsigned x, int k)`.
+struct BitWriter {
+    out: Vec<u8>,
+    bits: u32,
+    nbits: u32,
+}
+
+impl BitWriter {
+    fn new() -> Self { Self { out: Vec::new(), bits: 0, nbits: 0 } }
+
+    fn putb(&mut self, x: u32, k: u32) {
+        let masked = x & ((1u32 << k) - 1);
+        self.bits |= masked << self.nbits;
+        self.nbits += k;
+        while self.nbits > 7 {
+            self.out.push(self.bits as u8);
+            self.bits >>= 8;
+            self.nbits -= 8;
+        }
+    }
+
+    fn put_byte(&mut self, b: u8) { self.putb(b as u32, 8); }
+
+    fn flush(&mut self) {
+        if self.nbits > 0 {
+            self.out.push(self.bits as u8);
+            self.bits = 0; self.nbits = 0;
+        }
+    }
+}
+
+// -------------------- Level 1: variable-bit LZ77 ----------------------
+
+fn preprocess_lz77_var(input: &[u8], args: LzArgs) -> Vec<u8> {
+    let n = input.len();
+    let min_match = args.min_match.max(4) as usize; // upstream requires min ≥ 4 for level 1
+    let max_match = (1 << 14) * 3;
+    let max_literal = (1 << 14) / 4;
+    let bucket = ((1u32 << args.log_bucket) - 1) as usize;
+    let ht_bits = args.log_ht_size.max(8) as usize;
+    let ht_size = 1usize << ht_bits;
+    let check_bits = (12i32 - args.log_block_mib as i32).max(0) as u32;
+    let check_mask: u32 = (1u32 << check_bits) - 1;
+    let shift1 = if min_match > 0 { (ht_bits as u32 - 1) / min_match as u32 + 1 } else { 1 };
+    let rb = if args.log_block_mib > 4 { args.log_block_mib - 4 } else { 0 };
+
+    let mut ht: Vec<u32> = vec![0; ht_size];
+    let mut bw = BitWriter::new();
+
+    fn emit_literal_var(bw: &mut BitWriter, input: &[u8], lit_start: &mut Option<usize>, end: usize) {
+        if let Some(start) = *lit_start {
+            let mut lit = (end - start) as u32;
+            if lit > 0 {
+                // 00 prefix.
+                bw.putb(0, 2);
+                let mut ll = lg(lit) as i32;
+                ll -= 1;
+                while ll - 1 >= 0 {
+                    ll -= 1;
+                    bw.putb(1, 1);
+                    bw.putb((lit >> ll) & 1, 1);
+                }
+                bw.putb(0, 1);
+                let mut k = start;
+                while lit > 0 {
+                    bw.put_byte(input[k]);
+                    k += 1;
+                    lit -= 1;
+                }
+            }
+            *lit_start = None;
+        }
+    }
+
+    fn emit_match_var(bw: &mut BitWriter, len: u32, mut off: u32, rb: u32) {
+        let mut ll = lg(len) as i32 - 1;
+        off += (1u32 << rb) - 1;
+        let lo = (lg(off) as i32 - 1 - rb as i32).max(0) as u32;
+        bw.putb((lo + 8) >> 3, 2);
+        bw.putb(lo & 7, 3);
+        while ll - 1 >= 2 {
+            ll -= 1;
+            bw.putb(1, 1);
+            bw.putb((len >> ll) & 1, 1);
+        }
+        bw.putb(0, 1);
+        bw.putb(len & 3, 2);
+        bw.putb(off, rb);
+        bw.putb(off >> rb, lo);
+    }
+
+    let mut h1: u32 = 0;
+    let mut i: usize = 0;
+    let mut lit_start: Option<usize> = None;
+
+    while i < n {
+        let mut best_len = 0usize;
+        let mut best_p = 0usize;
+
+        if i + min_match + 4 <= n {
+            for k in 0..=bucket {
+                let slot = (h1 ^ (k as u32)) & (ht_size as u32 - 1);
+                let entry = ht[slot as usize];
+                if entry == 0 { continue; }
+                if (entry & check_mask) != ((input[i + 3] as u32) & check_mask) { continue; }
+                let p = (entry >> check_bits) as usize;
+                if p >= i { continue; }
+                if p + best_len >= n || i + best_len >= n { continue; }
+                if input[p + best_len] != input[i + best_len] { continue; }
+                let mut l = 0usize;
+                while i + l < n && l < max_match && input[p + l] == input[i + l] {
+                    l += 1;
+                }
+                if l > best_len { best_len = l; best_p = p; }
+                if best_len >= 128 { break; }
+            }
+        }
+
+        let off = if best_len >= min_match { i.saturating_sub(best_p) } else { 0 };
+        let take_match = best_len >= min_match && off > 0;
+
+        if take_match {
+            emit_literal_var(&mut bw, input, &mut lit_start, i);
+            emit_match_var(&mut bw, best_len as u32, off as u32, rb);
+            for step in 0..best_len {
+                let pos = i + step;
+                if pos + 4 <= n {
+                    let entry = ((pos as u32) << check_bits) | ((input[pos + 3] as u32) & check_mask);
+                    let slot = ((pos as u32 * 1234547) >> 19) & (bucket as u32);
+                    let h_slot = h1 ^ slot;
+                    ht[(h_slot & (ht_size as u32 - 1)) as usize] = entry;
+                    if pos + min_match < n {
+                        h1 = (((h1.wrapping_mul(5)) << shift1)
+                              .wrapping_add((input[pos + min_match] as u32 + 1).wrapping_mul(123456791)))
+                            & (ht_size as u32 - 1);
+                    }
+                }
+            }
+            i += best_len;
+        } else {
+            if lit_start.is_none() { lit_start = Some(i); }
+            if i + 4 <= n {
+                let entry = ((i as u32) << check_bits) | ((input[i + 3] as u32) & check_mask);
+                let slot = ((i as u32 * 1234547) >> 19) & (bucket as u32);
+                let h_slot = h1 ^ slot;
+                ht[(h_slot & (ht_size as u32 - 1)) as usize] = entry;
+                if i + min_match < n {
+                    h1 = (((h1.wrapping_mul(5)) << shift1)
+                          .wrapping_add((input[i + min_match] as u32 + 1).wrapping_mul(123456791)))
+                        & (ht_size as u32 - 1);
+                }
+            }
+            i += 1;
+            if let Some(start) = lit_start {
+                if i - start >= max_literal {
+                    emit_literal_var(&mut bw, input, &mut lit_start, i);
+                }
+            }
+        }
+    }
+
+    emit_literal_var(&mut bw, input, &mut lit_start, n);
+    bw.flush();
+    bw.out
 }
 
 // -------------------- Level 3: BWT -----------------------------------

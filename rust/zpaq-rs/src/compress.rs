@@ -431,6 +431,36 @@ pub fn compress_method<W: Writer>(
         return Ok(c.into_inner());
     }
 
+    if let Some(rest) = method.strip_prefix("x4,1,") {
+        // Variable-bit Elias-gamma LZ77, min match length supplied
+        // as the numeric tail.
+        let min_match: i32 = rest.parse().map_err(|_| CompressError::InvalidHeader)?;
+        if !(4..=64).contains(&min_match) { return Err(CompressError::InvalidHeader); }
+        let mut args = [0i32; 9];
+        args[0] = 4;
+        args[1] = 1;
+        args[2] = min_match;
+        let cc = crate::compiler::compile_with_args(crate::models::LZ77_VAR_CFG, args)
+            .map_err(|_| CompressError::InvalidHeader)?;
+        let pcomp = cc.pcomp.clone().ok_or(CompressError::InvalidHeader)?;
+
+        c.start_block_modeled(&cc.header)?;
+        c.start_segment(b"", b"")?;
+        c.post_process_prog(&pcomp)?;
+        let lz_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
+            log_block_mib: 4,
+            level_flag: 1,
+            min_match: min_match as u32,
+            min_match2: 0,
+            log_bucket: 4,
+            log_ht_size: 16,
+        });
+        c.write_bytes(&lz_bytes)?;
+        c.end_segment(None)?;
+        c.end_block()?;
+        return Ok(c.into_inner());
+    }
+
     if let Some(rest) = method.strip_prefix("x4,2,") {
         // Byte-aligned LZ77, min match length supplied as the
         // numeric tail (e.g. "x4,2,12" → min_match = 12).
@@ -533,6 +563,20 @@ mod tests {
         let mut w = VecWriter::new();
         decompress(&mut r, &mut w).unwrap();
         assert_eq!(w.into_inner(), inp);
+    }
+
+    /// `x4,1,M` — variable-bit Elias-gamma LZ77. Validates the
+    /// bit-packed encoder + canned PCOMP integration.
+    #[test]
+    fn compress_method_lz77_var_round_trip() {
+        let inp = b"the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let out = compress_method(VecWriter::new(), &inp, "x4,1,4").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
+        assert!(wire.len() < inp.len());
     }
 
     /// `x4,2,M` — byte-aligned LZ77. Repetitive input should
