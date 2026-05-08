@@ -34,14 +34,18 @@ typedef uint32_t UInt32;
 typedef int64_t  Int64;
 typedef uint64_t UInt64;
 
-// Match k_7zip_GUID_Data1/2 from IDecl.h.
-static const GUID kSeqInStream  = { 0x23170F69, 0x40C1, 0x278A, { 0,0,0,0, 0x00,0x03,0x00,0x01 } };
-static const GUID kSeqOutStream = { 0x23170F69, 0x40C1, 0x278A, { 0,0,0,0, 0x00,0x03,0x00,0x02 } };
-static const GUID kIIDCoder     = { 0x23170F69, 0x40C1, 0x278A, { 0,0,0,0, 0x00,0x04,0x00,0x05 } };
-// CLSID for an encoder/decoder is built as Data1/Data2 fixed,
-// Data3 = 0x2790 (encoder) / 0x2791 (decoder), Data4[0..7] = methodId BE.
-static const UInt16 kEncoderData3 = 0x2790;
-static const UInt16 kDecoderData3 = 0x2791;
+// Match k_7zip_GUID_Data1/2/3_Common and the layout from IDecl.h's
+// Z7_DECL_IFACE_7ZIP_SUB macro: Data4 = {0, 0, 0, groupId, 0, subId, 0, 0}.
+//   ISequentialInStream  : group=3, sub=1
+//   ISequentialOutStream : group=3, sub=2
+//   ICompressCoder       : group=4, sub=5
+static const GUID kSeqInStream  = { 0x23170F69, 0x40C1, 0x278A, { 0, 0, 0, 3, 0, 1, 0, 0 } };
+static const GUID kSeqOutStream = { 0x23170F69, 0x40C1, 0x278A, { 0, 0, 0, 3, 0, 2, 0, 0 } };
+static const GUID kIIDCoder     = { 0x23170F69, 0x40C1, 0x278A, { 0, 0, 0, 4, 0, 5, 0, 0 } };
+
+// k_7zip_GUID_Data3_{Decoder,Encoder} from IDecl.h:
+static const UInt16 kDecoderData3 = 0x2790;
+static const UInt16 kEncoderData3 = 0x2791;
 
 #define ZIP_STDMETHOD STDMETHODCALLTYPE
 
