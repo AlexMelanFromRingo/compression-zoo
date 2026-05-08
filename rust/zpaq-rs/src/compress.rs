@@ -390,8 +390,9 @@ pub fn compress_with_config<W: Writer>(
 ///   * `"x4,1,M"` — variable-bit LZ77 with min match `M ∈ [4..64]`.
 ///   * `"x4,2,M"` — byte-aligned LZ77 with min match `M ∈ [1..64]`.
 ///   * `"x4,3"`   — BWT.
-///   * `"x4,5,M"` / `"x4,6,M"` / `"x4,7"` — same as `1`/`2`/`3`
-///     plus E8E9 (Intel/AMD CALL/JMP `rel32 → abs32`) prefilter.
+///   * `"x4,5,M"` — variable-bit LZ77 + E8E9 prefilter.
+///   * `"x4,6,M"` — byte-aligned LZ77 + E8E9 prefilter.
+///   * `"x4,7"`   — BWT + E8E9 prefilter.
 ///
 /// Unsupported strings return [`CompressError::InvalidHeader`].
 pub fn compress_method<W: Writer>(
@@ -428,7 +429,9 @@ pub fn compress_method<W: Writer>(
         let mut args = [0i32; 9];
         args[0] = 4;
         args[1] = if doe8 { 7 } else { 3 };
-        let cc = crate::compiler::compile_with_args(crate::models::BWT_CFG, args)
+        let cfg = if doe8 { crate::models::BWT_E8E9_CFG }
+                  else    { crate::models::BWT_CFG };
+        let cc = crate::compiler::compile_with_args(cfg, args)
             .map_err(|_| CompressError::InvalidHeader)?;
         let pcomp = cc.pcomp.clone()
             .ok_or(CompressError::InvalidHeader)?;
@@ -447,16 +450,37 @@ pub fn compress_method<W: Writer>(
         return Ok(c.into_inner());
     }
 
-    if let Some(rest) = method.strip_prefix("x4,1,") {
-        // Variable-bit Elias-gamma LZ77, min match length supplied
-        // as the numeric tail.
+    // LZ77 prefixes — handle 4 variants (level 1 var-bit and 2 byte,
+    // each with or without E8E9). The encoder-side LzArgs.level_flag
+    // already pipes through the E8E9 prefilter via preproc::e8e9_forward.
+    let lz_match: Option<(&str, i32, i32)> = if let Some(r) = method.strip_prefix("x4,1,") {
+        Some((r, 1, 1))
+    } else if let Some(r) = method.strip_prefix("x4,5,") {
+        Some((r, 1, 5))
+    } else if let Some(r) = method.strip_prefix("x4,2,") {
+        Some((r, 2, 2))
+    } else if let Some(r) = method.strip_prefix("x4,6,") {
+        Some((r, 2, 6))
+    } else {
+        None
+    };
+    if let Some((rest, level, level_flag)) = lz_match {
         let min_match: i32 = rest.parse().map_err(|_| CompressError::InvalidHeader)?;
-        if !(4..=64).contains(&min_match) { return Err(CompressError::InvalidHeader); }
+        let lo = if level == 1 { 4 } else { 1 };
+        if !(lo..=64).contains(&min_match) { return Err(CompressError::InvalidHeader); }
         let mut args = [0i32; 9];
         args[0] = 4;
-        args[1] = 1;
+        args[1] = level_flag;
         args[2] = min_match;
-        let cc = crate::compiler::compile_with_args(crate::models::LZ77_VAR_CFG, args)
+        let doe8 = level_flag >= 4;
+        let cfg = match (level, doe8) {
+            (1, false) => crate::models::LZ77_VAR_CFG,
+            (1, true)  => crate::models::LZ77_VAR_E8E9_CFG,
+            (2, false) => crate::models::LZ77_BYTE_CFG,
+            (2, true)  => crate::models::LZ77_BYTE_E8E9_CFG,
+            _ => unreachable!(),
+        };
+        let cc = crate::compiler::compile_with_args(cfg, args)
             .map_err(|_| CompressError::InvalidHeader)?;
         let pcomp = cc.pcomp.clone().ok_or(CompressError::InvalidHeader)?;
 
@@ -465,37 +489,7 @@ pub fn compress_method<W: Writer>(
         c.post_process_prog(&pcomp)?;
         let lz_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
             log_block_mib: 4,
-            level_flag: 1,
-            min_match: min_match as u32,
-            min_match2: 0,
-            log_bucket: 4,
-            log_ht_size: 16,
-        });
-        c.write_bytes(&lz_bytes)?;
-        c.end_segment(None)?;
-        c.end_block()?;
-        return Ok(c.into_inner());
-    }
-
-    if let Some(rest) = method.strip_prefix("x4,2,") {
-        // Byte-aligned LZ77, min match length supplied as the
-        // numeric tail (e.g. "x4,2,12" → min_match = 12).
-        let min_match: i32 = rest.parse().map_err(|_| CompressError::InvalidHeader)?;
-        if !(1..=64).contains(&min_match) { return Err(CompressError::InvalidHeader); }
-        let mut args = [0i32; 9];
-        args[0] = 4;
-        args[1] = 2;
-        args[2] = min_match;
-        let cc = crate::compiler::compile_with_args(crate::models::LZ77_BYTE_CFG, args)
-            .map_err(|_| CompressError::InvalidHeader)?;
-        let pcomp = cc.pcomp.clone().ok_or(CompressError::InvalidHeader)?;
-
-        c.start_block_modeled(&cc.header)?;
-        c.start_segment(b"", b"")?;
-        c.post_process_prog(&pcomp)?;
-        let lz_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
-            log_block_mib: 4,
-            level_flag: 2,
+            level_flag: level_flag as u32,
             min_match: min_match as u32,
             min_match2: 0,
             log_bucket: 4,
@@ -579,6 +573,29 @@ mod tests {
         let mut w = VecWriter::new();
         decompress(&mut r, &mut w).unwrap();
         assert_eq!(w.into_inner(), inp);
+    }
+
+    /// E8E9 LZ77 / BWT round-trip with input that contains
+    /// `0xE8` / `0xE9` opcode bytes followed by valid offsets.
+    /// Without the inverse-E8E9 step in PCOMP, these positions
+    /// would be corrupted by the encoder-side prefilter.
+    #[test]
+    fn compress_method_e8e9_variants() {
+        let mut inp: Vec<u8> = Vec::new();
+        inp.extend_from_slice(b"prefix bytes ");
+        inp.extend_from_slice(&[0xE8, 0x10, 0x00, 0x00, 0x00]);
+        inp.extend_from_slice(b" middle ");
+        inp.extend_from_slice(&[0xE9, 0x20, 0x00, 0x00, 0xFF]);
+        inp.extend_from_slice(b" tail bytes for padding ".repeat(20).as_slice());
+        for method in ["x4,5,4", "x4,6,4", "x4,7"] {
+            let out = compress_method(VecWriter::new(), &inp, method).unwrap();
+            let wire = out.into_inner();
+            let mut r = SliceReader::new(&wire);
+            let mut w = VecWriter::new();
+            decompress(&mut r, &mut w).unwrap();
+            assert_eq!(w.into_inner(), inp,
+                "round-trip failed for method='{}'", method);
+        }
     }
 
     /// Digit-method aliases ("1", "2", "3") should resolve to the

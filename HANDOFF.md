@@ -213,22 +213,24 @@ Method IDs (community-aligned):
       buffer the whole input before emitting OUT bytes.
    ✅ LZBuffer level 1 (variable-bit Elias-gamma LZ77) + level 2
       (byte LZ77) + level 3 (BWT, via `bsc-rs::sais`).
-   ✅ `compress_method` high-level API supports:
-      `"0"` (store), `"1"` / `"2"` / `"3"` (digit aliases),
-      `"x4,1,M"` (variable-bit LZ77, min match `M`),
-      `"x4,2,M"` (byte-aligned LZ77, min match `M`),
-      `"x4,3"`   (BWT, 16 MiB block),
-      `"x4,7"`   (BWT + E8E9 prefilter).
-      All decompress correctly under both `zpaq_decompress` and the
-      upstream libzpaq decoder, validated on random binaries
-      100B..100KB plus the 273 KB `libzpaq.cpp` source.
+   ✅ `compress_method` high-level API supports the full
+      preproc-only menu:
+        `"0"` (store), `"1"` / `"2"` / `"3"` (digit aliases),
+        `"x4,1,M"` / `"x4,5,M"` (variable-bit LZ77, ±E8E9),
+        `"x4,2,M"` / `"x4,6,M"` (byte-aligned LZ77, ±E8E9),
+        `"x4,3"`   / `"x4,7"`   (BWT, ±E8E9).
+      All seven methods decompress correctly under both
+      `zpaq_decompress` and the upstream libzpaq decoder, validated
+      on random binaries 100B..100KB, the 273 KB `libzpaq.cpp`
+      source, and a real x86_64 ELF (~517 KB; E8E9 variants give
+      a small but real ratio improvement: 60.64% → 60.08% with
+      `"x4,2,4"` → `"x4,6,4"`).
       Ratio on libzpaq.cpp: byte LZ77 = 37.4%, var-bit LZ77 = 30.4%.
-   ⏳ Remaining: E8E9-enabled LZ77 variants (`"x4,5,M"`, `"x4,6,M"`)
-      need their own E8E9-decode PCOMP textual templates. Component
-      specs (`"ci1"`, `"i"`, `"m"`, `"s"`, ...) that stack a context
-      model on top of the LZ77/BWT preproc — that's where upstream's
-      best-ratio methods live, requires porting the model spec
-      branches of `makeConfig`. Once those land the full upstream
+   ⏳ Remaining: component specs (`"ci1"`, `"i"`, `"m"`, `"s"`, ...)
+      that stack a context model on top of the LZ77/BWT preproc —
+      that's where upstream's best-ratio methods live, requires
+      porting the model spec branches of `makeConfig` (~300 LOC of
+      textual config building). Once those land the full upstream
       compression menu is reachable.
 3. **libsais cache-aware optimisations.** Reference SA-IS landed +
    small single-pass refactor. Real 2-3× wins need bit-packed L/S,

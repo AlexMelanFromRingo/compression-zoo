@@ -44,6 +44,307 @@ pub const MAX_CFG: &[u8] = &[
     25, 25, 25, 112, 56, 0,
 ];
 
+/// Variable-bit LZ77 + E8E9 (level 5 = 1+4) config template, from
+/// upstream `makeConfig("x4,5,...", args)`. Identical to
+/// [`LZ77_VAR_CFG`] in HCOMP and LZ77 state machine but the PCOMP
+/// buffers everything in M and runs an inverse-E8E9 pass at EOF
+/// before emitting OUT bytes.
+pub const LZ77_VAR_E8E9_CFG: &str = r#"
+comp 9 16 0 $1+20 0
+hcomp
+c-- *c=a a+= 255 d=a *d=c
+halt
+pcomp lazy2 3 ;
+ (r1 = state
+  r2 = len - match or literal length
+  r3 = m - number of offset bits expected
+  r4 = ptr to buf
+  r5 = r - low bits of offset
+  c = bits - input buffer
+  d = n - number of bits in c)
+
+  a> 255 if
+    b=0 d=r 4 do (for b=0..d-1, d = end of buf)
+      a=b a==d ifnot
+        a+= 4 a<d if
+          a=*b a&= 254 a== 232 if (e8 or e9?)
+            c=b b++ b++ b++ b++ a=*b a++ a&= 254 a== 0 if (00 or ff)
+              b-- a=*b
+              b-- a<<= 8 a+=*b
+              b-- a<<= 8 a+=*b
+              a-=b a++
+              *b=a a>>= 8 b++
+              *b=a a>>= 8 b++
+              *b=a b++
+            endif
+            b=c
+          endif
+        endif
+        a=*b out b++
+      forever
+    endif
+
+    (reset state)
+    a=0 b=0 c=0 d=0 r=a 1 r=a 2 r=a 3 r=a 4
+    halt
+  endif
+
+  a<<=d a+=c c=a               (bits+=a<<n)
+  a= 8 a+=d d=a                (n+=8)
+
+  (if state==0 (expect new code))
+  a=r 1 a== 0 if (match code mm,mmm)
+    a= 1 r=a 2                 (len=1)
+    a=c a&= 3 a> 0 if          (if (bits&3))
+      a-- a<<= 3 r=a 3           (m=((bits&3)-1)*8)
+      a=c a>>= 2 c=a             (bits>>=2)
+      b=r 3 a&= 7 a+=b r=a 3     (m+=bits&7)
+      a=c a>>= 3 c=a             (bits>>=3)
+      a=d a-= 5 d=a              (n-=5)
+      a= 1 r=a 1                 (state=1)
+    else (literal, discard 00)
+      a=c a>>= 2 c=a             (bits>>=2)
+      d-- d--                    (n-=2)
+      a= 3 r=a 1                 (state=3)
+    endif
+  endif
+
+  (while state==1 && n>=3 (expect match length n*4+ll -> r2))
+  do a=r 1 a== 1 if a=d a> 2 if
+    a=c a&= 1 a== 1 if         (if bits&1)
+      a=c a>>= 1 c=a             (bits>>=1)
+      b=r 2 a=c a&= 1 a+=b a+=b r=a 2 (len+=len+(bits&1))
+      a=c a>>= 1 c=a             (bits>>=1)
+      d-- d--                    (n-=2)
+    else
+      a=c a>>= 1 c=a             (bits>>=1)
+      a=r 2 a<<= 2 b=a           (len<<=2)
+      a=c a&= 3 a+=b r=a 2       (len+=bits&3)
+      a=c a>>= 2 c=a             (bits>>=2)
+      d-- d-- d--                (n-=3)
+      a= 2 r=a 1                 (state=2)
+    endif
+  forever endif endif
+
+  (if state==2 && n>=m) (expect m offset bits)
+  a=r 1 a== 2 if a=r 3 a>d ifnot
+    a=c r=a 6 a=d r=a 7          (save c=bits, d=n in r6,r7)
+    b=r 3 a= 1 a<<=b d=a         (d=1<<m)
+    a-- a&=c a+=d                (d=offset=bits&((1<<m)-1)|(1<<m))
+    d=a b=r 4 a=b a-=d c=a       (c=p=(b=ptr)-offset)
+
+    (while len-- (copy match d bytes from *c to *b, no out))
+    d=r 2 do a=d a> 0 if d--
+      a=*c *b=a c++ b++          (buf[ptr++]-buf[p++])
+    forever endif
+    a=b r=a 4
+
+    a=r 6 b=r 3 a>>=b c=a        (bits>>=m)
+    a=r 7 a-=b d=a               (n-=m)
+    a=0 r=a 1                    (state=0)
+  endif endif
+
+  (while state==3 && n>=2 (expect literal length))
+  do a=r 1 a== 3 if a=d a> 1 if
+    a=c a&= 1 a== 1 if         (if bits&1)
+      a=c a>>= 1 c=a              (bits>>=1)
+      b=r 2 a&= 1 a+=b a+=b r=a 2 (len+=len+(bits&1))
+      a=c a>>= 1 c=a              (bits>>=1)
+      d-- d--                     (n-=2)
+    else
+      a=c a>>= 1 c=a              (bits>>=1)
+      d--                         (--n)
+      a= 4 r=a 1                  (state=4)
+    endif
+  forever endif endif
+
+  (if state==4 && n>=8 (expect len literals, buffered for E8E9))
+  a=r 1 a== 4 if a=d a> 7 if
+    b=r 4 a=c *b=a
+    b++ a=b r=a 4                 (buf[ptr++]=bits)
+    a=c a>>= 8 c=a                (bits>>=8)
+    a=d a-= 8 d=a                 (n-=8)
+    a=r 2 a-- r=a 2 a== 0 if      (if --len<1)
+      a=0 r=a 1                     (state=0)
+    endif
+  endif endif
+  halt
+end
+"#;
+
+/// Byte-aligned LZ77 + E8E9 (level 6 = 2+4) config template, from
+/// upstream `makeConfig("x4,6,...", args)`. PCOMP buffers the
+/// decoded LZ77 stream in M, runs inverse-E8E9 at EOF, then OUTs.
+pub const LZ77_BYTE_E8E9_CFG: &str = r#"
+comp 9 16 0 $1+20 0
+hcomp
+c-- *c=a a+= 255 d=a *d=c
+  (decode lz77 into M. Codes:
+  00xxxxxx = literal length xxxxxx+1
+  xx......, xx > 0 = match with xx offset bytes to follow)
+
+  a=r 1 a== 0 if (init)
+    a= 168 (skip post code)
+  else a== 1 if  (new code?)
+    a=*c r=a 2  (save code in R2)
+    a> 63 if a>>= 6 a++ a++  (match)
+    else a++ a++ endif  (literal)
+  else (read rest of code)
+    a--
+  endif endif
+  r=a 1  (R1 = 1+expected bytes to next code)
+halt
+pcomp lzpre c ;
+  (Decode LZ77: d=state, M=output buffer, b=size)
+  a> 255 if (at EOF decode e8e9 and output)
+    d=b b=0 do (for b=0..d-1, d = end of buf)
+      a=b a==d ifnot
+        a+= 4 a<d if
+          a=*b a&= 254 a== 232 if (e8 or e9?)
+            c=b b++ b++ b++ b++ a=*b a++ a&= 254 a== 0 if (00 or ff)
+              b-- a=*b
+              b-- a<<= 8 a+=*b
+              b-- a<<= 8 a+=*b
+              a-=b a++
+              *b=a a>>= 8 b++
+              *b=a a>>= 8 b++
+              *b=a b++
+            endif
+            b=c
+          endif
+        endif
+        a=*b out b++
+      forever
+    endif
+    b=0 c=0 d=0 a=0 r=a 1 r=a 2 (reset state)
+  halt
+  endif
+
+  (in state d==0, expect a new code)
+  (put length in r1 and inital part of offset in r2)
+  c=a a=d a== 0 if
+    a=c a>>= 6 a++ d=a
+    a== 1 if (literal?)
+      a+=c r=a 1 a=0 r=a 2
+    else (3 to 5 byte match)
+      d++ a=c a&= 63 a+= $3 r=a 1 a=0 r=a 2
+    endif
+  else
+    a== 1 if (writing literal)
+      a=c *b=a b++
+      a=r 1 a-- a== 0 if d=0 endif r=a 1 (if (--len==0) state=0)
+    else
+      a> 2 if (reading offset)
+        a=r 2 a<<= 8 a|=c r=a 2 d-- (off=off<<8|c, --state)
+      else (state==2, write match)
+        a=r 2 a<<= 8 a|=c c=a a=b a-=c a-- c=a (c=i-off-1)
+        d=r 1 (d=len)
+        do (copy match d bytes from *c to *b, no out)
+          a=*c *b=a c++ b++
+        d-- a=d a> 0 while
+        (d=state=0. off, len don't matter)
+      endif
+    endif
+  endif
+  halt
+end
+"#;
+
+/// BWT + E8E9 (level 7 = 3+4) config template, from upstream
+/// `makeConfig("x4,7", args)`. After IBWT recovers the bytes, an
+/// inverse-E8E9 pass over the buffer reverses the encoder-side
+/// E8E9 prefilter.
+pub const BWT_E8E9_CFG: &str = r#"
+comp 9 16 $1+20 $1+20 0
+hcomp
+c-- *c=a a+= 255 d=a *d=c
+halt
+pcomp bwtrle c ;
+
+  (read BWT, index into M, size in b)
+  a> 255 ifnot
+    *b=a b++
+
+  (inverse BWT)
+  elsel
+
+    (index in last 4 bytes, put in c and R1)
+    b-- a=*b
+    b-- a<<= 8 a+=*b
+    b-- a<<= 8 a+=*b
+    b-- a<<= 8 a+=*b c=a r=a 1
+
+    (save size in R2)
+    a=b r=a 2
+
+    (count bytes in H[~1..~255, ~0])
+    do
+      a=b a> 0 if
+        b-- a=*b a++ a&= 255 d=a d! *d++
+      forever
+    endif
+
+    (cumulative counts: H[~i=0..255] = count of bytes before i)
+    d=0 d! *d= 1 a=0
+    do
+      a+=*d *d=a d--
+    d<>a a! a> 255 a! d<>a until
+
+    (build first part of linked list in H[0..idx-1])
+    b=0 do
+      a=c a>b if
+        d=*b d! *d++ d=*d d-- *d=b
+      b++ forever
+    endif
+
+    (rest of list in H[idx+1..n-1])
+    b=c b++ c=r 2 do
+      a=c a>b if
+        d=*b d! *d++ d=*d d-- *d=b
+      b++ forever
+    endif
+
+    (copy M to low 8 bits of H to reduce cache misses in next loop)
+    b=0 do
+      a=c a>b if
+        d=b a=*d a<<= 8 a+=*b *d=a
+      b++ forever
+    endif
+
+    (traverse list and copy to M)
+    d=r 1 b=0 do
+      a=d a== 0 ifnot
+        a=*d a>>= 8 d=a
+ *b=*d b++
+      forever
+    endif
+
+    (e8e9 transform to out)
+    d=b b=0 do (for b=0..d-1, d = end of buf)
+      a=b a==d ifnot
+        a+= 4 a<d if
+          a=*b a&= 254 a== 232 if
+            c=b b++ b++ b++ b++ a=*b a++ a&= 254 a== 0 if
+              b-- a=*b
+              b-- a<<= 8 a+=*b
+              b-- a<<= 8 a+=*b
+              a-=b a++
+              *b=a a>>= 8 b++
+              *b=a a>>= 8 b++
+              *b=a b++
+            endif
+            b=c
+          endif
+        endif
+        a=*b out b++
+      forever
+    endif
+
+  endif
+  halt
+end
+"#;
+
 /// Variable-bit LZ77 (level 1) config template, extracted verbatim
 /// from upstream `makeConfig("x4,1,...", args)`. `$1` is the
 /// log-block-size and `$3` is the LZ77 minimum match length. The
