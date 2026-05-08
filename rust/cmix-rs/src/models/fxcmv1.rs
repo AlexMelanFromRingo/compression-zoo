@@ -1254,6 +1254,260 @@ impl DirectStateMap {
 }
 
 // ====================================================================
+// Buffer — circular byte buffer that backs upstream's `buf(i)` /
+// `bufr(i)` helpers. `pos` is the byte index of the next write
+// slot; `buffer[(pos - i) & BMASK]` returns the byte `i` positions
+// ago.
+// ====================================================================
+
+pub const BMASK: usize = (1 << 24) - 1;
+pub const BUFSIZE: usize = 1 << 24;
+
+pub struct Buffer {
+    pub buffer: Vec<u8>,
+    pub pos: usize,
+}
+
+impl Buffer {
+    pub fn new() -> Self { Self { buffer: vec![0u8; BUFSIZE], pos: 0 } }
+    /// `buf(i)` — byte `i` positions back (i ≥ 1; i = 1 is the
+    /// most recent byte).
+    #[inline] pub fn buf(&self, i: usize) -> u8 {
+        self.buffer[(self.pos.wrapping_sub(i)) & BMASK]
+    }
+    /// `bufr(i)` — byte at absolute position `i` (mod BMASK).
+    #[inline] pub fn bufr(&self, i: usize) -> u8 {
+        self.buffer[i & BMASK]
+    }
+    /// Append a byte and advance `pos`.
+    pub fn push(&mut self, b: u8) {
+        self.buffer[self.pos & BMASK] = b;
+        self.pos = self.pos.wrapping_add(1);
+    }
+}
+
+impl Default for Buffer { fn default() -> Self { Self::new() } }
+
+// ====================================================================
+// MTFList — small move-to-front index list used by SparseMatchModel.
+// ====================================================================
+
+pub struct MtfList {
+    pub root:  i32,
+    pub index: i32,
+    pub previous: Vec<i32>,
+    pub next:     Vec<i32>,
+}
+
+impl MtfList {
+    pub fn new(s: usize) -> Self {
+        let mut previous = vec![0i32; s];
+        let mut next = vec![0i32; s];
+        for i in 0..s {
+            previous[i] = i as i32 - 1;
+            next[i]     = i as i32 + 1;
+        }
+        next[s - 1] = -1;
+        Self { root: 0, index: 0, previous, next }
+    }
+
+    pub fn get_first(&mut self) -> i32 {
+        self.index = self.root;
+        self.index
+    }
+
+    pub fn get_next(&mut self) -> i32 {
+        if self.index >= 0 { self.index = self.next[self.index as usize]; }
+        self.index
+    }
+
+    pub fn move_to_front(&mut self, i: i32) {
+        debug_assert!(i >= 0 && (i as usize) < self.previous.len());
+        self.index = i;
+        if self.index == self.root { return; }
+        let p = self.previous[self.index as usize];
+        let n = self.next[self.index as usize];
+        if p >= 0 { self.next[p as usize] = n; }
+        if n >= 0 { self.previous[n as usize] = p; }
+        self.previous[self.root as usize] = self.index;
+        self.next[self.index as usize] = self.root;
+        self.root = self.index;
+        self.previous[self.root as usize] = -1;
+    }
+}
+
+// ====================================================================
+// SparseMatchModel — sparse-stride byte-match predictor used by
+// upstream's FXCMv1. Holds 4 distinct hash chains keyed by
+// configurable offset/stride/length, finds the longest sparse match
+// and emits two stretched-logit inputs into the mixer.
+// ====================================================================
+
+pub const SPARSE_MAX_LEN: u32 = 64;
+pub const SPARSE_MIN_LEN: u32 = 2;
+pub const SPARSE_NUM_HASHES: usize = 4;
+
+#[derive(Clone, Copy)]
+pub struct SparseConfig {
+    pub offset: u32,
+    pub stride: u32,
+    pub deletions: u32,
+    pub min_len: u32,
+    pub bit_mask: u32,
+}
+
+const SPARSE_CONFIGS: [SparseConfig; SPARSE_NUM_HASHES] = [
+    SparseConfig { offset: 0, stride: 1, deletions: 0, min_len: 3, bit_mask: 0xFF },
+    SparseConfig { offset: 0, stride: 1, deletions: 0, min_len: 4, bit_mask: 0xFF },
+    SparseConfig { offset: 0, stride: 2, deletions: 0, min_len: 6, bit_mask: 0xFF },
+    SparseConfig { offset: 0, stride: 1, deletions: 0, min_len: 5, bit_mask: 0xFF },
+];
+
+pub struct SparseMatchModel {
+    pub table: Vec<u32>,           // 1024*1024 entries
+    pub list: MtfList,
+    pub hashes: [u32; SPARSE_NUM_HASHES],
+    pub hash_index: u32,
+    pub length: u32,
+    pub index: u32,
+    pub mask: u32,
+    pub expected_byte: u8,
+    pub valid: bool,
+}
+
+impl SparseMatchModel {
+    pub fn new() -> Self {
+        Self {
+            table: vec![0u32; 1024 * 1024],
+            list: MtfList::new(SPARSE_NUM_HASHES),
+            hashes: [0; SPARSE_NUM_HASHES],
+            hash_index: 0,
+            length: 0,
+            index: 0,
+            mask: 1024 * 1024 - 1,
+            expected_byte: 0,
+            valid: false,
+        }
+    }
+
+    pub fn update(&mut self, buf: &Buffer) {
+        // Refresh hashes.
+        for i in 0..SPARSE_NUM_HASHES {
+            let cfg = SPARSE_CONFIGS[i];
+            let mut h = (i as u32 + 1) * 191;
+            let mut k = 1u32;
+            for _ in 0..cfg.min_len {
+                h = h.wrapping_mul(191).wrapping_add((buf.buf(k as usize) as u32) << i);
+                k += cfg.stride;
+            }
+            self.hashes[i] = h & self.mask;
+        }
+        if self.length != 0 {
+            self.index = self.index.wrapping_add(1);
+            if self.length < SPARSE_MAX_LEN { self.length += 1; }
+        } else {
+            // Try each hash from the MTF list head.
+            let mut i = self.list.get_first();
+            while i >= 0 {
+                let cfg = SPARSE_CONFIGS[i as usize];
+                self.index = self.table[self.hashes[i as usize] as usize];
+                if self.index > 0 {
+                    let mut offset = 1u32;
+                    while self.length < cfg.min_len
+                        && (buf.buf(offset as usize)
+                            ^ buf.bufr(self.index.wrapping_sub(offset) as usize)) == 0
+                    {
+                        self.length += 1;
+                        offset = offset.wrapping_add(cfg.stride);
+                    }
+                    if self.length >= cfg.min_len {
+                        self.length -= cfg.min_len - 1;
+                        self.hash_index = i as u32;
+                        self.list.move_to_front(i);
+                        break;
+                    }
+                }
+                self.length = 0;
+                self.index = 0;
+                i = self.list.get_next();
+            }
+        }
+        // Update positions.
+        for i in 0..SPARSE_NUM_HASHES {
+            self.table[self.hashes[i] as usize] = buf.pos as u32;
+        }
+        self.expected_byte = buf.bufr(self.index as usize);
+        self.valid = self.length > 1;
+    }
+
+    /// Per-bit prediction emit. Adds two inputs to `out` and
+    /// returns the current match length.
+    pub fn p(&mut self, c0: i32, bpos: i32, buf: &Buffer, out: &mut Vec<i16>) -> u32 {
+        let b = (c0 << (8 - bpos)) as u8;
+        if bpos == 0 { self.update(buf); }
+
+        if self.length > 0
+            && (((self.expected_byte ^ b) >> (8 - bpos)) as i32) != 0
+        {
+            self.length = 0;
+        }
+
+        if self.valid {
+            if self.length > 1 {
+                let expected_bit = ((self.expected_byte >> (7 - bpos)) & 1) as i32;
+                let sign = 2 * expected_bit - 1;
+                let l1 = (self.length - 1).min(32);
+                let l2 = (self.length - 2).min(3);
+                let l3 = (self.length - 1).min(8);
+                out.push((sign * ((l1 as i32) << 5)) as i16);
+                out.push((sign * ((1 << l2) * l3 as i32) << 4) as i16);
+            } else {
+                out.push(0);
+                out.push(0);
+            }
+        } else {
+            out.push(0);
+            out.push(0);
+        }
+        self.length
+    }
+}
+
+impl Default for SparseMatchModel { fn default() -> Self { Self::new() } }
+
+// ====================================================================
+// `vec<T, S>` — small fixed-capacity int vector used by
+// BracketContext / WordsContext / ColumnContext etc. We store as a
+// runtime-sized Vec<i32> with a recorded `capacity` matching
+// upstream's compile-time S.
+// ====================================================================
+
+#[derive(Clone)]
+pub struct ContextVec {
+    pub cxt: Vec<i32>,
+    pub size: usize,
+    pub capacity: usize,
+}
+
+impl ContextVec {
+    pub fn new(s: usize) -> Self { Self { cxt: vec![0i32; s], size: 0, capacity: s } }
+    pub fn push(&mut self, v: i32) {
+        debug_assert!(self.size < self.capacity);
+        self.cxt[self.size] = v;
+        self.size += 1;
+    }
+    pub fn pop(&mut self) -> i32 {
+        if self.size == 0 { return 0; }
+        self.size -= 1;
+        self.cxt[self.size]
+    }
+    pub fn last(&self) -> i32 {
+        if self.size == 0 { 0 } else { self.cxt[self.size - 1] }
+    }
+    pub fn clear(&mut self) { self.size = 0; }
+}
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -1522,6 +1776,47 @@ mod tests {
         dsm.set(0xCAFE, 1, &nn, &strt, &mut out);
         dsm.set(0xBABE, 0, &nn, &strt, &mut out);
         assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn buffer_round_trips_circular() {
+        let mut b = Buffer::new();
+        for v in [b'a', b'b', b'c', b'd', b'e'] { b.push(v); }
+        // buf(1) = most recent (e), buf(2) = d, …
+        assert_eq!(b.buf(1), b'e');
+        assert_eq!(b.buf(2), b'd');
+        assert_eq!(b.buf(5), b'a');
+    }
+
+    #[test]
+    fn mtf_list_moves_front() {
+        let mut l = MtfList::new(4);
+        // Initial order: 0, 1, 2, 3.
+        assert_eq!(l.get_first(), 0);
+        assert_eq!(l.get_next(), 1);
+        l.move_to_front(2);
+        assert_eq!(l.get_first(), 2);
+        assert_eq!(l.get_next(), 0);  // 2 → 0 → 1 → 3
+    }
+
+    #[test]
+    fn context_vec_push_pop_works() {
+        let mut v = ContextVec::new(4);
+        v.push(7); v.push(8);
+        assert_eq!(v.size, 2);
+        assert_eq!(v.last(), 8);
+        assert_eq!(v.pop(), 8);
+        assert_eq!(v.last(), 7);
+    }
+
+    #[test]
+    fn sparse_match_emits_two_inputs_per_call() {
+        let mut buf = Buffer::new();
+        for &b in b"abcabcabc" { buf.push(b); }
+        let mut m = SparseMatchModel::new();
+        let mut out: Vec<i16> = Vec::new();
+        let _ = m.p(/*c0=*/1, /*bpos=*/0, &buf, &mut out);
+        assert_eq!(out.len(), 2);
     }
 
     #[test]
