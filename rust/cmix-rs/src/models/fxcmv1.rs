@@ -3944,6 +3944,36 @@ impl FxcmState {
             || (self.c1 > 127 && self.c2 != ESCAPE_CHR)
     }
 
+    /// Word-pipeline cycle (fxcmv1.cpp:3964-3970). On a non-letter
+    /// byte after a word run (`word0 != 0`), shift the
+    /// word3/word2/word1/word0 pipeline using upstream's prime
+    /// multipliers. Skips the cycle for some `pWord.Type` classes
+    /// before the empirical `blpos` threshold.
+    ///
+    /// Caller must clear `word0` after the cycle if the byte
+    /// terminated the word.
+    pub fn cycle_word_pipeline(&mut self, blpos: u32) {
+        if self.word0 == 0 { return; }
+        let p_type = self.stem_words[self.p_word].r#type;
+        let cycle = blpos > 463_139_793
+            || (p_type & (eng::CONJUNCTIVE_ADVERB | eng::CONJUNCTION)) == 0;
+        if cycle {
+            self.word3 = self.word2.wrapping_mul(47);
+            self.word2 = self.word1.wrapping_mul(53);
+            self.word1 = self.word0.wrapping_mul(83);
+        }
+    }
+
+    /// Update `firstWord` if it hasn't been set yet AND we aren't
+    /// inside a `[` bracket (fxcmv1.cpp:3976-3978).
+    /// `fc_cxt` is the current `fccxt.cxt` (FirstChar bracket
+    /// context); compare against [`SQUAREOPEN_CHR`].
+    pub fn maybe_seed_first_word(&mut self, fc_cxt: u8) {
+        if self.first_word == 0 && fc_cxt != SQUAREOPEN_CHR {
+            self.first_word = self.word0;
+        }
+    }
+
     /// Number-tracking sub-step (fxcmv1.cpp:3940-3953). Consumes the
     /// most-recent byte (`self.c1`) and updates `numbers`, `number0`,
     /// `number1`, `numlen0`, `numlen1`, `mybenum` per upstream's
@@ -4548,6 +4578,51 @@ mod tests {
         }
         assert_eq!(s.number0, 127);
         assert_eq!(s.numlen0, 3);
+    }
+
+    #[test]
+    fn cycle_word_pipeline_shifts_word_chain() {
+        let mut s = FxcmState::new();
+        s.word0 = 7;
+        s.cycle_word_pipeline(0);
+        assert_eq!(s.word1, 7 * 83);
+        // word2 cycles in word1 from before (which was 0 → 0*53=0).
+        assert_eq!(s.word2, 0);
+        assert_eq!(s.word3, 0);
+        // Run again with new word0.
+        s.word0 = 11;
+        s.cycle_word_pipeline(0);
+        assert_eq!(s.word1, 11 * 83);
+        assert_eq!(s.word2, 7 * 83 * 53);
+    }
+
+    #[test]
+    fn cycle_word_pipeline_skips_for_certain_pword_types() {
+        let mut s = FxcmState::new();
+        s.word0 = 5;
+        // Set pWord type to Conjunction → cycle skipped (before blpos
+        // threshold).
+        s.stem_words[s.p_word].r#type = eng::CONJUNCTION;
+        s.cycle_word_pipeline(0);
+        assert_eq!(s.word1, 0, "Conjunction should skip the cycle");
+
+        // Past the blpos threshold the cycle runs anyway.
+        s.cycle_word_pipeline(463_139_794);
+        assert_eq!(s.word1, 5 * 83);
+    }
+
+    #[test]
+    fn maybe_seed_first_word_only_seeds_outside_bracket() {
+        let mut s = FxcmState::new();
+        s.word0 = 42;
+        s.maybe_seed_first_word(/*fc_cxt=*/0);
+        assert_eq!(s.first_word, 42);
+
+        // Inside `[` the seed is suppressed.
+        let mut s2 = FxcmState::new();
+        s2.word0 = 42;
+        s2.maybe_seed_first_word(SQUAREOPEN_CHR);
+        assert_eq!(s2.first_word, 0);
     }
 
     #[test]
