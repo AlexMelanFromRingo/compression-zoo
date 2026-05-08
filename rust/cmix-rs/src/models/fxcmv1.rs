@@ -2011,6 +2011,16 @@ impl Default for WordsContext { fn default() -> Self { Self::new() } }
 // ====================================================================
 
 #[inline]
+/// Three-arg hash used by FXCMv1 for APM context derivation
+/// (`AH1`, `AH2`, etc.). Verbatim from fxcmv1.cpp:2281-2284.
+/// `c` defaults to `0xffffffff` upstream.
+pub fn fxcm_hash(a: u32, b: u32, c: u32) -> u32 {
+    let h = a.wrapping_mul(110_002_499)
+        .wrapping_add(b.wrapping_mul(30_005_491))
+        .wrapping_add(c.wrapping_mul(50_004_239));
+    h ^ (h >> 9) ^ (a >> 3) ^ (b >> 3) ^ (c >> 4)
+}
+
 pub fn fxcm_hash3(a: u32, b: u32, c: u32) -> u32 {
     let h = a.wrapping_mul(110_002_499)
         .wrapping_add(b.wrapping_mul(30_005_491))
@@ -5060,6 +5070,177 @@ impl Predictor {
             (s.x4 & 0x80f00000)
                 .wrapping_add((s.x4 & 0x0000f0ff) << 12),
         );
+
+        // Paragraph (word) vs column (above-byte) sub-branch.
+        if s.is_paragraph == 1 {
+            // Word.
+            if s.c1 == ESCAPE_CHR
+                || fccontext == HTLINK_CHR as u32
+                || fccontext == CURLYOPENING_CHR as u32
+                || s.is_math
+                || s.is_pre
+            {
+                self.cm_c2[12].sets();
+            } else {
+                self.cm_c2[12].set(
+                    h.wrapping_add(self.worcxt.word(1).wrapping_mul(53).wrapping_mul(79))
+                     .wrapping_add(self.worcxt.word(3).wrapping_mul(53)
+                                       .wrapping_mul(47).wrapping_mul(71)),
+                );
+            }
+        } else {
+            // Column.
+            if fccontext == HTLINK_CHR as u32
+                || brcontext == LESSTHAN_CHR as u32
+                || self.htcxt.cxt != 0
+            {
+                self.cm_c2[12].sets();
+            } else if col == 31 {
+                self.cm_c2[12].set(c4 << 16);
+            } else {
+                self.cm_c2[12].set(
+                    above
+                        | ((c4 & 0xffff) << 16)
+                        | (above1 << 8),
+                );
+            }
+        }
+
+        // cmC2[13] — word/sentence stream, gated by many "html/template"
+        // conditions including the high byte of worcxt.sBytes(0)=='\\'.
+        let sb0_high = (self.worcxt.s_bytes(0) >> 8) as u8;
+        let cm_c2_13_disabled = s.c1 == ESCAPE_CHR
+            || utf8 != 0
+            || fccontext == CURLYOPENING_CHR as u32
+            || fccontext == HTLINK_CHR as u32
+            || fc == HTML_CHR as u32
+            || self.htcxt.cxt != 0
+            || s.fc as u8 == SPACE_CHR
+            || s.is_pre
+            || c1 == b'&' as u32
+            || brcontext == LESSTHAN_CHR as u32
+            || s.is_math
+            || col < 2
+            || sb0_high == b'\\';
+        if cm_c2_13_disabled {
+            self.cm_c2[13].sets();
+            self.cm_c2[13].sets();
+        } else {
+            self.cm_c2[13].set(
+                self.worcxt.word(1).wrapping_mul(83).wrapping_mul(1471)
+                    .wrapping_sub(s.word0.wrapping_mul(53))
+                    .wrapping_add(self.worcxt.word(2)),
+            );
+            self.cm_c2[13].set(
+                h.wrapping_add(self.worcxt.word(2).wrapping_mul(53).wrapping_mul(79))
+                 .wrapping_add(self.worcxt.word(3).wrapping_mul(53)
+                                   .wrapping_mul(47).wrapping_mul(71)),
+            );
+        }
+
+        // cmC[3] — last-byte stream2b/3bR + first char + brfcidx,
+        //          link-or-word / number cross.
+        self.cm_c[3].set(
+            ((s.stream3b_r & 7) << 10)
+                .wrapping_add(s.stream2b & 3)
+                .wrapping_add(fc * 4)
+                .wrapping_add(s.br_fc_idx << 24),
+        );
+        let lw_or_w0 = if s.link_word != 0 { s.link_word } else { s.word0 };
+        self.cm_c[3].set(
+            lw_or_w0.wrapping_mul(3301).wrapping_add(s.number0.wrapping_mul(3191)),
+        );
+
+        // cmC2[14] — word/non-repeating cross with brfcidx.
+        let cm_c2_14_disabled = s.c1 == ESCAPE_CHR
+            || utf8 != 0
+            || fccontext == CURLYOPENING_CHR as u32
+            || fccontext == HTLINK_CHR as u32
+            || s.fc as u8 == SPACE_CHR
+            || fc == HTML_CHR as u32
+            || brcontext == LESSTHAN_CHR as u32
+            || col < 2
+            || s.is_math
+            || sb0_high == b'\\';
+        if cm_c2_14_disabled {
+            self.cm_c2[14].sets();
+        } else {
+            self.cm_c2[14].set(
+                s.br_fc_idx
+                    .wrapping_add(
+                        self.worcxt.word(2)
+                            .wrapping_mul(s.stream3b_r & s.stream3b_r_mask2),
+                    )
+                    .wrapping_add(self.worcxt.types(1) & 0x1ff),
+            );
+        }
+
+        // cmC1[7] — local, small memory.
+        if s.c1 == ESCAPE_CHR || utf8 != 0 || s.fc as u8 == SPACE_CHR {
+            for _ in 0..4 { self.cm_c1[7].sets(); }
+        } else {
+            self.cm_c1[7].set(self.worcxt1.word(1).wrapping_add(s.word00));
+            self.cm_c1[7].set(
+                self.worcxt.word(2)
+                    .wrapping_add(s.word0.wrapping_mul(191))
+                    .wrapping_add(s.stream3b_r & 63),
+            );
+            self.cm_c1[7].set(
+                s.word0.wrapping_mul(191)
+                    .wrapping_add(s.stream3b_r & 63),
+            );
+            self.cm_c1[7].set(
+                (s.indirect_word0_pos & 0xffff)
+                    .wrapping_mul(191)
+                    .wrapping_add(s.word0)
+                    .wrapping_add(s.stream3b_r & 63),
+            );
+        }
+
+        // SmallStationaryContextMap fan-out (scmA[0..6]).
+        self.small_scms[0].set(c1);
+        self.small_scms[1].set(c2.wrapping_mul(s.is_paragraph as u32));
+        self.small_scms[2].set((s.indirect_word & 0xffffff) >> 16);
+        self.small_scms[3].set(s.stream3b & 0x1ff);
+        self.small_scms[4].set(s.stream2b & 0xff);
+        self.small_scms[5].set(brcontext);
+        self.small_scms[6].set(
+            (s.is_paragraph as u32).wrapping_add(2 * (s.stream3b_r & 0x3f)),
+        );
+
+        // Snapshot the few state fields the remaining writes touch,
+        // then drop the immutable borrow so we can mutate `self.state`.
+        let br_fc_idx_snap  = s.br_fc_idx;
+        let stream3b_r_snap = s.stream3b_r;
+        let x5_snap         = s.x5;
+        // (`s` is dropped here implicitly by going out of scope below.)
+        drop(s);
+
+        // wshift handler / sentence-end word-pipeline cycle
+        // (fxcmv1.cpp:4564-4568).
+        if self.state.wshift != 0 || self.state.c1 == LF_CHR {
+            self.state.word3 = self.state.word3.wrapping_mul(47);
+            self.state.word2 = self.state.word2.wrapping_mul(53);
+            self.state.word1 = self.state.word1.wrapping_mul(83);
+            self.state.wshift = 0;
+            if self.state.c1 == LF_CHR { self.state.s_verb = 0; }
+        }
+
+        // cmC2[15] — final word-stream feed with brfcidx + fc +
+        // stream3bR low 12 bits.
+        self.cm_c2[15].set(
+            (br_fc_idx_snap * 256)
+                .wrapping_add(fc)
+                .wrapping_add((stream3b_r_snap & 0xfff) << 16),
+        );
+
+        // APM hashes — fxcmv1.cpp:4572-4575.
+        self.state.ah1 = fxcm_hash(
+            (x5_snap >> 0) & 255,
+            (x5_snap >> 8) & 255,
+            (x5_snap >> 16) & 0x80ff,
+        );
+        self.state.ah2 = fxcm_hash(19, x5_snap & 0x80ffff, 0xffff_ffff);
     }
 }
 
