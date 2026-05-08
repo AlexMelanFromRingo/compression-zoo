@@ -16,9 +16,10 @@ A monorepo of high-ratio lossless compression tooling. Two halves:
 | `plugins/cmix/` (`cmix.dll`) | ✓ 148 MiB | cross-process round-trip (see plugin README for limits) | `/Codecs/cmix.dll` |
 | `plugins/brotli/` (`brotli.dll`) | ✓ 1.4 MiB | 12/12 Linux smoke; Windows test built, awaiting host | pending |
 | `rust/sevenz-rs/` | LZMA, LZMA2, PPMd7, PPMd8, BCJ, AES, hashes, CRC | 46 unit tests + bytewise C cross-check | — |
-| `rust/bsc-rs/` | adler32, format, LZP, BWT forward+inverse, range coder, predictor, QLFC static/adaptive/fast (encode + decode), top-level compress + decompress | 47 unit tests + 30/30 Rust enc → Rust+libbsc dec at levels 1/3/5/7/9 (and 40/40 libbsc enc → Rust dec previously) | — |
-| `rust/zpaq-rs/` | I/O traits, arith coder, SHA-1, block format, ZPAQL VM (256 opcodes), Predictor (8 components), PostProcessor PASS+PROG/PCOMP, top-level decompress | 22 unit tests + 12/18 end-to-end vs libzpaq (methods 0/1/2/3 all fixtures pass, 4/5 fail with a subtle predictor divergence) | — |
-| `rust/cmix-rs/` | skeleton | — | — |
+| `rust/bsc-rs/` | adler32, format, LZP, BWT forward+inverse (cache-aware bit-packed SA-IS), range coder, predictor, QLFC static/adaptive/fast (encode + decode), top-level compress + decompress | 61 unit tests + Rust↔libbsc round-trips at all levels | — |
+| `rust/zpaq-rs/` | I/O traits, arith coder, SHA-1, block format, ZPAQL VM, Predictor (8 components), PostProcessor PASS + PCOMP, top-level decompress, ZPAQL Compiler, LZBuffer (variable-bit / byte / BWT), E8E9 prefilter, `compress_method` covering all upstream digit methods (0..=9 with type-aware expansion incl. periodic-model analysis at level 5+) | 62 unit tests + Rust enc / libzpaq dec wire-compat across methods 0..=5 on random + real corpora | — |
+| `rust/cmix-rs/` | arith coder, sigmoid, state machines, context manager, Mixer + LSTM stack, SSE smoother, all Context types, Direct/Indirect/Match/Byte/Bracket models, full Shelwien PPMd port, FXCMv1 in progress (tables, mixers, state maps, context maps, APMs, buffer, brackets/columns/words, Porter2 stemmer, MatchModel2, FxcmState skeleton + byte-boundary step) | 90 unit tests | — |
+| `rust/gpu-rs/` | CUDA-via-FFI byte-histogram kernel + bench (1.6× speedup vs scalar at 16 MiB on RTX 4080) | bench harness | — |
 
 ### Method IDs (recorded in `docs/method-ids.md`)
 
@@ -78,10 +79,15 @@ The crate workspace lives at `rust/`:
 cd rust && cargo test --release
 ```
 
-That runs 46 sevenz-rs tests (LZMA / LZMA2 / PPMd7 / PPMd8 /
-BCJ / AES / hashes / CRC) and 13 bsc-rs tests (Adler-32 + the
-`bsc_block_info` header parser). All pass and all cross-check
-byte-for-byte against the C reference.
+That runs the full unit-test matrix: 46 in sevenz-rs (LZMA / LZMA2
+/ PPMd7 / PPMd8 / BCJ / AES / hashes / CRC), 61 in bsc-rs (Adler-32
++ LZP + BWT + cache-aware SA-IS + range coder + QLFC), 62 in
+zpaq-rs (block format + arith coder + ZPAQL VM + predictor +
+PostProcessor + Compiler + LZBuffer + E8E9 + digit-method
+expansion), 90 in cmix-rs (coder, sigmoid, mixer + LSTM stack,
+SSE, contexts, models incl. PPMd, FXCMv1 building blocks). All
+pass and all cross-check byte-for-byte against the C reference
+where applicable.
 
 ## Components
 
@@ -99,11 +105,24 @@ Direct port of the C reference implementations from `7zip/C/` with
 "variant A" goal of bringing the Rust port to feature parity with
 7-Zip's GUI (container, profiles, multithreading).
 
-### `rust/bsc-rs/`, `rust/zpaq-rs/`, `rust/cmix-rs/`
+### `rust/bsc-rs/`, `rust/zpaq-rs/`, `rust/cmix-rs/`, `rust/gpu-rs/`
 
-Per-plugin Rust ports. Currently `bsc-rs` has the Adler-32 and block
-header parser; `zpaq-rs` and `cmix-rs` are skeleton crates pending
-implementation.
+Per-plugin Rust ports.
+
+* `bsc-rs` is feature-complete (BWT + ST + LZP + QLFC) with
+  cache-aware SA-IS (bit-packed L/S array) and round-trips against
+  libbsc at every level.
+* `zpaq-rs` covers the libzpaq decode path end-to-end, the encoder
+  for all upstream digit methods (0..=9), the ZPAQL Compiler (with
+  bytecode-level validation against `makeConfig`), and the LZ77 /
+  BWT / E8E9 preprocessor. Encoded output decodes correctly under
+  upstream libzpaq for every method exercised in the test suite.
+* `cmix-rs` has the substrate (arith coder, mixer + LSTM, SSE,
+  contexts, base models, full PPMd) and a substantial chunk of the
+  FXCMv1 ensemble already ported; the heavy `modelPrediction`
+  orchestrator and PAQ8 component are the remaining big pieces.
+* `gpu-rs` is a CUDA-via-FFI experiment with a byte-histogram
+  kernel — see `docs/gpu-acceleration.md` for design notes.
 
 ## Licensing
 

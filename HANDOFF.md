@@ -224,11 +224,20 @@ Method IDs (community-aligned):
       on the simpler shapes; semantic-equivalence (mod whitespace)
       on level-2 methods (the level-2 HCOMP prefix differs only in
       indentation, both compile to identical bytecode).
-   ⏳ Remaining: digit-method type analysis — upstream's
-      `compressBlock` examines the input (entropy histogram +
-      type=binary/text/exe inference) before picking the `"x..."`
-      shape. Without that, `"4"` and `"5"` stay aliases; the user
-      has to pass `"x4,..."` explicitly for the heavy methods.
+   ✅ Digit-method type analysis — `expand_digit_method(method, data)`
+      mirrors libzpaq's `compressBlock` dispatch:
+        * Parses `"L[B,R,t]"` (level + optional block / redundancy /
+          type), defaults `type=512` when no commas.
+        * Computes block-size argument from input size via
+          `MAX(lg(n+4095) - 20, 0)`.
+        * Levels 1..=4 branch on `type` thresholds and emit the
+          corresponding LZ77 / LZ77+CM / BWT+CI shape with E8E9
+          suffix derived from the type bits.
+        * Levels 5..=9 run the periodic-model analysis (scan input
+          for repetition gaps, pick top two, emit matching
+          `c0,0,<999+period>,255i1` components) before appending
+          upstream's slow-CM tail.
+      Plain `"1".."9"` round-trip cleanly through the zpaq-rs decoder.
 3. **libsais cache-aware optimisations.** Beyond the reference
    Nong-2009 SA-IS port, this session added:
      - single-pass classify+count+lms-collect (one fewer scan of t).
@@ -238,12 +247,12 @@ Method IDs (community-aligned):
      - 1 MiB:  115 ms → 85 ms  (-26 %)
      - 4 MiB:  789 ms → 755 ms (-4 %)
      - 16 MiB: 4477 ms → 3914 ms (-13 %)
-   Real 2-3× wins past this point need either software prefetching
-   (`core::intrinsics::prefetch_*` is unsafe + nightly, conflicts
-   with `bsc-rs`'s `#![forbid(unsafe_code)]`) or libsais's heavier
-   algorithmic rework (bit-packed L/S backed by SIMD shuffles, the
-   gap-array trick to skip already-sorted bucket regions). Neither
-   fits the cleanliness goal of this crate; future work, deferred.
+   Plus this session: bit-packed L/S array (`Vec<bool>` →
+   `BitSet` over `Vec<u64>`, 8× cache-footprint reduction). The
+   SIMD-shuffle classify pass that pairs with bit-packed L/S in
+   upstream libsais is unsafe / nightly territory (`std::arch` or
+   `core::simd`), so per user decision it stays out — the
+   bit-packing is the safe-Rust portion of the cache-aware win.
 4. **CMIX-rs.** Substantial foundation in place — covers every
    sub-module that doesn't pull in PAQ/PPMd/FXCM:
      - `coder.rs`            — float-probability arith encoder/decoder.
@@ -323,11 +332,12 @@ Method IDs (community-aligned):
 
 ```
 $ cargo test --release
-test result: ok. 49 passed   (bsc-rs)
-test result: ok. 23 passed   (zpaq-rs)
+test result: ok. 61 passed   (bsc-rs)
+test result: ok. 62 passed   (zpaq-rs)
 test result: ok. 46 passed   (sevenz-rs)
-test result: ok. 86 passed   (cmix-rs, 1 ignored heavy SSE)
-   total: 204 unit tests passing
+test result: ok. 90 passed   (cmix-rs, 1 ignored heavy SSE)
+test result: ok.  3 passed   (gpu-rs)
+   total: 262 unit tests passing
 
 cross-language:
   bsc-rs encode + decode  30/30
