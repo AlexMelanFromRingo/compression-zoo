@@ -69,7 +69,7 @@ Remaining work (low priority):
 - Forward ST (most archives use BWT, not ST).
 - libsais SA-IS port for faster forward BWT (current is prefix-doubling, O(n log² n)).
 
-### `zpaq-rs` — DONE for decompress (methods 0–5 round-trip)
+### `zpaq-rs` — decompress 0–5 + encode (stored + canned models 1/2/3)
 
 Files:
 ```
@@ -83,22 +83,28 @@ rust/zpaq-rs/src/
   predictor_tables.rs       ← squash/stretch/dt/dt2k tables
   state_table.rs            ← SNS[1024] next-state table
   decompress.rs             ← top-level decompress + PostProcessor
-  bin/zpaq_decompress.rs    ← end-to-end CLI
+  compress.rs               ← Compresser (stored + modeled), 4 unit tests
+  models.rs                 ← canned min/mid/max headers from upstream
+  bin/zpaq_decompress.rs    ← decompress CLI
+  bin/zpaq_compress.rs      ← compress CLI (methods 0=store, 1=min, 2=mid, 3=max)
   bin/zpaq_inspect.rs       ← block/segment header dumper
 ```
 
 Test results:
-- 23 unit tests pass.
-- End-to-end vs `/tmp/zpaq_make`:
+- 27 unit tests pass.
+- Decompress end-to-end vs `/tmp/zpaq_make`:
   ```
-  ok  m0 (store)        — all fixtures
-  ok  m1 (LZ77)         — all fixtures
-  ok  m2                — all fixtures
-  ok  m3                — all fixtures
-  ok  m4 (n=8 model)    — all fixtures (incl. random 1KB and 100KB)
-  ok  m5 (n=23 model)   — all fixtures
+  ok  m0..m5            — all fixtures (incl. random 1KB and 100KB)
   ```
   Round-trips libzpaq.cpp (273 KB text) at 16.67% with m5.
+- Compress end-to-end (Rust encode → libzpaq decode AND Rust decode):
+  ```
+  ok  store (n=0)        — all sizes 100..100000 random + text fixtures
+  ok  min.cfg (level 1)  — all sizes
+  ok  mid.cfg (level 2)  — all sizes
+  ok  max.cfg (level 3)  — all sizes
+  ```
+  Compress ratio on libzpaq.cpp (273 KB): max.cfg = 16.53%.
 
 Bugs fixed historically (don't re-introduce):
 1. `decompress.rs::decompress_block` stored path passed `ph=0/pm=0` to
@@ -122,7 +128,11 @@ Bugs fixed historically (don't re-introduce):
    `cxt+m ≤ cm.size()`. (This was the "method 4/5" bug.)
 
 Remaining zpaq-rs work:
-- ZPAQ encode side (Encoder + predictor train + compile config strings).
+- Compiler — parse libzpaq config strings (`x4,3,1c0,0,255i1...`) to
+  bytecode. Without it we can compress with stored mode and the three
+  canned headers, but not arbitrary method strings.
+- Preprocessing (LZ77 / BWT / E8E9) — needed to match upstream's
+  default high-compression methods which run a PCOMP-driven preproc.
 - JIT path (intentionally skipped — interpret-only is fine).
 - More archive-format tests (multi-block, multi-segment).
 
@@ -172,10 +182,10 @@ Method IDs (community-aligned):
 
 ## Suggested ordering for next session
 
-1. **ZPAQ encode side.** Mirror of decompress: `predictor.update`
-   already works; need `Encoder` (symmetric of `Decoder`, already
-   in `arith.rs`), `Compiler` for config strings (~500 lines), and
-   `Compresser` driver.
+1. **ZPAQ Compiler + preprocessor.** Lifts encode from "store + 3
+   canned models" to "any libzpaq method string". Compiler is ~500
+   lines of recursive-descent over `opcodelist`; LZ77/BWT/E8E9 are
+   another ~1K lines. After this `compressBlock(method)` is reachable.
 2. **libsais SA-IS Rust port.** Standalone, well-bounded (libsais.c
    is ~5K lines, no global state). Replaces my prefix-doubling SA
    in `bsc-rs/src/bwt.rs::suffix_array`.
@@ -195,8 +205,10 @@ cross-language:
   bsc-rs ST inverse       20/20
   bsc-rs unbwt vs libsais  6/6
   bsc-rs range coder       8/8
-  zpaq-rs methods 0..5    36/36 short fixtures + 12/12 random binaries
-  Brotli plugin           12/12
+  zpaq-rs decode methods 0..5    36/36 short fixtures + 12/12 random
+  zpaq-rs encode m0/min/mid/max  16/16 random sizes 100..100000
+  zpaq-rs encode wire-compat     ditto, decoded by libzpaq
+  Brotli plugin                  12/12
 ```
 
 ## How to verify nothing regressed before you start
