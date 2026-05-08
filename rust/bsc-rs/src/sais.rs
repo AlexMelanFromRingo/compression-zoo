@@ -21,6 +21,43 @@
 
 #![allow(dead_code)]
 
+/// Bit-packed L/S type array.
+///
+/// Stores 64 type bits per `u64` word. On a typical input the bit
+/// pattern `is_s[0..n]` is the most-touched read-only structure
+/// during induced sorting; packing it 8× reduces the cache footprint
+/// from `n` bytes (with `Vec<bool>`) to `n/8` bytes — large texts
+/// (>L1) start fitting fully into L2 instead of spilling.
+///
+/// All accessors are O(1) and do not allocate after construction.
+struct BitSet {
+    words: Vec<u64>,
+    len:   usize,
+}
+
+impl BitSet {
+    fn with_capacity(n: usize) -> Self {
+        Self { words: vec![0u64; (n + 63) / 64], len: n }
+    }
+
+    #[inline(always)]
+    fn get(&self, i: usize) -> bool {
+        debug_assert!(i < self.len);
+        (self.words[i >> 6] >> (i & 63)) & 1 == 1
+    }
+
+    #[inline(always)]
+    fn set(&mut self, i: usize, v: bool) {
+        debug_assert!(i < self.len);
+        let mask = 1u64 << (i & 63);
+        if v { self.words[i >> 6] |= mask;  }
+        else { self.words[i >> 6] &= !mask; }
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize { self.len }
+}
+
 /// Suffix array of `text` over the byte alphabet (256 symbols),
 /// using an implicit smaller-than-everything sentinel at position
 /// `text.len()`. Output length is `text.len()`.
@@ -58,7 +95,10 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
     //   * `lms_positions` — positions i where i is an LMS suffix start
     //
     // Replaces three separate passes in the textbook reference.
-    let mut is_s = vec![false; n];
+    // Bit-packed L/S array — 1 bit per position instead of 1 byte;
+    // 8× cache-footprint reduction on the structure read most often
+    // by `induce_sort_*` and `lms_substring_equal`.
+    let mut is_s = BitSet::with_capacity(n);
     let mut counts = vec![0i32; k];
     // LMS positions store as u32 — saves 4 bytes/entry on 64-bit hosts
     // and keeps the typical n_lms ~ n/2 array half the cache footprint
@@ -66,7 +106,7 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
     // the rest of the SA-IS pipeline (i32 SA), so this is safe.
     let mut lms_positions: Vec<u32> = Vec::new();
 
-    is_s[n - 1] = true;
+    is_s.set(n - 1, true);
     counts[t[n - 1] as usize] += 1;
     let mut prev_s = true;
     for i in (0..n - 1).rev() {
@@ -77,7 +117,7 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
         } else {
             prev_s
         };
-        is_s[i] = s;
+        is_s.set(i, s);
         counts[t[i] as usize] += 1;
         // LMS at position i+1 ⇔ is_s[i+1] && !is_s[i]
         // (we know prev_s = is_s[i+1] from the previous iteration).
@@ -168,21 +208,21 @@ fn sais_main(t: &[i32], k: usize) -> Vec<i32> {
 /// [`is_lms_pos`] but inlined; helpful when the compiler can't be
 /// nudged to inline a `pub(crate)` fn through the iterator pipeline.
 #[inline(always)]
-fn is_lms_pos_inline(is_s: &[bool], i: usize) -> bool {
-    i > 0 && is_s[i] && !is_s[i - 1]
+fn is_lms_pos_inline(is_s: &BitSet, i: usize) -> bool {
+    i > 0 && is_s.get(i) && !is_s.get(i - 1)
 }
 
 /// `is_lms_pos(i)` ⇔ position `i` is the start of an LMS substring.
 /// Defined as: `i > 0 && is_s[i] && !is_s[i-1]`.
-fn is_lms_pos(is_s: &[bool], i: usize) -> bool {
-    i > 0 && is_s[i] && !is_s[i - 1]
+fn is_lms_pos(is_s: &BitSet, i: usize) -> bool {
+    i > 0 && is_s.get(i) && !is_s.get(i - 1)
 }
 
 /// Equality of the two LMS substrings starting at `a` and `b`.
 /// An LMS substring runs from one LMS position up to (and including)
 /// the next LMS position. Two singleton-sentinel LMS substrings
 /// compare unequal *unless* `a == b` (sentinels are unique).
-fn lms_substring_equal(t: &[i32], is_s: &[bool], a: usize, b: usize) -> bool {
+fn lms_substring_equal(t: &[i32], is_s: &BitSet, a: usize, b: usize) -> bool {
     let n = t.len();
     if a == n - 1 || b == n - 1 {
         return a == b;
@@ -194,7 +234,7 @@ fn lms_substring_equal(t: &[i32], is_s: &[bool], a: usize, b: usize) -> bool {
         if pa >= n || pb >= n {
             return false;
         }
-        if t[pa] != t[pb] || is_s[pa] != is_s[pb] {
+        if t[pa] != t[pb] || is_s.get(pa) != is_s.get(pb) {
             return false;
         }
         if k > 0 {
@@ -239,13 +279,13 @@ fn bucket_heads(counts: &[i32]) -> Vec<usize> {
 
 /// Place L predecessors of every assigned `sa[i]` into bucket heads,
 /// scanning left to right.
-fn induce_sort_l(sa: &mut [i32], t: &[i32], is_s: &[bool], counts: &[i32]) {
+fn induce_sort_l(sa: &mut [i32], t: &[i32], is_s: &BitSet, counts: &[i32]) {
     let mut heads = bucket_heads(counts);
     for i in 0..sa.len() {
         let j = sa[i];
         if j <= 0 { continue; } // -1 (empty) or 0 (no predecessor).
         let pred = (j - 1) as usize;
-        if !is_s[pred] {
+        if !is_s.get(pred) {
             let c = t[pred] as usize;
             sa[heads[c]] = pred as i32;
             heads[c] += 1;
@@ -255,13 +295,13 @@ fn induce_sort_l(sa: &mut [i32], t: &[i32], is_s: &[bool], counts: &[i32]) {
 
 /// Place S predecessors of every assigned `sa[i]` into bucket tails,
 /// scanning right to left.
-fn induce_sort_s(sa: &mut [i32], t: &[i32], is_s: &[bool], counts: &[i32]) {
+fn induce_sort_s(sa: &mut [i32], t: &[i32], is_s: &BitSet, counts: &[i32]) {
     let mut tails = bucket_tails(counts);
     for i in (0..sa.len()).rev() {
         let j = sa[i];
         if j <= 0 { continue; }
         let pred = (j - 1) as usize;
-        if is_s[pred] {
+        if is_s.get(pred) {
             let c = t[pred] as usize;
             sa[tails[c]] = pred as i32;
             if tails[c] > 0 { tails[c] -= 1; }
