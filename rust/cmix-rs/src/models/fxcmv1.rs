@@ -3557,6 +3557,33 @@ pub const ESC_LIMITS: [i32; 8] =
 pub const PRIMES: [u32; 14] =
     [0, 257, 251, 241, 239, 233, 229, 227, 223, 211, 199, 197, 193, 191];
 
+/// Bracket / first-char → 1-7 lookup (else 0). 128-entry, indexed
+/// by the low 7 bits of a control or open-bracket byte. Verbatim
+/// from fxcmv1.cpp:3681-3690.
+pub const FCY: [u8; 128] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 5, 0, 0, 0, 0, 6, 1, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0,
+    2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// First-char → 1-7 lookup (else 0). Verbatim from
+/// fxcmv1.cpp:3692-3701.
+pub const FCQ: [u8; 128] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 4, 5, 0, 0,
+    2, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0,
+    2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
 /// Tri/trj — small lookup tables that fold `fails` bits into the
 /// `pz` failure counter inside `update1`.
 pub const TRI: [u32; 4] = [0, 4, 3, 7];
@@ -4077,6 +4104,35 @@ impl FxcmState {
             if self.c1 == b')' { self.sen_word = 0; }
             false
         }
+    }
+
+    /// BrFcIdx / FcIdx context-index lookups —
+    /// fxcmv1.cpp:4167-4169 + 4246-4247.
+    ///
+    /// `BrFcIdx` collapses the active bracket / quote / first-char
+    /// context to one of 0..=7 via [`FCY`]. `FcIdx` is the
+    /// first-char-only collapse via [`FCQ`].
+    ///
+    /// `br_context` and `br_cxt_active` come from `BracketContext::cxt`
+    /// and `BracketContext::context != 0`. Same pair for `qo_*` and
+    /// `fc_*`.
+    pub fn compute_fc_indices(
+        &mut self,
+        br_context: u8, br_cxt_active: bool,
+        qo_context_high: u8, qo_cxt_active: bool,
+        fc_context: u8, fc_cxt_active: bool,
+    ) {
+        self.br_fc_idx = 0;
+        if br_cxt_active {
+            self.br_fc_idx = FCY[(br_context & 0x7f) as usize] as u32;
+        }
+        if !br_cxt_active && qo_cxt_active {
+            self.br_fc_idx = FCY[(qo_context_high & 0x7f) as usize] as u32;
+        }
+        if self.br_fc_idx == 0 && fc_cxt_active {
+            self.br_fc_idx = FCY[(fc_context & 0x7f) as usize] as u32;
+        }
+        self.fc_idx = FCQ[(fc_context & 0x7f) as usize] as u32;
     }
 
     /// UTF-8 byte-stream tracker — fxcmv1.cpp:4310-4321. When the
@@ -4949,6 +5005,39 @@ mod tests {
         s.sen_word = 999;
         s.update_streams_for_word_type(&w, /*is_paragraph=*/true);
         assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn fc_tables_have_known_anchor_values() {
+        // FCY is keyed by upstream's wiki-encoded control bytes
+        // (LESSTHAN_CHR='L', SQUAREOPEN_CHR=91, CURLYOPENING_CHR='P'),
+        // not the literal "[", "<", "{". `(` is at its ASCII slot.
+        assert_eq!(FCY[b'(' as usize], 1);
+        assert_eq!(FCY[LESSTHAN_CHR as usize], 4);
+        assert_eq!(FCY[SQUAREOPEN_CHR as usize], 3);
+        assert_eq!(FCY[CURLYOPENING_CHR as usize], 2);
+    }
+
+    #[test]
+    fn compute_fc_indices_picks_bracket_first() {
+        let mut s = FxcmState::new();
+        s.compute_fc_indices(
+            /*br=*/b'(', /*br_active=*/true,
+            /*qo_high=*/0, false,
+            /*fc=*/0, false,
+        );
+        assert_eq!(s.br_fc_idx, 1);  // FCY['('] = 1.
+    }
+
+    #[test]
+    fn compute_fc_indices_falls_back_to_quote() {
+        let mut s = FxcmState::new();
+        s.compute_fc_indices(
+            /*br=*/0, /*br_active=*/false,
+            /*qo_high=*/LESSTHAN_CHR, /*qo_active=*/true,
+            /*fc=*/0, /*fc_active=*/false,
+        );
+        assert_eq!(s.br_fc_idx, FCY[LESSTHAN_CHR as usize] as u32);
     }
 
     #[test]
