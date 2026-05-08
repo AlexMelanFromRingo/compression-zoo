@@ -153,27 +153,13 @@ Remaining zpaq-rs work:
 - JIT path (intentionally skipped — interpret-only is fine).
 - More archive-format tests (multi-block, multi-segment).
 
-### `cmix-rs` — NOT STARTED
+### `cmix-rs` — IN PROGRESS
 
-`rust/cmix-rs/src/lib.rs` is still a one-line skeleton.
-
-Realistic scope: CMIX is ~30K lines of intricate C++ (PAQ8-derived
-ensemble of dozens of sub-models with a logistic-mixer stack and
-heavy preprocessing). A faithful port is multi-week work and very
-bug-prone — every per-byte state divergence corrupts the bit stream.
-
-The plugin (`plugins/cmix/cmix.dll`) works fine for archive use
-today; the Rust port is purely for memory safety / portability and
-isn't on the critical path.
-
-Suggested approach when starting:
-1. Vendor `plugins/cmix/upstream` is already there.
-2. Start with `predictor.cpp` — the per-byte mix-of-models entry
-   point. Its inputs/outputs are well-defined.
-3. Expect to need ~60% of CMIX's source ported before a single-byte
-   round-trip works (all the static state matters).
-4. Use the same per-step trace bisection as for ZPAQ to find any
-   divergence early.
+Substantial foundation in place; see priority-4 entry below for the
+detailed list. Around 3700 LOC of FXCMv1 ported and 86/86 cmix-rs
+tests passing. The remaining work is dominated by `modelPrediction`
+(~960 LOC) and `paq8.cpp` (~8400 LOC), both of which orchestrate the
+already-ported building blocks.
 
 ### Plugins (C++) — DONE
 
@@ -279,32 +265,59 @@ Method IDs (community-aligned):
        Forward+softmax, BPTT on horizon wrap-around.
      - `mixer/byte_mixer.rs` — wraps the LSTM in a 256-byte
        distribution model, masked by the caller-supplied vocab.
+     - `mixer/sse.cpp`       — Shelwien's two-stage SSE smoother
+       (templated SSEi+Mixer); tested.
      - `contexts.rs`         — every Context type (Bit, ContextHash,
        Combined, Interval, IntervalHash, IndirectHash, Sparse,
        Bracket).
      - `models.rs`           — Direct, DirectHash, Indirect, Match,
-       ByteModel, Bracket. Each with convergence / round-trip /
-       smoke tests.
-   Tests: 32/32 in cmix-rs (~2200 LOC of Rust).
-   Remaining (still multi-day per the original handoff, but the
-   structural foundation is now in place):
-     - `mixer/sse.cpp` (~330 LOC) — Eugene Shelwien's templated
-       SSE smoother with several hundred MB of `SSEi<7>` /
-       `Mixer` instances. Mostly bit-fiddling; the port shape is
-       clear, just tedious.
-     - `predictor.cpp` (~490 LOC) — top-level orchestrator. Builds
-       the model graph (AddBracket, AddPAQ8, AddPPMD, AddWord,
-       AddDirect, AddMatch, AddDoubleIndirect, AddMixers, …) and
-       drives a layered Mixer + SSE pipeline. Once it lands the
-       bit-level CMIX is end-to-end runnable.
-     - `runner.cpp` (~330 LOC) — top-level driver / CLI.
-     - **Big models** (the bulk of CMIX): `paq8.cpp` (~8.4 K LOC),
-       `fxcmv1.cpp` (~4.9 K LOC), `ppmd.cpp` (~1.3 K LOC). These
-       are the heavy hitters — each is a multi-day port on its
-       own and dwarfs everything above.
-   The shape of the work is mostly mechanical (one module at a
-   time, with cross-validation via per-byte trace bisection against
-   the upstream binary), but the *size* is real.
+       ByteModel, Bracket.
+     - `models/ppmd.rs`      — full Shelwien-style PPMd port (heap
+       as `Vec<u8>` + u32 offsets, rescale / create_successors /
+       reduce_order / update_model). T-mode probabilities tested.
+     - `models/fxcmv1.rs`    — port of `fxcmv1.cpp` is well under
+       way (~3700 LOC ported, 86/86 tests passing). Shipped:
+         * NUM_MODELS, WRT_2B/3B tables, ESC_COEF, EXP_ESCAPE.
+         * build_ilog / build_squash_table / build_stretch_table /
+           build_dt.
+         * Inputs / BlockData / StateTable.
+         * Mixer1 (dot_product, train) + StateMap / StateMap1 /
+           RunContextMap / SmallStationaryContextMap.
+         * EBucket<A,B>, ContextMap<A,B> (replaces upstream's three
+           bucket variants in one struct).
+         * ApmDyn, DirectStateMap.
+         * Buffer (BMASK=0xFFFFFF), MtfList, ContextVec, generic
+           CmixVec<T>, BracketContextFx<T>.
+         * Wiki control constants + ColumnContext + WordsContext
+           (sbytes/type/stem/capital lists).
+         * Word + EngWordTypeFlags + EnglishStemmer (full Porter2
+           pipeline incl. all reference word lists, suffix-step
+           tables, Exceptions1/2, blpos<451531986 gate).
+         * MatchModel2 (HashElementForMatchPositions, MatchInfo
+           with delta/recovery state machine, candidate set,
+           per-bit update + mix returning length-scaled logits and
+           three StateMap1 outputs).
+         * PredictorInit reference data: C_R/C_S/C_S3/C_S4 (27 each),
+           ESC_LIMITS[8], TRI/TRJ, brackets/quotes/fchar/html
+           tables, STA_PARAMS[6] + build_sta_tables, pre1 builder
+           from STA7.
+         * Mixer/StateMap/SCM init param tables + build_mixers,
+           build_state_maps, build_small_scm helpers.
+   Tests: 86/86 in cmix-rs (1 ignored heavy SSE test).
+   Remaining (the heavy integration work — entangled file-scope
+   state in upstream means each piece pulls many siblings):
+     - **modelPrediction (~960 LOC)** — single function that
+       orchestrates ContextMap / StateMap / Bracket / Words /
+       SparseMatch / MatchModel updates per bit. The bulk of
+       FXCMv1's actual prediction logic.
+     - **PredictorInit / update1 wrapper** — ~100+77 LOC, mostly
+       bind-and-call on the components above.
+     - **Top-level fxcmv1::Predictor** — owns the ~30+ component
+       arrays + the per-byte state (c1..c4, pos, t[14], words/
+       firstWord/etc., line tracking, isText, isParagraph).
+     - `paq8.cpp` (~8.4 K LOC) — the other ensemble component.
+     - CMIX top-level Predictor (`predictor.cpp`, ~490 LOC) and
+       runner CLI (`runner.cpp`, ~330 LOC).
 
 ## Tests at handoff
 
@@ -313,7 +326,8 @@ $ cargo test --release
 test result: ok. 49 passed   (bsc-rs)
 test result: ok. 23 passed   (zpaq-rs)
 test result: ok. 46 passed   (sevenz-rs)
-   total: 118 unit tests passing
+test result: ok. 86 passed   (cmix-rs, 1 ignored heavy SSE)
+   total: 204 unit tests passing
 
 cross-language:
   bsc-rs encode + decode  30/30
