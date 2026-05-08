@@ -5312,23 +5312,62 @@ impl Predictor {
             + (stream2b & 3)) * 2
             + (words & 1)) as usize;
 
-        // Mixer 4 — heavy bpos branching.
-        let last_word_type = self.worcxt.types(1);
-        let last_word_capital = self.worcxt.capital_at(1) as u32;
-        let mut mx4 = c0_b & 255;
-        match bpos {
-            0 => mx4 |= ((last_word_capital & 1) << 3) | (((words >> 4) & 0xf) << 4),
-            1 => mx4 |= ((last_word_capital & 1) << 3) | ((c2_3b_r) << 4) | (bpos & 7),
-            2 => mx4 |= ((last_word_capital & 1) << 3) | ((stream2b & 3) << 4) | (bpos & 7),
-            3 => mx4 |= ((last_word_capital & 1) << 3) | ((words & 1) << 4) | (bpos & 7),
-            4 => mx4 |= ((last_word_capital & 1) << 3) | (bpos & 7),
-            _ => mx4 |= (last_word_capital & 1) << 3,
+        // Mixer 4 — fxcmv1.cpp:4706-4726. Computed `c` cycles with
+        // bpos, then folded with ord_x adjustment and is_paragraph.
+        let mut c4: u32 = c0_b;
+        if bpos != 0 {
+            match bpos {
+                1 => c4 = c4.wrapping_add(16 * c2_3b),
+                2 => c4 = c4.wrapping_add(16 * (stream2b & 3)),
+                3 => c4 = c4.wrapping_add(16 * (words & 1)),
+                _ => c4 = bpos.wrapping_add(c4 & 0xf0),
+            }
+            if bpos < 5 { c4 = bpos.wrapping_add(c4 & 0xf0); }
+        } else {
+            c4 = 16 * (stream2b & 0xf);
         }
-        // Plus the upper 8 bits: ordX clamped × isMatch(0/1).
-        mx4 |= ((s.ord_x as u32) & 0x1f) << 8
-             | (if is_match != 0 { 0x2000 } else { 0 });
-        let _ = last_word_type;  // (not yet folded in this stub)
-        self.mixers[4].cxt = mx4 as usize;
+        // ord_x adjustment for mixer 4 (in-place: caller's
+        // `state.ord_x` is mutated).
+        let mut ord_x_adj = (s.ord_x as i32) - 1;
+        if ord_x_adj < 0 { ord_x_adj = 0; }
+        if is_match != 0 { ord_x_adj += 1; }
+        self.mixers[4].cxt = (c4
+            + (ord_x_adj as u32) * 256
+            + 8 * (s.is_paragraph as u32)) as usize;
+
+        // Mixer 5 — words / first-char / stream2b/3b cross.
+        self.mixers[5].cxt = ((s.ord_w as u32) * 256
+            + (stream2b & 0xf0)
+            + ((s.stream3b & 0x38) >> 2)) as usize * 4 + s.fc_idx as usize;
+
+        // Mixer 7 — bpos-split: 0..=2 vs 3..=7.
+        if bpos > 2 {
+            self.mixers[7].cxt = (((s.stream3b & 7) * 8
+                + WRT_3B[(c0_b & 255) as usize] as u32)
+                * 256
+                + s.br_fc_idx * 32
+                + (words & 7) * 4
+                + (s.is_paragraph as u32)
+                + if is_match != 0 { 2 } else { 0 }) as usize;
+        } else {
+            self.mixers[7].cxt = (((s.stream3b & 63) * 256
+                + s.br_fc_idx * 16
+                + (words & 7) * 2
+                + (s.is_paragraph as u32))
+                | if is_match != 0 { 128 } else { 0 }) as usize;
+        }
+
+        // Mixer 9 — bpos × fails low2 cross. Upstream additionally
+        // folds `lstmex` (LSTM auxiliary signal); without that
+        // available yet, we leave the slot at 0.
+        self.mixers[9].cxt = ((bpos << 8) * 4
+            + (s.fails & 3) * 256) as usize;
+
+        // Update state.ord_x with the post-mixer-4 adjustment so the
+        // upstream "ordX = ordX-1; ... if (isMatch) ordX++;" carries
+        // forward to the next bit.
+        let _ = s;  // release immutable borrow
+        self.state.ord_x = ord_x_adj;
     }
 }
 
