@@ -319,29 +319,45 @@ Method IDs (community-aligned):
    Tests: 86/86 in cmix-rs (1 ignored heavy SSE test).
    Remaining (the heavy integration work — entangled file-scope
    state in upstream means each piece pulls many siblings):
-     - **modelPrediction (~960 LOC)** — single function that
-       orchestrates ContextMap / StateMap / Bracket / Words /
-       SparseMatch / MatchModel updates per bit. The bulk of
-       FXCMv1's actual prediction logic.
-     - **PredictorInit / update1 wrapper** — ~100+77 LOC, mostly
-       bind-and-call on the components above.
-     - **Top-level fxcmv1::Predictor** — owns the ~30+ component
-       arrays + the per-byte state (c1..c4, pos, t[14], words/
-       firstWord/etc., line tracking, isText, isParagraph).
-     - `paq8.cpp` (~8.4 K LOC) — the other ensemble component.
-     - CMIX top-level Predictor (`predictor.cpp`, ~490 LOC) and
-       runner CLI (`runner.cpp`, ~330 LOC).
+     - **`fxcmv1::Predictor`** owns the full FXCMv1 component graph:
+       all 32 ContextMaps (cmC2[18], cmC1[8], cmC[6]) configured
+       with the upstream `(m, c_r, c_s, c_s3, c_s4, STA*, st2_p*)`
+       parameter tuples, the 12 Mixer1 instances, 7
+       SmallStationaryContextMap, 1 RunContextMap, 3 StateMap1
+       (MatchModel internals), 6 ApmDyn (APM cascade), 4
+       BracketContext (brackets / quotes / first-char / html), 1
+       ColumnContext, 3 WordsContext, MatchModel2, SparseMatchModel,
+       Buffer, FxcmState, plus all pre-computed tables (sqt / strt
+       / ilog / dt / sta_tables / pre1 / st2_p0/1/2). Construction
+       allocates the upstream-equivalent footprint (several GB) so
+       any test that builds it pays a one-off ~4 s.
+     - **modelPrediction integration** — most byte-boundary
+       sub-steps are ported as standalone methods on `FxcmState`
+       (byte_boundary_step, shift_letter_classes, is_word_letter,
+       track_numbers, cycle_word_pipeline, maybe_seed_first_word,
+       update_streams_for_word_type, rotate_stream_masks,
+       update_streams_after_byte, line_break_lf, sentence_end_punct,
+       punct_comma/colon/curly/close_square/less_than/equals/nbsp,
+       update_indirect_histories, update_word0_position,
+       paragraph_from_fc, track_utf8_byte, compute_fc_indices). The
+       remaining work is the `cmC[N].set(hash)` per-byte / per-bit
+       feeds that consume these helpers and drive the
+       Mixer/APM stack — straight transcription of upstream
+       fxcmv1.cpp:4250-4760 onto `Predictor`.
+     - `paq8.cpp` — the other ensemble component, untouched.
+     - CMIX top-level `predictor.cpp` orchestrator and `runner.cpp`
+       CLI, untouched.
 
 ## Tests at handoff
 
 ```
 $ cargo test --release
 test result: ok. 61 passed   (bsc-rs)
-test result: ok. 62 passed   (zpaq-rs)
+test result: ok. 62 passed   (zpaq-rs unit) + 4 wire_compat
 test result: ok. 46 passed   (sevenz-rs)
-test result: ok. 90 passed   (cmix-rs, 1 ignored heavy SSE)
+test result: ok. 121 passed  (cmix-rs, 1 ignored heavy SSE)
 test result: ok.  3 passed   (gpu-rs)
-   total: 262 unit tests passing
+   total: 297 tests passing
 
 cross-language:
   bsc-rs encode + decode  30/30
