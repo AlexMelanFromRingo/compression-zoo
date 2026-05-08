@@ -15,10 +15,13 @@
 #![forbid(unsafe_code)]
 
 pub mod coder;     // arithmetic coder (encoder.cpp / decoder.cpp)
+pub mod contexts;  // bit/bracket/combined/context-hash/...
 pub mod mixer;     // mixer + mixer-input
+pub mod models;    // direct, direct-hash, indirect, match
 pub mod sigmoid;   // mixer/sigmoid table
 pub mod state;     // State trait
 pub mod states;    // nonstationary, run-map
 
-// TODO (multi-week scope): predictor, context_manager, contexts/*,
-// mixer/{byte-mixer,lstm,sse}, models/*. See HANDOFF.
+// TODO (multi-week scope): predictor, context_manager,
+// mixer/{byte-mixer,lstm,sse}, big models (paq8/fxcmv1/ppmd),
+// byte-model/bracket. See HANDOFF.

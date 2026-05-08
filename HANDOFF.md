@@ -258,30 +258,36 @@ Method IDs (community-aligned):
    algorithmic rework (bit-packed L/S backed by SIMD shuffles, the
    gap-array trick to skip already-sorted bucket regions). Neither
    fits the cleanliness goal of this crate; future work, deferred.
-4. **CMIX-rs.** Foundation in place this session:
-     - `coder.rs` — float-probability arithmetic encoder/decoder
-       with `Predictor` trait. Round-trip-tested via stub predictor.
-     - `sigmoid.rs` — Logit table + scalar Logistic.
+4. **CMIX-rs.** Significant progress this session — full foundation
+   plus the small-model layer:
+     - `coder.rs`     — float-probability arith encoder/decoder.
+     - `sigmoid.rs`   — Logit table + scalar Logistic.
      - `state.rs` + `states/{run_map, nonstationary}.rs` — both
-       PAQ-derived state machines, transition tables verbatim from
-       upstream. Anchor values cross-checked.
-     - `mixer.rs` — `MixerInput` + `Mixer` (per-context weight maps,
-       online SGD with global + per-context decay). Learning
-       smoke-test passes.
-   Tests: 12/12 in cmix-rs.
-   Remaining (multi-week per the original handoff):
-     - `contexts/*` (~10 small files: bit-context, bracket-context,
-       interval, sparse, indirect-hash, …).
-     - `models/*` — the big chunk. `paq8.cpp` alone is multi-kLOC,
-       and `ppmd.cpp` re-ports an entire PPMd implementation.
-     - `predictor.cpp` — top-level orchestrator that wires every
-       sub-model into the mixer.
-     - `mixer/{byte-mixer, lstm, lstm-layer, sse}` — the LSTM-based
-       refinement layer plus the SSE smoothing pass.
-     - `runner.cpp` / `context-manager.cpp` — top-level driver.
+       PAQ-derived state machines, tables verbatim from upstream.
+     - `mixer.rs`     — `MixerInput` + `Mixer` (per-context weights
+       in `HashMap<u64, ContextData>`, online SGD with global +
+       per-context decay). Learning smoke-test passes.
+     - `contexts.rs`  — every Context type from `contexts/*.cpp`:
+       BitContext, ContextHash, CombinedContext, Interval,
+       IntervalHash, IndirectHash, Sparse, BracketContext.
+     - `models.rs`    — Direct, DirectHash, Indirect, Match,
+       ByteModel. Each with round-trip / convergence tests.
+   Tests: 25/25 in cmix-rs.
+   Remaining (still multi-week per the original handoff, but smaller
+   now):
+     - `models/bracket.cpp`           (~60 LOC, subclass of ByteModel
+                                       with vocab + match-pair stats).
+     - `mixer/{byte-mixer, lstm, lstm-layer, sse}.cpp` (~500 LOC) —
+       the LSTM-based refinement stack on top of the linear `Mixer`.
+     - `predictor.cpp` (~490 LOC) — the orchestrator that wires
+       every sub-model into the mixer pipeline.
+     - `context-manager.cpp` + `runner.cpp` — top-level driver.
+     - **Big models** (the bulk of CMIX): `paq8.cpp` (~8.4 K LOC),
+       `fxcmv1.cpp` (~4.9 K LOC), `ppmd.cpp` (~1.3 K LOC). These
+       are the heavy hitters — each is a multi-day port on its own.
    The shape of the work is mostly mechanical (one module at a
    time, with cross-validation via per-byte trace bisection against
-   the upstream binary), but the size is real.
+   the upstream binary), but the *size* is real.
 
 ## Tests at handoff
 
