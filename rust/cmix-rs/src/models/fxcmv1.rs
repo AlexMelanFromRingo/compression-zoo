@@ -4492,6 +4492,12 @@ pub struct Predictor {
     pub cm_c2: Vec<ContextMap<14, 128>>,
     pub cm_c1: Vec<ContextMap<3,  32>>,
     pub cm_c:  Vec<ContextMap<7,  64>>,
+    /// Per-CM STA-slot index (0..=5 → STA1, STA2, STA4, STA5, STA6,
+    /// STA7). Used by `mix_byte_context_maps` to look up the right
+    /// 1024-byte slice in `sta_tables` when calling `mix1`.
+    pub cm_c2_sta: Vec<u8>,
+    pub cm_c1_sta: Vec<u8>,
+    pub cm_c_sta:  Vec<u8>,
 }
 
 impl Predictor {
@@ -4646,6 +4652,11 @@ impl Predictor {
             match_model,
             smatch: SparseMatchModel::new(),
             cm_c2, cm_c1, cm_c,
+            // sta indices (0=STA1, 1=STA2, 2=STA4, 3=STA5, 4=STA6, 5=STA7)
+            // — must mirror the order of the *_specs above.
+            cm_c2_sta: vec![4, 4, 4, 4, 4, 4, 0, 3, 2, 4, 3, 3, 4, 4, 4, 0, 4, 4],
+            cm_c1_sta: vec![4, 5, 1, 0, 5, 5, 4, 1],
+            cm_c_sta:  vec![1, 3, 1, 1, 0, 0],
         }
     }
 
@@ -5245,6 +5256,169 @@ impl Predictor {
 }
 
 impl Predictor {
+    /// Per-bit ContextMap mix chain — fxcmv1.cpp:4581-4629. Calls
+    /// every `cm.mix1(...)` (32 ContextMaps total) plus the seven
+    /// SmallStationaryContextMap predictors and the MatchModel /
+    /// SparseMatchModel. Pushes their stretched / raw outputs into
+    /// `block.mx_inputs1`, accumulates `ord_x` / `ord_w` across the
+    /// CM mix calls, and returns the MatchModel's reported match
+    /// length (caller stores into `state.is_match`).
+    pub fn mix_byte_context_maps(&mut self) -> u32 {
+        // Snapshot inputs we'll need without holding a borrow.
+        let cc = self.block.c0;
+        let bp = self.block.bpos;
+        let c1 = (self.block.c4 & 0xff) as u8;
+        let y  = self.block.y;
+        let bposshift   = 7 - bp;
+        let c0shift_bp  = (self.block.c0 << 1) ^ (256 >> bposshift);
+
+        // Each cm.mix1 needs a temp Vec to push into; we then drain
+        // each into mx_inputs1 via `add` (which performs the
+        // upstream bounds + range checks).
+        let mut tmp: Vec<i16> = Vec::with_capacity(32);
+
+        // SmallStationaryContextMap fan-out — pushes 2 outputs each.
+        let sscmrate = self.state.sscm_rate;
+        for s in self.small_scms.iter_mut() {
+            tmp.clear();
+            s.mix(y, sscmrate, &self.sqt, &self.strt, &mut tmp);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+        }
+
+        // MatchModel — pushes 1 + 3*2 = 7 outputs and returns length.
+        tmp.clear();
+        let order_hashes = self.state.t;
+        let word1_hash = self.worcxt.word(1);
+        let pos = self.state.pos;
+        // mix takes &mut Vec<i32>, not Vec<i16> — pass a separate
+        // i32 buffer and convert on push.
+        let mut tmp32: Vec<i32> = Vec::with_capacity(8);
+        let is_match = self.match_model.mix(
+            y, bp, c1, cc, pos,
+            &self.buffer, &order_hashes, word1_hash,
+            &self.sqt, &self.strt, &self.dt,
+            &mut tmp32,
+        );
+        for v in tmp32 { self.block.mx_inputs1.add(v.clamp(-2047, 2047) as i16); }
+
+        // SparseMatchModel — pushes 2 outputs.
+        tmp.clear();
+        self.smatch.p(cc, bp, &self.buffer, &mut tmp);
+        for &v in &tmp { self.block.mx_inputs1.add(v); }
+
+        // ContextMap mixes. Each pushes per-context outputs (5 +
+        // run-context = 6) into out via mix1. Inline `bp` matches
+        // BlockData::bpos, `cc` is c0.
+        let mut ord_x = 0i32;
+        let mut ord_w = 0i32;
+
+        // cm_c2[0] — first CM: ord_x bonus +2 if cxt-mask is non-zero.
+        if self.cm_c2[0].cxt_mask != 0 { ord_x = 2; }
+        for (i, cm) in self.cm_c2.iter_mut().enumerate().take(13) {
+            tmp.clear();
+            let nn_idx = self.cm_c2_sta[i] as usize;
+            let nn_slice = &self.sta_tables[nn_idx * 1024..(nn_idx + 1) * 1024];
+            let r = cm.mix1(cc, bp, c1, y, &mut tmp, c0shift_bp, bposshift, nn_slice);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+            // ord_x accumulation: cm_c2[0..=3] feed ord_x; [4..=5] feed ord_w.
+            if i < 4 { ord_x += r; if i == 0 && ord_x == 3 { ord_x = 2; } }
+            else if i < 6 { ord_w += r; }
+        }
+        if ord_w > 3 { ord_w = 3; }
+
+        // cm_c1[0..2,4]
+        for i in &[0usize, 1, 2, 4] {
+            tmp.clear();
+            let nn_idx = self.cm_c1_sta[*i] as usize;
+            let nn_slice = &self.sta_tables[nn_idx * 1024..(nn_idx + 1) * 1024];
+            self.cm_c1[*i].mix1(cc, bp, c1, y, &mut tmp,
+                                c0shift_bp, bposshift, nn_slice);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+        }
+
+        // cm_c[0..=2]
+        for i in 0..3 {
+            tmp.clear();
+            let nn_idx = self.cm_c_sta[i] as usize;
+            let nn_slice = &self.sta_tables[nn_idx * 1024..(nn_idx + 1) * 1024];
+            self.cm_c[i].mix1(cc, bp, c1, y, &mut tmp,
+                              c0shift_bp, bposshift, nn_slice);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+        }
+        // cm_c1[3]
+        {
+            tmp.clear();
+            let nn_idx = self.cm_c1_sta[3] as usize;
+            let nn_slice = &self.sta_tables[nn_idx * 1024..(nn_idx + 1) * 1024];
+            self.cm_c1[3].mix1(cc, bp, c1, y, &mut tmp,
+                               c0shift_bp, bposshift, nn_slice);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+        }
+
+        // cm_c2[13]
+        {
+            tmp.clear();
+            let nn_idx = self.cm_c2_sta[13] as usize;
+            let nn_slice = &self.sta_tables[nn_idx * 1024..(nn_idx + 1) * 1024];
+            let r = self.cm_c2[13].mix1(cc, bp, c1, y, &mut tmp,
+                                        c0shift_bp, bposshift, nn_slice);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+            ord_w += r;
+        }
+
+        // cm_c[3] / cm_c2[14] / cm_c2[15] / cm_c[4..=5]
+        for &(arr_kind, idx) in &[
+            (1u8, 3), (2, 14), (2, 15), (1, 4), (1, 5),
+        ] {
+            tmp.clear();
+            let (nn_idx, r) = match arr_kind {
+                1 => {
+                    let n = self.cm_c_sta[idx] as usize;
+                    let nn_slice = &self.sta_tables[n * 1024..(n + 1) * 1024];
+                    (n, self.cm_c[idx].mix1(cc, bp, c1, y, &mut tmp,
+                                            c0shift_bp, bposshift, nn_slice))
+                }
+                _ => {
+                    let n = self.cm_c2_sta[idx] as usize;
+                    let nn_slice = &self.sta_tables[n * 1024..(n + 1) * 1024];
+                    (n, self.cm_c2[idx].mix1(cc, bp, c1, y, &mut tmp,
+                                             c0shift_bp, bposshift, nn_slice))
+                }
+            };
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+            if arr_kind == 2 && idx == 14 { ord_w += r; }
+            let _ = nn_idx;
+        }
+
+        // cm_c2[16..=17] / cm_c1[6..=7]
+        for i in &[16usize, 17] {
+            tmp.clear();
+            let nn_idx = self.cm_c2_sta[*i] as usize;
+            let nn_slice = &self.sta_tables[nn_idx * 1024..(nn_idx + 1) * 1024];
+            self.cm_c2[*i].mix1(cc, bp, c1, y, &mut tmp,
+                                c0shift_bp, bposshift, nn_slice);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+        }
+        for i in &[6usize, 7] {
+            tmp.clear();
+            let nn_idx = self.cm_c1_sta[*i] as usize;
+            let nn_slice = &self.sta_tables[nn_idx * 1024..(nn_idx + 1) * 1024];
+            self.cm_c1[*i].mix1(cc, bp, c1, y, &mut tmp,
+                                c0shift_bp, bposshift, nn_slice);
+            for &v in &tmp { self.block.mx_inputs1.add(v); }
+        }
+
+        // RunContextMap final mix — pushes 1 prediction.
+        let p_run = self.run_cm.p(c0shift_bp, bposshift);
+        self.block.mx_inputs1.add(p_run);
+
+        // Persist ord_x / ord_w into FxcmState so set_mixer_contexts
+        // sees them.
+        self.state.ord_x = ord_x;
+        self.state.ord_w = ord_w;
+        is_match
+    }
+
     /// Per-bit mixer-context derivation — fxcmv1.cpp:4642-4757. Each
     /// of the 12 mixers gets its `cxt` set as a function of (bpos,
     /// c0, stream2b/3b/3bR, words/numbers, BrFcIdx/FcIdx, ordX/ordW
@@ -5526,6 +5700,18 @@ mod tests {
         let p = Predictor::new();
         assert_eq!(p.predict(), 0.5);
         let _ = E; // silence unused
+    }
+
+    #[test]
+    fn mix_byte_context_maps_runs_without_panic() {
+        let mut p = Predictor::new();
+        // Initial state: c0=1 (with leading 1), bpos=0, etc.
+        // Calling mix at byte boundary should run all 32 CM mix1
+        // paths plus scm/match/sparse without panicking.
+        let _is_match = p.mix_byte_context_maps();
+        // mx_inputs1 should now be populated.
+        assert!(p.block.mx_inputs1.ncount > 0,
+            "expected mix to push predictions into mx_inputs1");
     }
 
     #[test]
