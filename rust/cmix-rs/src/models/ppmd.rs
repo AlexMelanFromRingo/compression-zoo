@@ -443,12 +443,73 @@ impl Ppmd {
         head
     }
 
+    /// Coalesce adjacent free blocks. Mirrors upstream's
+    /// `GlueFreeBlocks`. The algorithm:
+    ///   1. Drain every BList[i] into a temporary linked list off
+    ///      a stack-local sentinel.
+    ///   2. While walking the temp list, if `p + p->NU` lands on
+    ///      another free block (Stamp == ~0), absorb it.
+    ///   3. Re-distribute by NU into the appropriate buckets,
+    ///      splitting > 128-unit megablocks into 128-unit chunks
+    ///      first.
     fn glue_free_blocks(&mut self) {
-        // Faithful port of `GlueFreeBlocks` — coalesces adjacent
-        // free blocks. For now we implement the simpler "no-op"
-        // variant; the model regresses to alloc-rare pressure when
-        // the heap is full, which mirrors upstream's restoration
-        // behaviour. Full coalescing comes in a follow-up turn.
+        // We can't write a sentinel "off the heap" cheaply — instead
+        // we collect everything into a Vec<(ptr, nu)>, coalesce on
+        // the heap, then redistribute. This deviates from upstream's
+        // in-place linked-list dance but produces the same end state.
+
+        // Drop a NUL terminator at LoUnit (upstream "if LoUnit!=HiUnit").
+        if self.lo_unit != self.hi_unit {
+            self.heap[self.lo_unit as usize] = 0;
+        }
+
+        let mut all: Vec<u32> = Vec::new();
+        for i in 0..=N_INDEXES {
+            while self.blist_next[i] != 0 {
+                let p = self.remove_from_blist(i);
+                if blk_nu(&self.heap, p) != 0 {
+                    all.push(p);
+                }
+            }
+        }
+
+        // Coalesce: for each block, walk forward absorbing adjacent
+        // (heap_addr == p + nu*UNIT_SIZE) Stamp==~0 blocks.
+        for &p in &all {
+            loop {
+                let nu = blk_nu(&self.heap, p);
+                let next_addr = p + u2b(nu);
+                if next_addr as usize + 12 > self.heap.len() { break; }
+                if blk_stamp(&self.heap, next_addr) != !0u32 { break; }
+                let next_nu = blk_nu(&self.heap, next_addr);
+                if next_nu == 0 { break; }
+                blk_set_nu(&mut self.heap, p, nu + next_nu);
+                blk_set_nu(&mut self.heap, next_addr, 0);
+                blk_set_stamp(&mut self.heap, next_addr, 0);
+            }
+        }
+
+        // Redistribute back into the buckets.
+        for &raw_p in &all {
+            let mut p = raw_p;
+            let mut sz = blk_nu(&self.heap, p);
+            if sz == 0 { continue; }
+            // Cleave megablocks into 128-unit chunks.
+            while sz > 128 {
+                self.insert_into_blist(p, N_INDEXES - 1, 128);
+                p += u2b(128);
+                sz -= 128;
+            }
+            let mut i = self.tables.units2indx[(sz - 1) as usize] as usize;
+            if self.tables.indx2units[i] as u32 != sz {
+                let bucket_units = self.tables.indx2units[i - 1] as u32;
+                let k = sz - bucket_units;
+                self.insert_into_blist(p + u2b(sz - k), (k - 1) as usize, k);
+                i -= 1;
+            }
+            self.insert_into_blist(p, i, self.tables.indx2units[i] as u32);
+        }
+
         self.glue_count = 1u32 << (13 + self.glue_count1);
         self.glue_count1 += 1;
     }
@@ -461,6 +522,148 @@ impl Ppmd {
     fn free_unit(&mut self, ptr: u32) {
         let indx = if ptr > self.units_start + 128 * 1024 { 0 } else { N_INDEXES };
         self.insert_into_blist(ptr, indx, 1);
+    }
+
+    fn units_cpy(&mut self, dest: u32, src: u32, nu: u32) {
+        let n = u2b(nu) as usize;
+        // Need split borrow because src and dest live in the same Vec.
+        let (lo, hi, lo_off, hi_off) = if dest < src {
+            (dest, src, 0usize, 0usize)
+        } else {
+            (src, dest, 0usize, 0usize)
+        };
+        let _ = (lo, hi, lo_off, hi_off);
+        // Easiest path: copy via a small temporary buffer.
+        let mut buf = vec![0u8; n];
+        buf.copy_from_slice(&self.heap[src as usize..src as usize + n]);
+        self.heap[dest as usize..dest as usize + n].copy_from_slice(&buf);
+    }
+
+    fn expand_units(&mut self, old_ptr: u32, old_nu: u32) -> u32 {
+        let i0 = self.tables.units2indx[(old_nu - 1) as usize];
+        let i1 = self.tables.units2indx[old_nu as usize];
+        if i0 == i1 { return old_ptr; }
+        let ptr = self.alloc_units(old_nu + 1);
+        if ptr != 0 {
+            self.units_cpy(ptr, old_ptr, old_nu);
+            self.insert_into_blist(old_ptr, i0 as usize,
+                self.tables.indx2units[i0 as usize] as u32);
+        }
+        ptr
+    }
+
+    fn shrink_units(&mut self, old_ptr: u32, old_nu: u32, new_nu: u32) -> u32 {
+        let i0 = self.tables.units2indx[(old_nu - 1) as usize] as usize;
+        let i1 = self.tables.units2indx[(new_nu - 1) as usize] as usize;
+        if i0 == i1 { return old_ptr; }
+        if self.blist_next[i1] != 0 {
+            let ptr = self.remove_from_blist(i1);
+            self.units_cpy(ptr, old_ptr, new_nu);
+            self.insert_into_blist(old_ptr, i0,
+                self.tables.indx2units[i0] as u32);
+            ptr
+        } else {
+            self.split_block(old_ptr, i0 as u32, i1 as u32);
+            old_ptr
+        }
+    }
+
+    fn move_units_up(&mut self, old_ptr: u32, nu: u32) -> u32 {
+        let indx = self.tables.units2indx[(nu - 1) as usize] as usize;
+        if old_ptr > self.units_start + 128 * 1024
+            || old_ptr > self.blist_next[indx]
+        {
+            return old_ptr;
+        }
+        let ptr = self.remove_from_blist(indx);
+        self.units_cpy(ptr, old_ptr, nu);
+        self.insert_into_blist(old_ptr, N_INDEXES,
+            self.tables.indx2units[indx] as u32);
+        ptr
+    }
+
+    fn prepare_text_area(&mut self) {
+        self.aux_unit = self.alloc_context();
+        if self.aux_unit == 0 {
+            self.aux_unit = self.units_start;
+        } else if self.aux_unit == self.units_start {
+            self.units_start += UNIT_SIZE;
+            self.aux_unit = self.units_start;
+        }
+    }
+
+    fn expand_text_area(&mut self) {
+        let mut count = [0u32; N_INDEXES];
+
+        if self.aux_unit != self.units_start {
+            // *(uint*)AuxUnit != ~uint(0) ?
+            if get_u32(&self.heap, self.aux_unit) != !0u32 {
+                self.units_start += UNIT_SIZE;
+            } else {
+                self.insert_into_blist(self.aux_unit, 0, 1);
+            }
+        }
+
+        // While first units_start block has Stamp==~0, absorb it.
+        loop {
+            let p = self.units_start;
+            if p as usize + 12 > self.heap.len() { break; }
+            if blk_stamp(&self.heap, p) != !0u32 { break; }
+            let nu = blk_nu(&self.heap, p);
+            self.units_start = p + u2b(nu);
+            count[self.tables.units2indx[(nu - 1) as usize] as usize] += 1;
+            blk_set_stamp(&mut self.heap, p, 0);
+        }
+
+        // Walk the N_INDEXES (last) bucket and remove any zero-stamp
+        // entries, decrementing count and stamps[N_INDEXES].
+        // (The full upstream logic uses linked-list traversal; we
+        // rebuild the list while filtering.)
+        if count.iter().any(|&c| c != 0) {
+            let mut head = self.blist_next[N_INDEXES];
+            let mut new_head: u32 = 0;
+            let mut removed: u32 = 0;
+            while head != 0 {
+                let next = blk_next(&self.heap, head);
+                if blk_stamp(&self.heap, head) == 0 {
+                    removed += 1;
+                } else {
+                    blk_set_next(&mut self.heap, head, new_head);
+                    new_head = head;
+                }
+                head = next;
+            }
+            self.blist_next[N_INDEXES] = new_head;
+            self.blist_stamp[N_INDEXES] = self.blist_stamp[N_INDEXES].wrapping_sub(removed);
+
+            for i in 0..N_INDEXES {
+                if count[i] == 0 { continue; }
+                let mut h = self.blist_next[i];
+                let mut nh: u32 = 0;
+                let mut left = count[i];
+                let mut removed: u32 = 0;
+                while h != 0 && left > 0 {
+                    let next = blk_next(&self.heap, h);
+                    if blk_stamp(&self.heap, h) == 0 {
+                        removed += 1;
+                        left -= 1;
+                    } else {
+                        blk_set_next(&mut self.heap, h, nh);
+                        nh = h;
+                    }
+                    h = next;
+                }
+                // Append remaining (rest of original list) untouched.
+                while h != 0 {
+                    let next = blk_next(&self.heap, h);
+                    blk_set_next(&mut self.heap, h, nh);
+                    nh = h;
+                    h = next;
+                }
+                self.blist_next[i] = nh;
+                self.blist_stamp[i] = self.blist_stamp[i].wrapping_sub(removed);
+            }
+        }
     }
 
     // ---- Model startup ----
@@ -527,6 +730,304 @@ impl Ppmd {
             for k in 0..32 {
                 self.see2[i][k].init(8 * i as u32 + 5);
             }
+        }
+    }
+
+    // ---- Update-path helpers (mode 0 = actually train the model) ----
+
+    /// Rescale a context's stats: halve every freq, re-sort, prune
+    /// zeros, possibly collapse to a single-state context. Mirrors
+    /// upstream `STATE* rescale(...)`.
+    fn rescale(&mut self, q: u32, found_state: u32) -> u32 {
+        // Move found_state to the head of its stats list.
+        let cur_flags = ctx_flags(&self.heap, q);
+        ctx_set_flags(&mut self.heap, q, cur_flags & 0x14);
+        let p1 = ctx_i_stats(&self.heap, q);
+        // tmp = found_state[0]; shift everything down to make room
+        // at p1 for the (formerly) found_state.
+        let mut tmp = [0u8; 6];
+        for i in 0..6 { tmp[i] = self.heap[(found_state + i as u32) as usize]; }
+        let mut p = found_state;
+        while p != p1 {
+            // p[0] = p[-1]
+            for i in 0..6 {
+                self.heap[(p + i as u32) as usize]
+                    = self.heap[(p - 6 + i as u32) as usize];
+            }
+            p -= 6;
+        }
+        for i in 0..6 { self.heap[(p1 + i as u32) as usize] = tmp[i]; }
+
+        let order_fall = self.order_fall;
+        let of: i32 = if order_fall != 0 { 1 } else { 0 };
+        let f0 = state_freq(&self.heap, p1) as i32;
+        let sf_initial = ctx_summ_freq(&self.heap, q) as i32;
+        let mut sf = sf_initial;
+        let mut esc_freq = sf - f0;
+        let new_f0 = ((f0 + of) >> 1) as u8;
+        state_set_freq(&mut self.heap, p1, new_f0);
+        ctx_set_summ_freq(&mut self.heap, q, new_f0 as u16);
+
+        let num_stats = ctx_num_stats(&self.heap, q) as i32;
+        let mut p = p1;
+        for _ in 0..num_stats {
+            p += 6;
+            let mut a = state_freq(&self.heap, p) as i32;
+            esc_freq -= a;
+            a = (a + of) >> 1;
+            state_set_freq(&mut self.heap, p, a as u8);
+            let mut sumf = ctx_summ_freq(&self.heap, q) as i32;
+            sumf += a;
+            ctx_set_summ_freq(&mut self.heap, q, sumf as u16);
+            if a != 0 {
+                let sym = state_symbol(&self.heap, p);
+                if sym >= 0x40 {
+                    let cf = ctx_flags(&self.heap, q);
+                    ctx_set_flags(&mut self.heap, q, cf | 0x08);
+                }
+            }
+            if a > state_freq(&self.heap, p - 6) as i32 {
+                // Bubble up.
+                let mut tmp = [0u8; 6];
+                for i in 0..6 { tmp[i] = self.heap[(p + i as u32) as usize]; }
+                let mut p1c = p;
+                while p1c > q + 4 + 6 {  // > stats start
+                    let prev = p1c - 6;
+                    if tmp[1] as i32 <= state_freq(&self.heap, prev) as i32 { break; }
+                    for i in 0..6 {
+                        self.heap[(p1c + i as u32) as usize]
+                            = self.heap[(prev + i as u32) as usize];
+                    }
+                    p1c = prev;
+                }
+                for i in 0..6 { self.heap[(p1c + i as u32) as usize] = tmp[i]; }
+            }
+        }
+
+        // Trim tail zeros.
+        if state_freq(&self.heap, p) == 0 {
+            let mut zero_count = 0i32;
+            while state_freq(&self.heap, p) == 0 {
+                zero_count += 1;
+                p -= 6;
+            }
+            esc_freq += zero_count;
+            let a_units = (num_stats + 2) >> 1;
+            let new_ns = num_stats - zero_count;
+            ctx_set_num_stats(&mut self.heap, q, new_ns as u8);
+            if new_ns == 0 {
+                let stats = ctx_i_stats(&self.heap, q);
+                let s_freq = state_freq(&self.heap, stats);
+                let s_sym  = state_symbol(&self.heap, stats);
+                let s_succ = state_succ(&self.heap, stats);
+                let new_freq = (((2 * s_freq as i32 + esc_freq - 1) / esc_freq.max(1))
+                    .min(MAX_FREQ as i32 / 3)) as u8;
+                let new_flags = ctx_flags(&self.heap, q) & 0x18;
+                ctx_set_flags(&mut self.heap, q, new_flags);
+                self.free_units(stats, a_units as u32);
+                let one = one_state_offset(q);
+                state_set_symbol(&mut self.heap, one, s_sym);
+                state_set_freq  (&mut self.heap, one, new_freq);
+                state_set_succ  (&mut self.heap, one, s_succ);
+                return one;
+            }
+            let shrunk = self.shrink_units(
+                ctx_i_stats(&self.heap, q),
+                a_units as u32,
+                ((new_ns + 2) >> 1) as u32,
+            );
+            ctx_set_i_stats(&mut self.heap, q, shrunk);
+        }
+
+        let new_summ = ctx_summ_freq(&self.heap, q) as i32 + ((esc_freq + 1) >> 1);
+        ctx_set_summ_freq(&mut self.heap, q, new_summ as u16);
+
+        let order_fall = self.order_fall;
+        let flags_q = ctx_flags(&self.heap, q);
+        let stats_q = ctx_i_stats(&self.heap, q);
+        let head_freq = state_freq(&self.heap, stats_q) as i32;
+        let a;
+        if order_fall != 0 || (flags_q & 0x04) == 0 {
+            sf -= esc_freq;
+            let denom = (sf - f0).max(1);
+            a = ((f0 * (ctx_summ_freq(&self.heap, q) as i32)
+                  - sf * head_freq + denom - 1) / denom)
+                .clamp(2, MAX_FREQ as i32 / 2 - 18) as u8;
+        } else {
+            a = 2;
+        }
+        let new_head = state_freq(&self.heap, stats_q).saturating_add(a);
+        state_set_freq(&mut self.heap, stats_q, new_head);
+        let new_summ = ctx_summ_freq(&self.heap, q) as i32 + a as i32;
+        ctx_set_summ_freq(&mut self.heap, q, new_summ as u16);
+        ctx_set_flags(&mut self.heap, q, flags_q | 0x04);
+        stats_q
+    }
+
+    /// `processBinSymbol<0>` — update path for binary contexts.
+    fn process_bin_symbol(&mut self, q: u32, symbol: u8) {
+        let rs = one_state_offset(q);
+        let suffix = ctx_i_suffix(&self.heap, q);
+        let suffix_ns = ctx_num_stats(&self.heap, suffix);
+        let flags_q = ctx_flags(&self.heap, q);
+        let idx = self.tables.ns2bs_indx[suffix_ns as usize] as i32
+            + self.prev_success
+            + flags_q as i32
+            + ((self.run_length >> 26) & 0x20);
+        let qtab = self.tables.qtable[(state_freq(&self.heap, rs) - 1) as usize] as usize;
+        let bs = self.bin_summ[qtab][idx as usize] as i32;
+        self.bsumm = bs;
+        // Apply BinSumm decay.
+        self.bin_summ[qtab][idx as usize] =
+            (bs as i32 - ((bs + 64) >> PERIOD_BITS)) as u16;
+
+        let rs_sym = state_symbol(&self.heap, rs);
+        if rs_sym != symbol {
+            self.char_mask[rs_sym as usize] = self.esc_count;
+            self.num_masked = 0;
+            self.prev_success = 0;
+            self.found_state = 0;
+        } else {
+            // Boost the BinSumm entry, increment freq up to 196,
+            // bump run-length, mark success.
+            let new_bs = self.bin_summ[qtab][idx as usize] as i32 + INTERVAL as i32;
+            self.bin_summ[qtab][idx as usize] = new_bs as u16;
+            let f = state_freq(&self.heap, rs);
+            if f < 196 { state_set_freq(&mut self.heap, rs, f + 1); }
+            self.run_length = self.run_length.wrapping_add(1);
+            self.prev_success = 1;
+            self.found_state = rs;
+        }
+    }
+
+    /// `processSymbol1<0>` — update path for n_stats > 0 contexts.
+    fn process_symbol1(&mut self, q: u32, symbol: u8) {
+        let stats = ctx_i_stats(&self.heap, q);
+        let cnum = ctx_num_stats(&self.heap, q) as i32;
+        let p0 = stats;
+        let head_sym = state_symbol(&self.heap, p0);
+
+        if head_sym == symbol {
+            self.prev_success = 0;
+            let f = state_freq(&self.heap, p0).saturating_add(4);
+            state_set_freq(&mut self.heap, p0, f);
+            let new_summ = ctx_summ_freq(&self.heap, q).saturating_add(4);
+            ctx_set_summ_freq(&mut self.heap, q, new_summ);
+            self.found_state = p0;
+            if f > MAX_FREQ {
+                self.found_state = self.rescale(q, p0);
+            }
+            return;
+        }
+
+        self.prev_success = 0;
+        let mut found = 0u32;
+        let mut found_idx: i32 = -1;
+        for i in 1..=cnum {
+            let p = stats + 6 * i as u32;
+            if state_symbol(&self.heap, p) == symbol {
+                found = p;
+                found_idx = i;
+                break;
+            }
+        }
+
+        if found != 0 {
+            let f = state_freq(&self.heap, found).saturating_add(4);
+            state_set_freq(&mut self.heap, found, f);
+            let new_summ = ctx_summ_freq(&self.heap, q).saturating_add(4);
+            ctx_set_summ_freq(&mut self.heap, q, new_summ);
+            // If we beat the previous-position freq, swap up.
+            let prev = found - 6;
+            if state_freq(&self.heap, found) > state_freq(&self.heap, prev) {
+                let mut tmp = [0u8; 6];
+                for i in 0..6 { tmp[i] = self.heap[(found + i as u32) as usize]; }
+                for i in 0..6 {
+                    self.heap[(found + i as u32) as usize]
+                        = self.heap[(prev + i as u32) as usize];
+                }
+                for i in 0..6 { self.heap[(prev + i as u32) as usize] = tmp[i]; }
+                self.found_state = prev;
+            } else {
+                self.found_state = found;
+            }
+            if f > MAX_FREQ {
+                self.found_state = self.rescale(q, self.found_state);
+            }
+            let _ = found_idx;
+        } else {
+            // Symbol not in this context's stats — mask all and
+            // recurse outward.
+            self.num_masked = cnum;
+            for i in 0..=cnum {
+                let p = stats + 6 * i as u32;
+                self.char_mask[state_symbol(&self.heap, p) as usize] = self.esc_count;
+            }
+            self.found_state = 0;
+        }
+    }
+
+    /// `processSymbol2<0>` — update path for masked contexts.
+    fn process_symbol2(&mut self, q: u32, symbol: u8) {
+        let stats = ctx_i_stats(&self.heap, q);
+        let cnum = ctx_num_stats(&self.heap, q) as i32;
+        let summ_freq = ctx_summ_freq(&self.heap, q) as u32;
+        let flags_q = ctx_flags(&self.heap, q);
+
+        // SEE lookup.
+        let see_freq;
+        let psee2_idx: Option<(usize, usize)>;
+        if cnum != 0xFF {
+            let mut row = (self.tables.qtable[(cnum + 3) as usize] - 4) as usize;
+            row = row.min(22);
+            let mut col = 0usize;
+            if summ_freq > 10 * (cnum as u32 + 1) { col += 1; }
+            let suffix = ctx_i_suffix(&self.heap, q);
+            let suff_ns = ctx_num_stats(&self.heap, suffix) as i32;
+            if 2 * cnum < suff_ns + self.num_masked { col += 2; }
+            col += flags_q as usize;
+            col = col.min(31);
+            see_freq = self.see2[row][col].get_mean() as i32 + 1;
+            psee2_idx = Some((row, col));
+        } else {
+            see_freq = 1;
+            psee2_idx = None;
+        }
+
+        let mut low = 0i32;
+        let mut found = 0u32;
+        for i in 0..=cnum {
+            let p = stats + 6 * i as u32;
+            let c = state_symbol(&self.heap, p);
+            if self.char_mask[c as usize] != self.esc_count {
+                self.char_mask[c as usize] = self.esc_count;
+                low += state_freq(&self.heap, p) as i32;
+                if c == symbol { found = p; }
+            }
+        }
+        let total = see_freq + low;
+
+        if found != 0 {
+            if let Some((r, c)) = psee2_idx {
+                if see_freq > 2 { self.see2[r][c].summ -= see_freq as u16; }
+                self.see2[r][c].update();
+            }
+            let f = state_freq(&self.heap, found).saturating_add(4);
+            state_set_freq(&mut self.heap, found, f);
+            let new_summ = ctx_summ_freq(&self.heap, q).saturating_add(4);
+            ctx_set_summ_freq(&mut self.heap, q, new_summ);
+            self.found_state = found;
+            if f > MAX_FREQ {
+                self.found_state = self.rescale(q, found);
+            }
+            self.run_length = self.init_rl;
+            self.esc_count = self.esc_count.wrapping_add(1);
+        } else {
+            self.num_masked = cnum;
+            if let Some((r, c)) = psee2_idx {
+                self.see2[r][c].summ = (self.see2[r][c].summ as i32 + (total - see_freq)) as u16;
+            }
+            let _ = total;
         }
     }
 
@@ -681,18 +1182,385 @@ impl Ppmd {
         }
     }
 
-    /// Per-byte update — currently a simplified path that just
-    /// advances `esc_count` and re-runs `prepare_byte`. The full
-    /// model-update path (UpdateModel + processSymbol1/2 with mode
-    /// 0) follows in a future turn; for now PPMd contributes
-    /// stable but un-trained probabilities.
-    pub fn byte_update(&mut self, _byte: u8) {
-        // The full mod_ppmd update walks the tree, allocates new
-        // contexts, and updates frequencies. Intentionally deferred
-        // — the read-only prediction path above is enough to verify
-        // the heap+tree structure is sound. The remaining glue lands
-        // in the next turn; see the `update_model` method below for
-        // the in-progress port.
+    /// `CreateSuccessors` — create new contexts for higher orders
+    /// when a symbol is seen. Returns the resulting context offset.
+    fn create_successors(&mut self, skip: bool, p_state: u32, mut pc: u32) -> u32 {
+        let mut ps: [u32; MAX_O] = [0; MAX_O];
+        let mut pps_n: usize = 0;
+
+        let sym = state_symbol(&self.heap, self.found_state);
+        let i_up_branch = state_succ(&self.heap, self.found_state);
+
+        if !skip {
+            ps[pps_n] = self.found_state;
+            pps_n += 1;
+            if ctx_i_suffix(&self.heap, pc) == 0 {
+                return self.create_successors_no_loop(ps, pps_n, pc, sym, i_up_branch);
+            }
+        }
+
+        let mut p = p_state;
+        let mut entered = p_state != 0;
+        if entered { pc = ctx_i_suffix(&self.heap, pc); }
+
+        loop {
+            if !entered {
+                pc = ctx_i_suffix(&self.heap, pc);
+                if ctx_num_stats(&self.heap, pc) != 0 {
+                    let stats = ctx_i_stats(&self.heap, pc);
+                    p = stats;
+                    while state_symbol(&self.heap, p) != sym { p += 6; }
+                    let f = state_freq(&self.heap, p);
+                    let bump = if f < MAX_FREQ - 1 { 2 } else { 0 };
+                    state_set_freq(&mut self.heap, p, f + bump);
+                    let new_summ = ctx_summ_freq(&self.heap, pc).saturating_add(bump as u16);
+                    ctx_set_summ_freq(&mut self.heap, pc, new_summ);
+                } else {
+                    p = one_state_offset(pc);
+                    let suff_pc = ctx_i_suffix(&self.heap, pc);
+                    let suff_ns = ctx_num_stats(&self.heap, suff_pc);
+                    let f = state_freq(&self.heap, p);
+                    if suff_ns == 0 && f < 16 {
+                        state_set_freq(&mut self.heap, p, f + 1);
+                    }
+                }
+            }
+            entered = false;
+
+            if state_succ(&self.heap, p) != i_up_branch {
+                pc = state_succ(&self.heap, p);
+                break;
+            }
+            ps[pps_n] = p;
+            pps_n += 1;
+            if ctx_i_suffix(&self.heap, pc) == 0 { break; }
+        }
+
+        self.create_successors_no_loop(ps, pps_n, pc, sym, i_up_branch)
+    }
+
+    fn create_successors_no_loop(
+        &mut self,
+        ps: [u32; MAX_O],
+        pps_n: usize,
+        mut pc: u32,
+        sym: u8,
+        i_up_branch: u32,
+    ) -> u32 {
+        if pps_n == 0 { return pc; }
+
+        // Build a temp PPM_CONTEXT (12 bytes).
+        let mut ct = [0u8; 12];
+        // NumStats = 0
+        ct[0] = 0;
+        let upbyte_addr = i_up_branch;
+        let next_byte = self.heap[upbyte_addr as usize];
+        ct[1] = 0x10 * (sym >= 0x40) as u8 | 0x08 * (next_byte >= 0x40) as u8;
+        // oneState() at offset 2: Symbol, Freq, iSuccessor.
+        ct[2] = next_byte;
+        // ct[3] = freq, set later.
+        let succ = i_up_branch + 1;
+        ct[4..8].copy_from_slice(&succ.to_le_bytes());
+        // ct[8..12] = iSuffix, set later per allocated context.
+
+        let cf;
+        if ctx_num_stats(&self.heap, pc) != 0 {
+            let stats = ctx_i_stats(&self.heap, pc);
+            let mut p = stats;
+            while state_symbol(&self.heap, p) != sym { p += 6; }
+            let cf_v = state_freq(&self.heap, p) as i32 - 1;
+            let s0 = ctx_summ_freq(&self.heap, pc) as i32
+                - ctx_num_stats(&self.heap, pc) as i32 - cf_v;
+            cf = if 2 * cf_v < s0 {
+                1 + (12 * cf_v > s0) as i32
+            } else {
+                1 + 2 + cf_v / s0.max(1)
+            };
+        } else {
+            cf = state_freq(&self.heap, one_state_offset(pc)) as i32;
+        }
+        ct[3] = cf.min(7) as u8;
+
+        let mut chain_count = pps_n;
+        while chain_count > 0 {
+            let pc1 = self.alloc_context();
+            if pc1 == 0 { return 0; }
+            for i in 0..12 {
+                self.heap[(pc1 + i as u32) as usize] = ct[i];
+            }
+            ctx_set_i_suffix(&mut self.heap, pc1, pc);
+            pc = pc1;
+            chain_count -= 1;
+            state_set_succ(&mut self.heap, ps[chain_count], pc);
+        }
+        pc
+    }
+
+    /// `ReduceOrder` — fall back to the lowest matching context.
+    fn reduce_order(&mut self, mut p_state: u32, pc_in: u32) -> u32 {
+        let mut pc = pc_in;
+        let pc1 = pc;
+        state_set_succ(&mut self.heap, self.found_state, self.text_ptr);
+        let sym = state_symbol(&self.heap, self.found_state);
+        let i_up_branch = state_succ(&self.heap, self.found_state);
+        self.order_fall += 1;
+
+        let mut entered = p_state != 0;
+        if entered { pc = ctx_i_suffix(&self.heap, pc); }
+
+        loop {
+            if !entered {
+                if ctx_i_suffix(&self.heap, pc) == 0 { return pc; }
+                pc = ctx_i_suffix(&self.heap, pc);
+                if ctx_num_stats(&self.heap, pc) != 0 {
+                    let stats = ctx_i_stats(&self.heap, pc);
+                    p_state = stats;
+                    while state_symbol(&self.heap, p_state) != sym { p_state += 6; }
+                    let f = state_freq(&self.heap, p_state);
+                    let bump = if f < MAX_FREQ - 3 { 2 } else { 0 };
+                    state_set_freq(&mut self.heap, p_state, f + bump);
+                    let new_summ = ctx_summ_freq(&self.heap, pc).saturating_add(bump as u16);
+                    ctx_set_summ_freq(&mut self.heap, pc, new_summ);
+                } else {
+                    p_state = one_state_offset(pc);
+                    let f = state_freq(&self.heap, p_state);
+                    if f < 11 { state_set_freq(&mut self.heap, p_state, f + 1); }
+                }
+            }
+            entered = false;
+            if state_succ(&self.heap, p_state) != 0 { break; }
+            state_set_succ(&mut self.heap, p_state, i_up_branch);
+            self.order_fall += 1;
+        }
+
+        let succ = state_succ(&self.heap, p_state);
+        if succ <= i_up_branch {
+            let saved = self.found_state;
+            self.found_state = p_state;
+            let new_succ = self.create_successors(false, 0, pc);
+            state_set_succ(&mut self.heap, p_state, new_succ);
+            self.found_state = saved;
+        }
+
+        if self.order_fall == 1 && pc1 == self.max_context {
+            let new_succ = state_succ(&self.heap, p_state);
+            state_set_succ(&mut self.heap, self.found_state, new_succ);
+            self.text_ptr = self.text_ptr.saturating_sub(1);
+        }
+
+        state_succ(&self.heap, p_state)
+    }
+
+    /// `UpdateModel` — extend the context tree with the new symbol.
+    fn update_model(&mut self, min_context: u32) -> u32 {
+        let f_symbol = state_symbol(&self.heap, self.found_state);
+        let f_freq = state_freq(&self.heap, self.found_state);
+        let i_f_succ = state_succ(&self.heap, self.found_state);
+
+        let mut p_state: u32 = 0;
+        let mut pc: u32 = 0;
+        if ctx_i_suffix(&self.heap, min_context) != 0 {
+            pc = ctx_i_suffix(&self.heap, min_context);
+            if ctx_num_stats(&self.heap, pc) != 0 {
+                let stats = ctx_i_stats(&self.heap, pc);
+                let mut p = stats;
+                if state_symbol(&self.heap, p) != f_symbol {
+                    p += 6;
+                    while state_symbol(&self.heap, p) != f_symbol { p += 6; }
+                    if state_freq(&self.heap, p) >= state_freq(&self.heap, p - 6) {
+                        let mut tmp = [0u8; 6];
+                        for i in 0..6 { tmp[i] = self.heap[(p + i as u32) as usize]; }
+                        for i in 0..6 {
+                            self.heap[(p + i as u32) as usize]
+                                = self.heap[(p - 6 + i as u32) as usize];
+                        }
+                        for i in 0..6 { self.heap[(p - 6 + i as u32) as usize] = tmp[i]; }
+                        p -= 6;
+                    }
+                }
+                if state_freq(&self.heap, p) < MAX_FREQ - 3 {
+                    let cf = 2 + (f_freq < 28) as u8;
+                    let new_f = state_freq(&self.heap, p) + cf;
+                    state_set_freq(&mut self.heap, p, new_f);
+                    let new_summ = ctx_summ_freq(&self.heap, pc).saturating_add(cf as u16);
+                    ctx_set_summ_freq(&mut self.heap, pc, new_summ);
+                }
+                p_state = p;
+            } else {
+                p_state = one_state_offset(pc);
+                let f = state_freq(&self.heap, p_state);
+                if f < 14 { state_set_freq(&mut self.heap, p_state, f + 1); }
+            }
+        }
+
+        if self.order_fall == 0 && i_f_succ != 0 {
+            let new_succ = self.create_successors(true, p_state, min_context);
+            state_set_succ(&mut self.heap, self.found_state, new_succ);
+            if new_succ == 0 {
+                self.saved_pc = pc;
+                return 0;
+            }
+            self.max_context = state_succ(&self.heap, self.found_state);
+            return self.max_context;
+        }
+
+        // Append the symbol to text area.
+        if (self.text_ptr as usize) < self.heap.len() {
+            self.heap[self.text_ptr as usize] = f_symbol;
+        }
+        self.text_ptr += 1;
+        let mut i_succ = self.text_ptr;
+        if self.text_ptr >= self.units_start {
+            self.saved_pc = pc;
+            return 0;
+        }
+
+        let mut i_f_succ_local = i_f_succ;
+        if i_f_succ_local != 0 {
+            if i_f_succ_local < self.units_start {
+                let new_succ = self.create_successors(false, p_state, min_context);
+                i_f_succ_local = new_succ;
+            }
+        } else {
+            i_f_succ_local = self.reduce_order(p_state, min_context);
+        }
+
+        if i_f_succ_local == 0 {
+            self.saved_pc = pc;
+            return 0;
+        }
+
+        if self.order_fall > 0 {
+            self.order_fall -= 1;
+            if self.order_fall == 0 {
+                i_succ = i_f_succ_local;
+                if self.max_context != min_context {
+                    self.text_ptr -= 1;
+                }
+            }
+        }
+
+        let s0 = (ctx_summ_freq(&self.heap, min_context) as i32) - f_freq as i32;
+        let ns = ctx_num_stats(&self.heap, min_context) as i32;
+        let flag = 0x08 * (f_symbol >= 0x40) as u8;
+
+        let mut walk = self.max_context;
+        while walk != min_context {
+            let ns1 = ctx_num_stats(&self.heap, walk) as i32;
+            if ns1 != 0 {
+                if ns1 & 1 != 0 {
+                    let stats = ctx_i_stats(&self.heap, walk);
+                    let p = self.expand_units(stats, ((ns1 + 1) >> 1) as u32);
+                    if p == 0 { self.saved_pc = walk; return 0; }
+                    ctx_set_i_stats(&mut self.heap, walk, p);
+                }
+                let q_inc = self.tables.qtable[(ns + 4) as usize] as i32 >> 3;
+                let new_summ = ctx_summ_freq(&self.heap, walk).saturating_add(q_inc as u16);
+                ctx_set_summ_freq(&mut self.heap, walk, new_summ);
+            } else {
+                let p = self.alloc_units(1);
+                if p == 0 { self.saved_pc = walk; return 0; }
+                let one = one_state_offset(walk);
+                for i in 0..6 {
+                    self.heap[(p + i as u32) as usize] = self.heap[(one + i as u32) as usize];
+                }
+                ctx_set_i_stats(&mut self.heap, walk, p);
+                let f = state_freq(&self.heap, p);
+                let new_freq = if f <= MAX_FREQ / 3 {
+                    (2 * f).saturating_sub(1)
+                } else {
+                    MAX_FREQ - 15
+                };
+                state_set_freq(&mut self.heap, p, new_freq);
+                let exp_idx = self.tables.qtable[(self.bsumm >> 8) as usize] as usize;
+                let exp_e = EXP_ESCAPE[exp_idx.min(15)] as u16;
+                let new_summ_freq = new_freq as u16 + (ns > 1) as u16 + exp_e;
+                ctx_set_summ_freq(&mut self.heap, walk, new_summ_freq);
+            }
+
+            let pc_summ = ctx_summ_freq(&self.heap, walk) as i32;
+            let cf_init = (f_freq as i32 - 1) * (5 + pc_summ);
+            let sf = s0 + pc_summ;
+            let cf;
+            if cf_init <= 3 * sf {
+                cf = 1 + (2 * cf_init > sf) as i32 + (2 * cf_init > 3 * sf) as i32;
+                let nf = ctx_summ_freq(&self.heap, walk).saturating_add(4);
+                ctx_set_summ_freq(&mut self.heap, walk, nf);
+            } else {
+                cf = 5
+                    + (cf_init > 5 * sf) as i32
+                    + (cf_init > 6 * sf) as i32
+                    + (cf_init > 8 * sf) as i32
+                    + (cf_init > 10 * sf) as i32
+                    + (cf_init > 12 * sf) as i32;
+                let nf = ctx_summ_freq(&self.heap, walk).saturating_add(cf as u16);
+                ctx_set_summ_freq(&mut self.heap, walk, nf);
+            }
+
+            let new_ns = ctx_num_stats(&self.heap, walk) + 1;
+            ctx_set_num_stats(&mut self.heap, walk, new_ns);
+            let stats = ctx_i_stats(&self.heap, walk);
+            let p = stats + 6 * new_ns as u32;
+            state_set_succ  (&mut self.heap, p, i_succ);
+            state_set_symbol(&mut self.heap, p, f_symbol);
+            state_set_freq  (&mut self.heap, p, cf as u8);
+            let cf_w = ctx_flags(&self.heap, walk);
+            ctx_set_flags(&mut self.heap, walk, cf_w | flag);
+
+            walk = ctx_i_suffix(&self.heap, walk);
+        }
+
+        self.max_context = i_f_succ_local;
+        self.max_context
+    }
+
+    /// Public per-byte update: consumes the just-(en|de)coded byte,
+    /// advances the model, then re-runs `prepare_byte` so the new
+    /// byte distribution is ready for the next call to
+    /// [`Self::finalize_probs`].
+    pub fn byte_update(&mut self, byte: u8) {
+        let mut min_ctx = self.max_context;
+        if ctx_num_stats(&self.heap, min_ctx) != 0 {
+            self.process_symbol1(min_ctx, byte);
+        } else {
+            self.process_bin_symbol(min_ctx, byte);
+        }
+
+        while self.found_state == 0 {
+            // Walk back along iSuffix until we find a context with
+            // a previously-unmasked symbol.
+            loop {
+                self.order_fall += 1;
+                let suffix = ctx_i_suffix(&self.heap, min_ctx);
+                if suffix == 0 {
+                    // Fall back to a fresh start; PPMd treats this
+                    // as a model restart.
+                    self.start_model_rare();
+                    self.prepare_byte();
+                    return;
+                }
+                min_ctx = suffix;
+                if ctx_num_stats(&self.heap, min_ctx) as i32 != self.num_masked { break; }
+            }
+            self.process_symbol2(min_ctx, byte);
+        }
+
+        if self.order_fall != 0
+            || state_succ(&self.heap, self.found_state) < self.units_start
+        {
+            let p = self.update_model(min_ctx);
+            if p != 0 { self.max_context = p; }
+            else if self.cut_off != 0 {
+                // Out of memory: full model restart for now (a real
+                // RestoreModelRare comes once the cut-off path lands).
+                self.start_model_rare();
+            } else {
+                self.start_model_rare();
+            }
+        } else {
+            self.max_context = state_succ(&self.heap, self.found_state);
+        }
+
         self.prepare_byte();
     }
 
@@ -733,6 +1601,27 @@ mod tests {
         assert!((sum - 1.0).abs() < 1e-3, "probs must sum to ~1, got {}", sum);
         // None should be zero (we floor to 1 before normalising).
         for &v in probs.iter() { assert!(v > 0.0); }
+    }
+
+    /// Feed a repetitive sequence ("ababab...") and verify that
+    /// after training, the model heavily predicts the next char.
+    /// Pattern ends with 'b', so 'a' (which always follows 'b' in
+    /// the pattern) should be the dominant prediction.
+    #[test]
+    fn ppmd_learns_repetitive_input() {
+        let mut p = Ppmd::new(/*order=*/4, /*memory_mb=*/4);
+        let pattern = b"ababababababababababab";
+        for &b in pattern { p.byte_update(b); }
+        let probs = p.finalize_probs();
+        let p_a = probs[b'a' as usize];
+        let p_z = probs[b'z' as usize];
+        let unif = 1.0 / 256.0;
+        // 'a' always follows 'b' — should dominate the distribution.
+        assert!(p_a > unif * 4.0,
+            "p(a) = {} should be well above uniform {}", p_a, unif);
+        // 'z' was never seen; should be essentially baseline.
+        assert!(p_z < p_a,
+            "p(z) = {} should be less than p(a) = {}", p_z, p_a);
     }
 
     #[test]
