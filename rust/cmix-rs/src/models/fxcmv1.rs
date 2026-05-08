@@ -3924,6 +3924,81 @@ impl FxcmState {
                 .wrapping_add((i as u32) * 256);
         }
     }
+
+    /// Words / spaces / numbers bit-shift step from
+    /// `modelPrediction` (fxcmv1.cpp:3871-3874). Called once per byte
+    /// boundary, in lockstep with `byte_boundary_step`.
+    pub fn shift_letter_classes(&mut self) {
+        self.words   = self.words.wrapping_shl(1);
+        self.spaces  = self.spaces.wrapping_shl(1);
+        self.numbers = self.numbers.wrapping_shl(1);
+    }
+
+    /// Returns true iff the current `c1` is a "word letter" — either a
+    /// lowercase ASCII letter (a..=z, the upstream `(j-'a')<=('z'-'a')`
+    /// check) or a non-ASCII byte (>127) whose predecessor wasn't the
+    /// ESCAPE control byte (upstream's UTF-8 / wiki-encoded char).
+    pub fn is_word_letter(&self) -> bool {
+        let j = self.c1;
+        (j >= b'a' && j <= b'z')
+            || (self.c1 > 127 && self.c2 != ESCAPE_CHR)
+    }
+
+    /// Number-tracking sub-step (fxcmv1.cpp:3940-3953). Consumes the
+    /// most-recent byte (`self.c1`) and updates `numbers`, `number0`,
+    /// `number1`, `numlen0`, `numlen1`, `mybenum` per upstream's
+    /// integer-literal parser.
+    ///
+    /// Must run AFTER `shift_letter_classes()` (which shifts
+    /// `numbers` left by 1).
+    pub fn track_numbers(&mut self) {
+        if (b'0'..=b'9').contains(&self.c1) {
+            self.numbers = self.numbers.wrapping_add(1);
+            // "1,000" / locale comma group: roll number0 → number1.
+            if (self.numbers & 4) != 0 && self.c2 == b',' {
+                self.number0 = self.number1;
+                self.number1 = 0;
+                self.numlen0 = self.numlen1;
+                self.numlen1 = 0;
+            }
+            // mybenum = "could be number" carry from the prior step;
+            // when the new digit lands within 2 chars of the carry,
+            // commit a roll.
+            if self.mybenum != 0 && self.numlen1 <= 2 {
+                self.number0 = self.number1;
+                self.number1 = 0;
+                self.numlen0 = self.numlen1;
+                self.numlen1 = 0;
+            }
+            self.number0 = self.number0
+                .wrapping_mul(10)
+                .wrapping_add((self.c1 & 0x0f) as u32);
+            self.numlen0 = (self.numlen0 + 1).min(19);
+            self.mybenum = 0;
+        } else {
+            // Non-digit terminates the current run.
+            if self.numlen0 != 0 || (self.numbers & 0xf) == 0 {
+                self.number1 = self.number0;
+                self.numlen1 = self.numlen0;
+                self.number0 = 0;
+                self.numlen0 = 0;
+            }
+            // Decimal-point continuation hints.
+            if self.numlen1 <= 2 && self.numlen1 != 0
+                && (self.numbers & 5) == 5
+                && self.numlen0 == 0 && self.c2 == b'.'
+            {
+                self.mybenum = 2;
+            } else if self.numlen1 <= 2 && self.numlen1 != 0
+                && (self.numbers & 2) != 0
+                && self.numlen0 == 0 && self.c1 == b'.'
+            {
+                self.mybenum = 1;
+            } else if self.mybenum == 1 && self.c1 != b'.' {
+                self.mybenum = 0;
+            }
+        }
+    }
 }
 
 // ====================================================================
@@ -4434,6 +4509,60 @@ mod tests {
         // After the threshold the VerbWords1 branch is disabled.
         assert!((w_above.r#type & eng::VERB) == 0,
             "at threshold, VerbWords1 branch must be skipped");
+    }
+
+    #[test]
+    fn shift_letter_classes_shifts_left_by_one() {
+        let mut s = FxcmState::new();
+        s.words = 0b0000_1010;
+        s.spaces = 0b0000_0101;
+        s.numbers = 0b0001_1111;
+        s.shift_letter_classes();
+        assert_eq!(s.words,   0b0001_0100);
+        assert_eq!(s.spaces,  0b0000_1010);
+        assert_eq!(s.numbers, 0b0011_1110);
+    }
+
+    #[test]
+    fn is_word_letter_rules() {
+        let mut s = FxcmState::new();
+        s.c1 = b'h'; assert!(s.is_word_letter());
+        s.c1 = b'z'; assert!(s.is_word_letter());
+        s.c1 = b'a'; assert!(s.is_word_letter());
+        s.c1 = b'A'; assert!(!s.is_word_letter());  // upper ASCII not a letter here
+        s.c1 = b'5'; assert!(!s.is_word_letter());
+        s.c1 = b' '; assert!(!s.is_word_letter());
+        // High-ASCII byte after a non-ESCAPE byte counts as letter.
+        s.c1 = 0xC3; s.c2 = b' '; assert!(s.is_word_letter());
+        s.c1 = 0xC3; s.c2 = ESCAPE_CHR; assert!(!s.is_word_letter());
+    }
+
+    #[test]
+    fn track_numbers_accumulates_digits() {
+        let mut s = FxcmState::new();
+        // Feed "127": three digits in a row, no comma.
+        for c in [b'1', b'2', b'7'] {
+            s.c1 = c;
+            s.shift_letter_classes();
+            s.track_numbers();
+        }
+        assert_eq!(s.number0, 127);
+        assert_eq!(s.numlen0, 3);
+    }
+
+    #[test]
+    fn track_numbers_rolls_into_number1_on_non_digit() {
+        let mut s = FxcmState::new();
+        // "42 " — "42" accumulates; the space rolls into number1.
+        for c in [b'4', b'2', b' '] {
+            s.c1 = c;
+            s.shift_letter_classes();
+            s.track_numbers();
+        }
+        assert_eq!(s.number1, 42);
+        assert_eq!(s.numlen1, 2);
+        assert_eq!(s.number0, 0);
+        assert_eq!(s.numlen0, 0);
     }
 
     #[test]
