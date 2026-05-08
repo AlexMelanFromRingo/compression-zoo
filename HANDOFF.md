@@ -328,22 +328,33 @@ Method IDs (community-aligned):
        BracketContext (brackets / quotes / first-char / html), 1
        ColumnContext, 3 WordsContext, MatchModel2, SparseMatchModel,
        Buffer, FxcmState, plus all pre-computed tables (sqt / strt
-       / ilog / dt / sta_tables / pre1 / st2_p0/1/2). Construction
-       allocates the upstream-equivalent footprint (several GB) so
-       any test that builds it pays a one-off ~4 s.
-     - **modelPrediction integration** — most byte-boundary
-       sub-steps are ported as standalone methods on `FxcmState`
-       (byte_boundary_step, shift_letter_classes, is_word_letter,
-       track_numbers, cycle_word_pipeline, maybe_seed_first_word,
+       / ilog / dt / sta_tables / pre1 / st2_p0/1/2).
+
+       **OOM caveat**: `Predictor::new()` allocates several GB of
+       bucket arrays — that's exactly upstream's PredictorInit
+       footprint. All tests that construct a `Predictor` are
+       `#[ignore]`-flagged with the run hint
+       `--ignored --test-threads=1`; running them in parallel (the
+       cargo default) OOM-kills the WSL host. Default
+       `cargo test -p cmix-rs --lib` runs the substrate (state /
+       maps / FxcmState helpers / wire-compat) but skips the heavy
+       constructions.
+     - **modelPrediction integration** — every byte-boundary sub-step
+       is ported as a `FxcmState` method (byte_boundary_step,
+       shift_letter_classes, is_word_letter, track_numbers,
+       cycle_word_pipeline, maybe_seed_first_word,
        update_streams_for_word_type, rotate_stream_masks,
        update_streams_after_byte, line_break_lf, sentence_end_punct,
        punct_comma/colon/curly/close_square/less_than/equals/nbsp,
        update_indirect_histories, update_word0_position,
        paragraph_from_fc, track_utf8_byte, compute_fc_indices). The
-       remaining work is the `cmC[N].set(hash)` per-byte / per-bit
-       feeds that consume these helpers and drive the
-       Mixer/APM stack — straight transcription of upstream
-       fxcmv1.cpp:4250-4760 onto `Predictor`.
+       per-byte ContextMap inputs (`cmC[N].set(hash)`) and per-bit
+       prediction chain are ported as four `Predictor` methods —
+       `feed_byte_context_maps`, `mix_byte_context_maps`,
+       `set_mixer_contexts`, `final_mixer_prediction` — plus the
+       post-prediction `apm_cascade`. They are wired together in
+       `perceive(bit)` → updates the cached `pr` that `predict()`
+       returns as a [0, 1] float.
      - `paq8.cpp` — the other ensemble component, untouched.
      - CMIX top-level `predictor.cpp` orchestrator and `runner.cpp`
        CLI, untouched.
@@ -355,9 +366,16 @@ $ cargo test --release
 test result: ok. 61 passed   (bsc-rs)
 test result: ok. 62 passed   (zpaq-rs unit) + 4 wire_compat
 test result: ok. 46 passed   (sevenz-rs)
-test result: ok. 121 passed  (cmix-rs, 1 ignored heavy SSE)
+test result: ok. 119 passed  (cmix-rs, 9 ignored — see OOM caveat below)
 test result: ok.  3 passed   (gpu-rs)
-   total: 297 tests passing
+   total: 295 tests passing (9 ignored — Predictor::new is GB-heavy)
+
+The cmix-rs ignored tests construct the full FXCMv1 Predictor; run
+them on a host with enough headroom via:
+
+```bash
+cargo test -p cmix-rs --lib -- --ignored --test-threads=1
+```
 
 cross-language:
   bsc-rs encode + decode  30/30
