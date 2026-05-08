@@ -1476,35 +1476,143 @@ impl SparseMatchModel {
 impl Default for SparseMatchModel { fn default() -> Self { Self::new() } }
 
 // ====================================================================
-// `vec<T, S>` — small fixed-capacity int vector used by
-// BracketContext / WordsContext / ColumnContext etc. We store as a
-// runtime-sized Vec<i32> with a recorded `capacity` matching
-// upstream's compile-time S.
+// `vec<T, S>` — fixed-capacity vector used by BracketContext /
+// WordsContext / ColumnContext. Upstream parameterises by element
+// type T and capacity S; the Rust port uses a `Vec<T>` with a
+// recorded `capacity` matching upstream's compile-time `S`.
 // ====================================================================
 
 #[derive(Clone)]
-pub struct ContextVec {
-    pub cxt: Vec<i32>,
+pub struct CmixVec<T: Default + Copy> {
+    pub cxt: Vec<T>,
     pub size: usize,
     pub capacity: usize,
 }
 
-impl ContextVec {
-    pub fn new(s: usize) -> Self { Self { cxt: vec![0i32; s], size: 0, capacity: s } }
-    pub fn push(&mut self, v: i32) {
+impl<T: Default + Copy> CmixVec<T> {
+    pub fn new(s: usize) -> Self {
+        Self { cxt: vec![T::default(); s], size: 0, capacity: s }
+    }
+    pub fn push(&mut self, v: T) {
         debug_assert!(self.size < self.capacity);
         self.cxt[self.size] = v;
         self.size += 1;
     }
-    pub fn pop(&mut self) -> i32 {
-        if self.size == 0 { return 0; }
+    pub fn pop(&mut self) -> T {
+        if self.size == 0 { return T::default(); }
         self.size -= 1;
         self.cxt[self.size]
     }
-    pub fn last(&self) -> i32 {
-        if self.size == 0 { 0 } else { self.cxt[self.size - 1] }
+    pub fn last(&self) -> T {
+        if self.size == 0 { T::default() } else { self.cxt[self.size - 1] }
+    }
+    pub fn at(&self, i: usize) -> T { self.cxt[i] }
+    pub fn set(&mut self, i: usize, v: T) { self.cxt[i] = v; }
+    pub fn inc(&mut self, i: usize) where T: std::ops::AddAssign + From<u8> {
+        let one: T = T::from(1);
+        self.cxt[i] += one;
     }
     pub fn clear(&mut self) { self.size = 0; }
+    pub fn is_empty(&self) -> bool { self.size == 0 }
+    pub fn len(&self) -> usize { self.size }
+}
+
+/// Backwards-compat alias for the i32-specific case used in earlier tests.
+pub type ContextVec = CmixVec<i32>;
+
+// ====================================================================
+// `BracketContext<T>` — bracket-pair stack tracker. Generic over T
+// so callers pick u8 / u16 storage (1-byte bracket pairs vs 2-byte
+// HTML-tag pairs etc). Mirrors upstream's `template <typename T>
+// struct BracketContext`.
+// ====================================================================
+
+pub struct BracketContextFx<T>
+    where T: Default + Copy + Eq + Into<u32> + From<u8>,
+{
+    pub context: u32,
+    pub active: CmixVec<i32>,
+    pub distance: CmixVec<i32>,
+    pub element: Vec<T>,
+    pub element_count: i32,
+    pub do_pop: bool,
+    pub limit: i32,
+    pub cxt: u32,
+    pub dst: u32,
+    pub elem_bits: u32,
+}
+
+impl<T> BracketContextFx<T>
+    where T: Default + Copy + Eq + Into<u32> + From<u8>,
+{
+    pub fn new(elements: &[T], pop: bool, limit: i32, elem_bits: u32) -> Self {
+        Self {
+            context: 0,
+            active: CmixVec::new(512),
+            distance: CmixVec::new(512),
+            element: elements.to_vec(),
+            element_count: elements.len() as i32,
+            do_pop: pop,
+            limit,
+            cxt: 0, dst: 0,
+            elem_bits,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.active.clear();
+        self.distance.clear();
+        self.context = 0; self.cxt = 0; self.dst = 0;
+    }
+
+    fn find(&self, b: u32) -> bool {
+        let mut i = 0;
+        while i < self.element_count as usize {
+            if self.element[i].into() == b { return true; }
+            i += 2;
+        }
+        false
+    }
+
+    fn find_end(&self, b: u32, c: u32) -> bool {
+        let mut i = 0;
+        while i < self.element_count as usize {
+            if self.element[i].into() == b && self.element[i + 1].into() == c {
+                return true;
+            }
+            i += 2;
+        }
+        false
+    }
+
+    pub fn update(&mut self, byte: u32) {
+        let mut pop = false;
+        if !self.active.is_empty() {
+            let top = self.active.last() as u32;
+            let dist_top = self.distance.last();
+            if self.find_end(top, byte) || dist_top >= self.limit {
+                self.active.pop();
+                self.distance.pop();
+                pop = self.do_pop;
+            } else {
+                let last_idx = self.distance.len() - 1;
+                let cur = self.distance.at(last_idx);
+                self.distance.set(last_idx, cur + 1);
+            }
+        }
+        if !pop && self.find(byte) {
+            self.active.push(byte as i32);
+            self.distance.push(0);
+        }
+        if !self.active.is_empty() {
+            self.cxt = self.active.last() as u32;
+            let max_d = (1u32 << self.elem_bits) - 1;
+            self.dst = (self.distance.last() as u32).min(max_d);
+            self.context = (1u32 << self.elem_bits) * self.cxt + self.dst;
+        } else {
+            self.context = 0; self.cxt = 0; self.dst = 0;
+        }
+    }
 }
 
 // ====================================================================
@@ -1807,6 +1915,20 @@ mod tests {
         assert_eq!(v.last(), 8);
         assert_eq!(v.pop(), 8);
         assert_eq!(v.last(), 7);
+    }
+
+    #[test]
+    fn bracket_context_fx_pushes_and_pops() {
+        // Element list: '(' → ')'.
+        let mut b: BracketContextFx<u8> = BracketContextFx::new(
+            &[b'(', b')'], false, 64, 8,
+        );
+        b.update(b'(' as u32);
+        let after_open = b.context;
+        assert!(after_open != 0);
+        b.update(b')' as u32);
+        // Stack empties on matched close → context resets to 0.
+        assert_eq!(b.context, 0);
     }
 
     #[test]
