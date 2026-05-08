@@ -4408,23 +4408,117 @@ impl FxcmState {
 // ====================================================================
 
 pub struct Predictor {
+    // Per-block prediction buffer used by the upstream
+    // `AddPrediction` / `ResetPredictions` plumbing.
     pub model_predictions: Vec<f32>,
-    pub prediction_index: usize,
+    pub prediction_index:  usize,
+
+    // Shared per-bit / per-byte state.
     pub block: BlockData,
+    pub state: FxcmState,
+    pub buffer: Buffer,
+
+    // Pre-computed lookup tables.
     pub sqt: Vec<i16>,
     pub strt: Vec<i16>,
     pub ilog: [U8; 256],
+    pub dt:   [i32; 1024],
+    pub sta_tables: Vec<u8>,
+    pub pre1: [i16; 256],
+
+    // Mixer / SmallStationaryContextMap / RunContextMap / StateMap arrays.
+    pub mixers: Vec<Mixer1>,        // length = 12
+    pub small_scms: Vec<SmallStationaryContextMap>, // length = 7
+    pub run_cm: RunContextMap,
+    pub state_maps_match: Vec<StateMap1>, // length = 3 (for MatchModel2)
+
+    // APM caskade (apmA0..apmA5 in upstream).
+    pub apm_a: Vec<ApmDyn>,         // length = 6
+
+    // Bracket / quote / first-char / html contexts.
+    pub brcxt: BracketContextFx<u8>,
+    pub qocxt: BracketContextFx<u8>,
+    pub fccxt: BracketContextFx<u8>,
+    pub htcxt: BracketContextFx<u16>,
+
+    // Column / words contexts (3 separate WordsContexts upstream).
+    pub colcxt: ColumnContext,
+    pub worcxt:  WordsContext,
+    pub worcxt1: WordsContext,
+    pub worcxt2: WordsContext,
+
+    // Match model + sparse match.
+    pub match_model: MatchModel2,
+    pub smatch:      SparseMatchModel,
 }
 
 impl Predictor {
     pub fn new() -> Self {
+        let sqt  = build_squash_table();
+        let strt = build_stretch_table();
+        let ilog = build_ilog();
+        let dt   = build_dt();
+        let sta_tables = build_sta_tables();
+        let pre1 = build_pre1_from_sta7(&sta_tables[5 * 1024..6 * 1024], &strt);
+
+        // mxInputs1 sizing matches upstream's
+        // `(515+16+1-5*2-2*2) & -16 = 512`; mxInputs2 = 16.
+        let inputs1_n: usize = 512;
+        let inputs2_n: usize = 16;
+
+        let mixers = build_mixers(inputs1_n, inputs2_n);
+        let small_scms = build_small_scm();
+        let run_cm = RunContextMap::new(1 * 4096 * 4096, /*rcm_ml=*/6, &ilog);
+        let state_maps_match = build_state_maps();
+
+        // 6 APMs sized per upstream `APM<256>`, `APM<0x8000*2>` etc.
+        // APM<S> upstream uses `S * 33` slots; ApmDyn picks `s` at
+        // runtime — we mirror the sizes directly.
+        let apm_a = vec![
+            ApmDyn::new(256,           &sqt),
+            ApmDyn::new(0x8000  * 2,   &sqt),
+            ApmDyn::new(0x8000  * 2,   &sqt),
+            ApmDyn::new(0x20000 * 2,   &sqt),
+            ApmDyn::new(0x20000 * 2,   &sqt),
+            ApmDyn::new(0x20000 * 2,   &sqt),
+        ];
+
+        // Bracket / quote / first-char / html contexts (8-bit / 16-bit).
+        let brackets = brackets_table();
+        let quotes   = quotes_table();
+        let fchar    = fchar_table();
+        let html     = html_table();
+        let brcxt = BracketContextFx::new(&brackets, false, 256, 8);
+        let qocxt = BracketContextFx::new(&quotes,   true,  256, 8);
+        let fccxt = BracketContextFx::new(&fchar,    false, 256, 8);
+        let htcxt = BracketContextFx::new(&html,     false, 0xfff, 16);
+
+        // Match model: 0x200000 hash table, sm_n / sm_limit per upstream.
+        // Three StateMap1 inside MatchModel2 use sizes 1<<9, 1<<19, 1<<16
+        // — we honour that in `build_state_maps`.
+        // The MatchModel2's own 3-state map array is separate from
+        // `state_maps_match`; the latter we pass into the model when
+        // constructing it, but our current MatchModel2 builds its
+        // own internally — keep `state_maps_match` for now in case
+        // the caller wants to share.
+        let match_model = MatchModel2::new(/*log2_size=*/21, /*sm_n=*/1 << 9,
+                                           /*sm_limit=*/1023);
+
         Self {
             model_predictions: vec![0.5f32; NUM_MODELS],
             prediction_index: 0,
             block: BlockData::new(528 + 32),
-            sqt: build_squash_table(),
-            strt: build_stretch_table(),
-            ilog: build_ilog(),
+            state: FxcmState::new(),
+            buffer: Buffer::new(),
+            sqt, strt, ilog, dt, sta_tables, pre1,
+            mixers, small_scms, run_cm, state_maps_match, apm_a,
+            brcxt, qocxt, fccxt, htcxt,
+            colcxt: ColumnContext::new(31),
+            worcxt:  WordsContext::new(),
+            worcxt1: WordsContext::new(),
+            worcxt2: WordsContext::new(),
+            match_model,
+            smatch: SparseMatchModel::new(),
         }
     }
 
@@ -4514,6 +4608,30 @@ mod tests {
         let p = Predictor::new();
         assert_eq!(p.predict(), 0.5);
         let _ = E; // silence unused
+    }
+
+    #[test]
+    fn predictor_owns_all_required_components() {
+        let p = Predictor::new();
+        // Tables.
+        assert_eq!(p.sqt.len(),  4095);   // d ∈ [-2047, +2047] = 4095 slots
+        assert_eq!(p.strt.len(), 4096);
+        assert_eq!(p.dt.len(),   1024);
+        assert_eq!(p.sta_tables.len(), 6 * 1024);
+        // Mixers / SCMs / state maps.
+        assert_eq!(p.mixers.len(),    12);
+        assert_eq!(p.small_scms.len(), 7);
+        assert_eq!(p.state_maps_match.len(), 3);
+        // APM cascade.
+        assert_eq!(p.apm_a.len(), 6);
+        // Bracket / words contexts construct cleanly.
+        assert_eq!(p.brcxt.element_count, 8);
+        assert_eq!(p.fccxt.element_count, 20);
+        assert_eq!(p.qocxt.element_count, 4);
+        assert_eq!(p.htcxt.element_count, 2);
+        // FxcmState boot constants reachable via predictor.
+        assert_eq!(p.state.ah2, 0x765BA55C);
+        assert_eq!(p.state.pr,  2048);
     }
 
     #[test]
