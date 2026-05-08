@@ -147,9 +147,13 @@ Remaining zpaq-rs work:
   `compress(method)` API can drive any upstream level.
 - LZBuffer level 1 — the variable-bit Elias-gamma LZ77 path. Bit-
   packed, trickier than level 2; deferred. Level 2 + 3 already work.
-- Wire-compat tests for LZBuffer + Compiler-generated PCOMP. The
-  pieces are all in place — just need a small C++ harness or canned
-  fixture corpus to compare against.
+- Wire-compat snapshot fixtures (`rust/zpaq-rs/tests/wire_compat.rs`):
+  pin SHA-1 digests of `expand_digit_method` outputs, `compile()`
+  HCOMP bytecode, `lzbuffer::preprocess()` outputs, and full
+  `compress_method()` byte streams. Each `compress_method` snapshot
+  also round-trips through the Rust decoder, so a digest drift +
+  successful round-trip is "format intentionally changed; refresh the
+  digest"; digest drift + failed round-trip is a real regression.
 - JIT path (intentionally skipped — interpret-only is fine).
 - More archive-format tests (multi-block, multi-segment).
 
