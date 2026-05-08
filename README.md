@@ -1,75 +1,122 @@
 # compression-zoo
 
-A monorepo of high-ratio lossless compression tooling: 7-Zip codec plugins
-wrapping algorithms that compress better than LZMA2, plus an in-progress
-memory-safe Rust port of the 7-Zip / LZMA SDK.
+A monorepo of high-ratio lossless compression tooling. Two halves:
+
+  1. Three 7-Zip codec plugin DLLs (ZPAQ, libbsc, CMIX) that give 7-Zip
+     better compression methods than its built-in LZMA2.
+  2. A memory-safe Rust port of the algorithms behind those plugins
+     and behind 7-Zip itself, with `#![forbid(unsafe_code)]`.
+
+## Status at a glance
+
+| Component | Built | Tested | Installed |
+|---|---|---|---|
+| `plugins/zpaq/` (`zpaq.dll`) | ✓ 747 KiB | 12/12 round-trip cases | `/Codecs/zpaq.dll` |
+| `plugins/bsc/` (`bsc.dll`) | ✓ 5.7 MiB | 10/10 round-trip cases | `/Codecs/bsc.dll` |
+| `plugins/cmix/` (`cmix.dll`) | ✓ 154 MiB | cross-process round-trip (see plugin README for limits) | `/Codecs/cmix.dll` |
+| `rust/sevenz-rs/` | LZMA, LZMA2, PPMd7, PPMd8, BCJ, AES, hashes, CRC | 46 unit tests + bytewise C cross-check | — |
+| `rust/bsc-rs/` | adler32 + format header | 13/13 unit tests + cross-check vs C | — |
+| `rust/zpaq-rs/` | skeleton | — | — |
+| `rust/cmix-rs/` | skeleton | — | — |
+
+### Method IDs (recorded in `docs/method-ids.md`)
+
+| ID          | Codec |
+|-------------|-------|
+| `0x4F71103` | ZPAQ (consistent with the existing community ID) |
+| `0x4F71200` | libbsc (proposed) |
+| `0x4F71201` | CMIX (proposed) |
+
+## Why bother — measured ratios
+
+From `docs/benchmarks.md`, on a 111 KiB C++ source file:
+
+| codec               | out_size | ratio  |
+|---------------------|---------:|-------:|
+| xz -9e (LZMA2)      |     8076 |  7.26% |
+| zstd --ultra -22    |     8396 |  7.55% |
+| **zpaq level 5**    | **6864** | **6.17%** |
+| bsc level 9         |     8114 |  7.29% |
+
+**ZPAQ level 5 compresses ~15 % smaller than LZMA2 ultra** in
+exchange for ~10× encode time. CMIX gives an additional ~2× ratio
+improvement but at hours of CPU per gigabyte and >25 GiB peak RSS,
+so it's mostly useful for tiny corpora or as a benchmark.
+
+## Quick start (use the plugins)
+
+You need MinGW-w64 to cross-compile the DLLs (`apt install
+mingw-w64`). On Windows you'd use MSVC; the upstream code is C++14
+and doesn't need anything fancy.
+
+```bash
+make -C plugins/zpaq && make -C plugins/zpaq install \
+    CODECS_DIR="/mnt/<drive>/Programs/7-Zip/Codecs"
+make -C plugins/bsc  && make -C plugins/bsc  install
+make -C plugins/cmix && make -C plugins/cmix install
+```
+
+Then in 7-Zip:
+
+```cmd
+7z a archive.7z -m0=zpaq -mx5 input
+7z x archive.7z
+
+7z a archive.7z -m0=bsc -mx5 input
+7z a archive.7z -m0=cmix input    :: be patient
+```
+
+## Quick start (Rust port)
+
+The crate workspace lives at `rust/`:
+
+```bash
+cd rust && cargo test --release
+```
+
+That runs 46 sevenz-rs tests (LZMA / LZMA2 / PPMd7 / PPMd8 /
+BCJ / AES / hashes / CRC) and 13 bsc-rs tests (Adler-32 + the
+`bsc_block_info` header parser). All pass and all cross-check
+byte-for-byte against the C reference.
 
 ## Components
 
 ### `plugins/` — Windows codec DLLs for 7-Zip
 
-Each plugin is a 64-bit Windows DLL implementing the 7-Zip codec interface
-(`ICompressCoder`). Drop the DLL into the `Codecs/` subdirectory of your
-7-Zip install and the new method ID becomes available from the GUI and CLI.
+Each plugin is a 64-bit Windows DLL implementing the 7-Zip codec
+interface (`ICompressCoder`). Drop the DLL into the `Codecs/`
+subdirectory of your 7-Zip install and the new method ID becomes
+available from the GUI and CLI.
 
-| Plugin | Algorithm | Method ID | License | Notes |
-|---|---|---|---|---|
-| `zpaq` | ZPAQ (Matt Mahoney) | `0x4F71103` | MIT (wrapper); ZPAQ is public domain | Levels 1–5; level 5 ≈ 15–20 % better ratio than LZMA2 ultra |
-| `bsc` | libbsc (Ilya Grebnov) | TBD | Apache-2.0 | BWT + ST + LZP; modest improvement, comparable speed |
-| `cmix` | CMIX (Byron Knoll) | TBD | GPL-3.0 | Top-of-leaderboard ratio; **hours of CPU and >25 GB RAM per GB** |
+### `rust/sevenz-rs/` — Memory-safe Rust port of 7-Zip algorithms
 
-See `docs/method-ids.md` for the community method-ID registry and
-`docs/benchmarks.md` for measured ratios.
+Direct port of the C reference implementations from `7zip/C/` with
+`#![forbid(unsafe_code)]`. Used as the foundation for the future
+"variant A" goal of bringing the Rust port to feature parity with
+7-Zip's GUI (container, profiles, multithreading).
 
-### `rust/sevenz-rs` — Memory-safe Rust port of 7-Zip algorithms
+### `rust/bsc-rs/`, `rust/zpaq-rs/`, `rust/cmix-rs/`
 
-Port of the C reference implementations from `7zip/C/` with
-`#![forbid(unsafe_code)]`. Currently implements:
-
-- LZMA encoder/decoder, LZMA2 framing
-- PPMd7 (PPMdH) and PPMd8 (PPMdI) encoders/decoders
-- BCJ family (x86, ARM, ARM64, IA64, PPC, SPARC, RISC-V, ARM-Thumb) and BCJ2
-- AES (CBC + CTR), MD5, SHA-1, SHA-256, SHA-512, Blake2s, XXH64
-- CRC-32 (slicing-by-N) and CRC-64
-
-The Rust port is a research/teaching artefact, cross-checked byte-for-byte
-against the C reference. The longer-term plan is to bring it up to feature
-parity with the 7-Zip GUI (container, profiles, multithreading) and to
-re-implement each plugin in Rust.
-
-## Quick start (plugins)
-
-Cross-compiling from Linux/WSL:
-
-```bash
-sudo apt install mingw-w64
-cd plugins/zpaq && make
-cp build/zpaq.dll "/mnt/<drive>/Program Files/7-Zip/Codecs/"
-```
-
-In 7-Zip CLI: `7z a archive.7z -m0=zpaq -mx5 file`. In the GUI, ZPAQ appears
-in the *Method* dropdown after the DLL is loaded.
+Per-plugin Rust ports. Currently `bsc-rs` has the Adler-32 and block
+header parser; `zpaq-rs` and `cmix-rs` are skeleton crates pending
+implementation.
 
 ## Licensing
 
 This repo aggregates components with different upstream licenses. The
-top-level project tooling (build scripts, docs) is MIT. Each subdirectory
-under `plugins/` has its own `LICENSE` reflecting the upstream algorithm:
+top-level project tooling (build scripts, docs) is MIT. Each
+subdirectory under `plugins/` and `rust/` has its own `LICENSE`
+reflecting the upstream algorithm:
 
-- `plugins/zpaq/` — MIT (wrapper) over public domain
-- `plugins/bsc/` — Apache-2.0
-- `plugins/cmix/` — GPL-3.0 (note: linking with this DLL imposes GPL-3.0
-  on derived works that statically link it; loading it as a 7-Zip plugin at
-  runtime is fine)
-- `plugins/sdk/` — LGPL-2.1+ / BSD (vendored 7-Zip plugin SDK headers,
-  Igor Pavlov)
-- `rust/sevenz-rs/` — LGPL-2.1+ to match 7-Zip upstream, with public-domain
-  fallback for files that derive from the LZMA SDK only
+- `plugins/zpaq/`, `rust/zpaq-rs/` — MIT/Unlicense (wrappers) over
+  public-domain libzpaq
+- `plugins/bsc/`, `rust/bsc-rs/` — Apache-2.0
+- `plugins/cmix/`, `rust/cmix-rs/` — GPL-3.0 (note: linking with the
+  DLL imposes GPL-3.0 on derived works that statically link it;
+  loading it as a 7-Zip plugin at runtime is fine)
+- `plugins/sdk/` — LGPL-2.1+ / BSD (vendored 7-Zip plugin SDK
+  headers, Igor Pavlov)
+- `rust/sevenz-rs/` — LGPL-2.1+ matching 7-Zip upstream, with
+  public-domain fallback for files derived from the LZMA SDK only
 
 See each subdirectory's `LICENSE` and `README.md` for specifics.
-
-## Status
-
-Work in progress. The Rust port is functionally complete for the listed
-algorithms; container-level features and the plugin DLLs are still being
-built. Not yet recommended for production use.
