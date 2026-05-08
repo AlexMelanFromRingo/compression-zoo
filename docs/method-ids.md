@@ -37,10 +37,13 @@ These are de-facto allocations from existing third-party plugins.
 
 | ID | Method | Plugin |
 |---|---|---|
+| `0x4F71102` | Brotli | `plugins/brotli/` (consistent with prior community plugin) |
 | `0x4F71103` | ZPAQ | `plugins/zpaq/` (consistent with prior community plugin) |
 | `0x4F71200` | libbsc | `plugins/bsc/` (proposed, open) |
 | `0x4F71201` | CMIX | `plugins/cmix/` (proposed, open) |
 
-The `0x4F712xx` block is currently unused upstream; we use it to avoid
-collisions with the `0x4F711xx` codecs that ship in mcmilk's plugin
-distribution.
+We reuse the existing community IDs (`0x4F71102` Brotli, `0x4F71103`
+ZPAQ) so archives produced by other plugins decompress with our DLLs
+without per-archive ID rewrites. New codecs we introduce (`bsc`,
+`cmix`) live in the `0x4F712xx` block to avoid colliding with the
+`0x4F711xx` codecs shipped in mcmilk's plugin distribution.
