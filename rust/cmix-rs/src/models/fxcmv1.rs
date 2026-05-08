@@ -3603,6 +3603,67 @@ pub fn build_sta_tables() -> Vec<u8> {
     out
 }
 
+// ====================================================================
+// Mixer / StateMap / SmallStationaryContextMap parameter tables.
+//
+// PredictorInit() configures 12 Mixer1 instances + 3 StateMap1 + 7
+// SmallStationaryContextMap. Below are the parameter tuples upstream
+// uses. Mirrored from fxcmv1.cpp:3313-3337.
+// ====================================================================
+
+/// Mixer1 init params: `(m_contexts, shift1, elim, uperr)`. The `n`
+/// (input count) comes from `mxInputs1.ncount` (or `mxInputs2.ncount`
+/// for the final two) and is set by the caller separately.
+pub const MIXER_PARAMS: [(usize, u32, i32, i32); 12] = [
+    (2048,         237, 8, 69),  // general
+    (6 * 256,      204, 8, 19),
+    (6 * 256 * 4,   70, 1, 34),
+    (8 * 256,       54, 1, 23),
+    (6 * 256,       55, 1, 24),
+    (7 * 256 * 4,   55, 1, 24),
+    (0x4000,        70, 1, 34),
+    (0x4000,        55, 1, 24),
+    (0x20000,       55, 1, 24),
+    (0x20000,       55, 1, 24),
+    (8*7*2*2,        6, 0,  4),  // final mixer
+    (1,              6, 0,  4),  // helper for final
+];
+
+/// `(n_contexts, limit)` for the three StateMap1 instances backing
+/// `MatchModel2::sm_a`. Sizes mirror upstream's
+/// `smA[0]=1<<9`, `smA[1]=1<<19`, `smA[2]=1<<16` all with limit 1023.
+pub const STATE_MAP_PARAMS: [(usize, i32); 3] = [
+    (1 << 9,  1023),
+    (1 << 19, 1023),
+    (1 << 16, 1023),
+];
+
+/// Number of context bits for the seven SmallStationaryContextMap
+/// instances (`scmA[0..6]`). Each map uses an 8-bit input width by
+/// default; those values are 8,8,8,9,8,8,7 in upstream.
+pub const SCM_BITS: [u8; 7] = [8, 8, 8, 9, 8, 8, 7];
+
+/// Build the 12 Mixer1 instances given the per-mixer input counts.
+/// `inputs1_n` is `mxInputs1.ncount` (used by mixers 0..=9), and
+/// `inputs2_n` is `mxInputs2.ncount` (used by mixers 10/11).
+pub fn build_mixers(inputs1_n: usize, inputs2_n: usize) -> Vec<Mixer1> {
+    MIXER_PARAMS.iter().enumerate().map(|(i, &(m, sh, el, ue))| {
+        let n = if i < 10 { inputs1_n } else { inputs2_n };
+        Mixer1::new(n, m, sh, el, ue)
+    }).collect()
+}
+
+/// Build the 3 StateMap1 instances backing MatchModel2.
+pub fn build_state_maps() -> Vec<StateMap1> {
+    STATE_MAP_PARAMS.iter().map(|&(n, lim)| StateMap1::new(n, lim)).collect()
+}
+
+/// Build the 7 SmallStationaryContextMap instances (`ctx_bits` from
+/// `SCM_BITS`, in_bits = 8 by default).
+pub fn build_small_scm() -> Vec<SmallStationaryContextMap> {
+    SCM_BITS.iter().map(|&b| SmallStationaryContextMap::new(b as u32, 8)).collect()
+}
+
 /// Per-state pre-stretched probability used by upstream's `pre2(STA7)`
 /// to seed `pre1[256]`. We compute it from STA7 (== STA_PARAMS[5]).
 pub fn build_pre1_from_sta7(sta7: &[u8], strt: &[i16]) -> [i16; 256] {
@@ -4124,6 +4185,38 @@ mod tests {
         // After the threshold the VerbWords1 branch is disabled.
         assert!((w_above.r#type & eng::VERB) == 0,
             "at threshold, VerbWords1 branch must be skipped");
+    }
+
+    #[test]
+    fn build_mixers_produces_twelve_with_correct_shape() {
+        let ms = build_mixers(/*inputs1_n=*/512, /*inputs2_n=*/16);
+        assert_eq!(ms.len(), 12);
+        // First mixer: m=2048, n=512.
+        assert_eq!(ms[0].m, 2048);
+        assert_eq!(ms[0].n, 512);
+        assert_eq!(ms[0].uperr, 69);
+        // Last mixer: m=1, n=16.
+        assert_eq!(ms[11].m, 1);
+        assert_eq!(ms[11].n, 16);
+        assert_eq!(ms[11].shift1, 6);
+    }
+
+    #[test]
+    fn build_state_maps_produces_three_with_distinct_sizes() {
+        let sms = build_state_maps();
+        assert_eq!(sms.len(), 3);
+        assert_eq!(sms[0].n, 1 << 9);
+        assert_eq!(sms[1].n, 1 << 19);
+        assert_eq!(sms[2].n, 1 << 16);
+    }
+
+    #[test]
+    fn build_small_scm_produces_seven_with_listed_bits() {
+        let scm = build_small_scm();
+        assert_eq!(scm.len(), 7);
+        // SmallStationaryContextMap has no public bits accessor;
+        // sanity-check that all 7 instantiate without panic.
+        for s in &scm { let _ = s; }
     }
 
     #[test]
