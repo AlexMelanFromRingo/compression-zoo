@@ -4,11 +4,13 @@
 //! [`Indirect`], [`Match`], [`ByteModel`], [`Bracket`].
 //!
 //! Submodules:
-//!   * [`ppmd`]   — `models/ppmd.{h,cpp}` (mod_ppmd_v2).
+//!   * [`ppmd`]    — `models/ppmd.{h,cpp}` (mod_ppmd_v2).
+//!   * [`fxcmv1`]  — `models/fxcmv1.{h,cpp}` (Kaido Orav's PAQ8-style mixer).
 
 #![allow(dead_code)]
 
 pub mod ppmd;
+pub mod fxcmv1;
 
 use crate::state::State;
 
