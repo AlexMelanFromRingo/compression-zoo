@@ -3777,6 +3777,16 @@ pub struct FxcmState {
     // 14-element hash table consulted by MatchModel2 + ContextMaps.
     pub t: [u32; 14],
 
+    // Indirect-byte / indirect-word rolling history. `t1` rolls
+    // 4 bytes per low byte (256 buckets); `t2` rolls 4 bytes per
+    // (c4 >> 8) & 0xffff word (64K buckets). Heap-allocated to
+    // keep `FxcmState` itself stack-friendly.
+    pub t1: Vec<u32>,
+    pub t2: Vec<u32>,
+
+    // Last-position-of-word0 lookup (`wp[word0 & 0xffff] = pos`).
+    pub wp: Vec<u32>,
+
     // Position counter (bytes seen so far).
     pub pos: u32,
 
@@ -3844,6 +3854,9 @@ impl FxcmState {
             fails: 0, failz: 0, failcount: 0,
             nl: 0, nl1: 0, col: 0, fc: 0,
             t: [0u32; 14],
+            t1: vec![0u32; 256],
+            t2: vec![0u32; 65536],
+            wp: vec![0u32; 65536],
             pos: 0,
             stream3b_mask: 0, stream3b_mask1: 0,
             stream3b_r_mask1: 0, stream3b_r_mask2: 0,
@@ -4064,6 +4077,79 @@ impl FxcmState {
             if self.c1 == b')' { self.sen_word = 0; }
             false
         }
+    }
+
+    /// Indirect-byte / indirect-word rolling histories — port of
+    /// fxcmv1.cpp:4290-4299. Updates:
+    ///
+    /// * `t2[(c4>>8)&0xffff]` — pushes c1 onto the 4-byte history
+    ///   keyed by the previous 16-bit word. The composed
+    ///   `indirect_word` for the current step is
+    ///   `(c4&0xffff) | (t2[c4&0xffff] << 16)`.
+    /// * `t1[(c4>>8)&0xff]` — pushes c1 onto the byte-keyed
+    ///   4-byte history. `indirect_byte = c1 | (t1[c1] << 8)`.
+    /// * `t1[brcontext]` — pushes the low 2 bits of `stream2b`
+    ///   onto the bracket-context byte history.
+    ///   `indirect_br_byte = (stream3b & 7) | (t1[brcontext] << 3)`.
+    ///
+    /// `c4` is the running 4-byte history (BlockData::c4).
+    /// `brcontext` is the active `BracketContext::cxt`.
+    pub fn update_indirect_histories(&mut self, c4: u32, brcontext: u8) {
+        // Rolling 4-byte history per (c4>>8)&0xffff.
+        let key_w_prev = ((c4 >> 8) & 0xffff) as usize;
+        self.t2[key_w_prev] = (self.t2[key_w_prev] << 8) | (self.c1 as u32);
+        let key_w = (c4 & 0xffff) as usize;
+        self.indirect_word = (key_w as u32) | (self.t2[key_w] << 16);
+
+        // Rolling 4-byte history per (c4>>8)&0xff.
+        let key_b_prev = ((c4 >> 8) & 0xff) as usize;
+        self.t1[key_b_prev] = (self.t1[key_b_prev] << 8) | (self.c1 as u32);
+        self.indirect_byte = (self.c1 as u32)
+            | (self.t1[self.c1 as usize] << 8);
+
+        // Bracket-context byte history (low 2 bits of stream2b).
+        self.t1[brcontext as usize] = (self.t1[brcontext as usize] << 2)
+            | (self.stream2b & 3);
+        self.indirect_br_byte = (self.stream3b & 7)
+            | (self.t1[brcontext as usize] << 3);
+    }
+
+    /// Word0-position lookup helper — fxcmv1.cpp:4301-4304. Computes
+    /// the distance between the current `pos` and the last `pos`
+    /// where `word0 & 0xffff` was seen, plus a back-reference byte
+    /// from the buffer at that distance and the current `c1`.
+    /// Stores result in `indirect_word0_pos`.
+    ///
+    /// Returns the distance (capped at 256) so the caller can decide
+    /// whether the position was "fresh" (>255 → caller emits a
+    /// distinct context).
+    pub fn update_word0_position(&mut self, buf: &Buffer) -> u32 {
+        let key = (self.word0 & 0xffff) as usize;
+        let last = self.wp[key];
+        let dist = self.pos.wrapping_sub(last);
+        if dist > 255 {
+            self.indirect_word0_pos = 256 + ((self.c1 as u32) << 16);
+            dist
+        } else {
+            let bb = buf.buf(dist as usize) as u32;
+            self.indirect_word0_pos = dist + (bb << 8) + ((self.c1 as u32) << 16);
+            dist
+        }
+    }
+
+    /// Latch the current `pos` into `wp[word0 & 0xffff]`. Should be
+    /// called when `word0` is being cleared (end of a word run) —
+    /// upstream stamps this immediately before zeroing `word0`.
+    pub fn stamp_word0_position(&mut self) {
+        let key = (self.word0 & 0xffff) as usize;
+        self.wp[key] = self.pos;
+    }
+
+    /// Paragraph flag derived from `fc` — fxcmv1.cpp:4192-4193,
+    /// 4240-4241. `is_paragraph = 1` when `fc == FIRSTUPPER`,
+    /// otherwise 0.
+    pub fn paragraph_from_fc(&mut self) {
+        self.is_paragraph = if self.fc as u8 == FIRSTUPPER_CHR { 1 } else { 0 };
     }
 
     /// Comma handler — fxcmv1.cpp:4086-4089.
@@ -4830,6 +4916,60 @@ mod tests {
         s.sen_word = 999;
         s.update_streams_for_word_type(&w, /*is_paragraph=*/true);
         assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn indirect_histories_roll_byte_into_t1_and_t2() {
+        let mut s = FxcmState::new();
+        s.c1 = 0x42;
+        s.stream2b = 0b11;  // low 2 bits = 3.
+        s.stream3b = 0b101; // low 3 bits = 5.
+        s.update_indirect_histories(/*c4=*/0x12345678, /*brcontext=*/0);
+        // t2[(c4>>8)&0xffff] = (0 << 8) | 0x42 = 0x42.
+        assert_eq!(s.t2[0x3456], 0x42);
+        // indirect_word low 16 = c4 & 0xffff = 0x5678.
+        assert_eq!(s.indirect_word & 0xffff, 0x5678);
+        // indirect_byte low 8 = c1.
+        assert_eq!(s.indirect_byte & 0xff, 0x42);
+        // indirect_br_byte low 3 = stream3b & 7 = 5.
+        assert_eq!(s.indirect_br_byte & 7, 5);
+    }
+
+    #[test]
+    fn word0_position_tracks_distance() {
+        let mut s = FxcmState::new();
+        let mut buf = Buffer::new();
+        for &b in b"abcdef" { buf.push(b); }
+        s.word0 = 0x1234;
+        s.pos = 100;
+        s.wp[0x1234] = 50;  // last seen 50 positions ago.
+        let dist = s.update_word0_position(&buf);
+        assert_eq!(dist, 50);
+        // Low 8 = dist; mid 8 = buf(50); high 8 = c1.
+        assert_eq!(s.indirect_word0_pos & 0xff, 50);
+    }
+
+    #[test]
+    fn word0_position_caps_at_256() {
+        let mut s = FxcmState::new();
+        let buf = Buffer::new();
+        s.word0 = 0; s.pos = 1000; s.wp[0] = 100;
+        s.c1 = 0xAB;
+        let dist = s.update_word0_position(&buf);
+        assert_eq!(dist, 900);  // returned distance unchanged.
+        // But stored value is 256 + (c1 << 16).
+        assert_eq!(s.indirect_word0_pos, 256 + (0xAB << 16));
+    }
+
+    #[test]
+    fn paragraph_from_fc_only_one_for_firstupper() {
+        let mut s = FxcmState::new();
+        s.fc = FIRSTUPPER_CHR as i32;
+        s.paragraph_from_fc();
+        assert_eq!(s.is_paragraph, 1);
+        s.fc = b' ' as i32;
+        s.paragraph_from_fc();
+        assert_eq!(s.is_paragraph, 0);
     }
 
     #[test]
