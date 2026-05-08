@@ -5332,6 +5332,92 @@ impl Predictor {
     }
 }
 
+impl Predictor {
+    /// APM cascade applied to `pr` (the modelPrediction output) —
+    /// fxcmv1.cpp:4807-4834. Returns the post-cascade prediction.
+    /// Mutates the AP M state of `apm_a[0..=5]` per the upstream
+    /// recipe.
+    ///
+    /// `pr_in` is the prediction returned by the per-bit context-map
+    /// mixer chain (modelPrediction's tail). `c0`, `y`, are the
+    /// current BlockData fields.
+    pub fn apm_cascade(&mut self, pr_in: i32, c0: i32, y: i32) -> i32 {
+        let s = &self.state;
+        let rate = s.rate as u32;
+        let fails = s.fails;
+        let failz = s.failz;
+        let failcount = s.failcount;
+        let stream2b = s.stream2b;
+        let stream2b_r = s.stream2b_r;
+        let stream3b_r = s.stream3b_r;
+        let ah1 = s.ah1;
+        let ah2 = s.ah2;
+        let x5 = s.x5;
+        // Drop the immutable borrow before APM mutates.
+        let _ = s;
+
+        let pu_init = (self.apm_a[0].p(pr_in, c0 as usize, 3, y, &self.strt)
+                         + 7 * pr_in + 4) >> 3;
+
+        // Compute pz after the failure-count fold.
+        let mut pz: i32 = (failcount + 1) as i32;
+        pz += TRI[((fails >> 5) & 3) as usize] as i32;
+        pz += TRJ[((fails >> 3) & 3) as usize] as i32;
+        pz += TRJ[((fails >> 1) & 3) as usize] as i32;
+        if (fails & 1) != 0 { pz += 8; }
+        pz /= 2;
+
+        let pu = self.apm_a[3].p(
+            pu_init,
+            (((c0 as u32) * 2) ^ ah1) as usize & 0x3ffff,
+            rate, y, &self.strt,
+        );
+        let pv0 = self.apm_a[1].p(
+            pr_in,
+            (((c0 as u32) * 8) ^ fxcm_hash(29, failz & 2047, 0xffff_ffff))
+                as usize & 0xffff,
+            rate + 1, y, &self.strt,
+        );
+
+        let pv = if (fails & 255) != 0 {
+            self.apm_a[4].p(
+                pv0,
+                fxcm_hash(c0 as u32, stream2b & 0xfffc, stream3b_r & 0x1ff)
+                    as usize & 0x3ffff,
+                rate, y, &self.strt,
+            )
+        } else {
+            self.apm_a[4].p(
+                pv0,
+                fxcm_hash(c0 as u32,
+                    (stream2b_r & 0xfffc).wrapping_add(0x10000),
+                    stream3b_r & 0x1ff) as usize & 0x3ffff,
+                rate, y, &self.strt,
+            )
+        };
+
+        let pt = self.apm_a[2].p(
+            pr_in,
+            (((c0 as u32) * 32) ^ ah2) as usize & 0xffff,
+            rate, y, &self.strt,
+        );
+
+        let pz_final = self.apm_a[5].p(
+            pu,
+            (((c0 as u32) * 4)
+                ^ fxcm_hash(pz.min(9) as u32, x5 & 0x80ff, 0xffff_ffff))
+                as usize & 0x3ffff,
+            rate, y, &self.strt,
+        );
+
+        if (fails & 255) != 0 {
+            (pt * 6 + pu + pv * 11 + pz_final * 14 + 31) >> 5
+        } else {
+            (pt * 4 + pu * 5 + pv * 12 + pz_final * 11 + 31) >> 5
+        }
+    }
+}
+
 impl Default for Predictor { fn default() -> Self { Self::new() } }
 
 // ====================================================================
@@ -5401,6 +5487,15 @@ mod tests {
         let p = Predictor::new();
         assert_eq!(p.predict(), 0.5);
         let _ = E; // silence unused
+    }
+
+    #[test]
+    fn apm_cascade_returns_within_pr_range() {
+        let mut p = Predictor::new();
+        // After cascade with pr=2048 (uniform), result should also be
+        // a 0..4096 prediction.
+        let out = p.apm_cascade(/*pr=*/2048, /*c0=*/1, /*y=*/0);
+        assert!(out >= 0 && out <= 4095, "apm_cascade out of range: {}", out);
     }
 
     #[test]
