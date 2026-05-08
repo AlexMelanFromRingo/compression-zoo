@@ -189,15 +189,25 @@ Method IDs (community-aligned):
 - The user accepts terse Russian and English; prefers fewer
   follow-up questions, more autonomous progress on long arcs.
 
-## Suggested ordering for next session
+## Plan (priority order chosen 2026-05-08 by user)
 
-1. **ZPAQ Compiler + preprocessor.** Lifts encode from "store + 3
+1. **Investigate GPU acceleration paths.** Map each algorithm in
+   bsc-rs / zpaq-rs / sevenz-rs to "parallel-friendly" vs
+   "inherently sequential". Identify highest-leverage targets
+   (likely: parallel byte histogram, suffix-array construction,
+   E8E9, multi-block ZPAQ decode). Land a design doc + a small
+   CUDA PoC for a representative kernel.
+2. **ZPAQ Compiler + preprocessor.** Lifts encode from "store + 3
    canned models" to "any libzpaq method string". Compiler is ~500
    lines of recursive-descent over `opcodelist`; LZ77/BWT/E8E9 are
-   another ~1K lines. After this `compressBlock(method)` is reachable.
-2. **CMIX-rs.** Start only if explicitly asked. Multi-session.
-3. *(optional)* libsais cache-aware optimisations (currently the
-   SA-IS port is the unoptimised reference, ~2-3× slower than libsais).
+   another ~1K lines. After this `compressBlock(method)` is
+   reachable.
+3. **libsais cache-aware optimisations.** Expected ~2-3× speedup on
+   top of the current Nong-2009 reference SA-IS in
+   `bsc-rs/src/sais.rs`.
+4. **CMIX-rs.** Multi-session per the original handoff. Start from
+   `predictor.cpp` (per-byte mix entry) and bisect against the
+   upstream binary. ~30 K lines of intricate C++ — multi-week.
 
 ## Tests at handoff
 

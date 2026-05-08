@@ -5,4 +5,5 @@ members = [
     "bsc-rs",
     "zpaq-rs",
     "cmix-rs",
+    "gpu-rs",
 ]

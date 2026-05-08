@@ -1,0 +1,19 @@
+[package]
+name = "gpu-rs"
+version = "0.0.1"
+edition = "2021"
+description = "CUDA kernels for compression-zoo (byte histogram, etc.)"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# When enabled, build.rs always links the CUDA kernels even if nvcc
+# is missing. Off by default — the workspace must build on hosts
+# without CUDA.
+required = []
+
+[[bin]]
+name = "histogram_bench"
+path = "src/bin/histogram_bench.rs"
