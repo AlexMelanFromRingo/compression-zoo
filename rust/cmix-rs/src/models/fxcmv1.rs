@@ -5631,6 +5631,51 @@ impl Predictor {
     }
 }
 
+impl Predictor {
+    /// Final mixer chain — fxcmv1.cpp:4744-4755. Runs mixers
+    /// 0..=9 to populate `mx_inputs2`, then runs the two final
+    /// mixers (10 and 11) and returns the squashed
+    /// `(mxA[10].p1()*7 + mxA[11].p1() + 4) >> 3`. Caller stores
+    /// the result into `state.pr`.
+    ///
+    /// Wired BEFORE this is called: `mx_inputs1` populated by
+    /// `mix_byte_context_maps`, mixer contexts assigned by
+    /// `set_mixer_contexts`. Upstream also pushes the LSTM byte
+    /// model's stretched prediction into `mx_inputs2`; that signal
+    /// isn't ported yet so we substitute zero (a no-op for the
+    /// final logit sum).
+    pub fn final_mixer_prediction(&mut self) -> i32 {
+        // Connect the per-mixer input vector. Upstream's setTxWx
+        // wires the first 10 mixers to mxInputs1.n; mixers 10, 11
+        // wire to mxInputs2.n. Our `set_inputs` copies the slice in.
+        let inputs1 = self.block.mx_inputs1.n[..self.block.mx_inputs1.ncount].to_vec();
+        for i in 0..=9 {
+            self.mixers[i].set_inputs(&inputs1);
+        }
+
+        // Reset mxInputs2 and push the LSTM-stretched prior (we're
+        // missing that signal, push 0 as the placeholder).
+        self.block.mx_inputs2.reset();
+        self.block.mx_inputs2.add(0);
+        // Push mxA[0..=9].p1() into mxInputs2.
+        for i in 0..=9 {
+            let p = self.mixers[i].p1(&self.sqt) as i16;
+            self.block.mx_inputs2.add(p.clamp(-2047, 2047));
+        }
+        // Upstream also adds `stretch(lstmpr) / 2`; substitute 0.
+        self.block.mx_inputs2.add(0);
+
+        // Wire mixers 10 and 11 to mx_inputs2.
+        let inputs2 = self.block.mx_inputs2.n[..self.block.mx_inputs2.ncount].to_vec();
+        self.mixers[10].set_inputs(&inputs2);
+        self.mixers[11].set_inputs(&inputs2);
+
+        let p10 = self.mixers[10].p1(&self.sqt);
+        let p11 = self.mixers[11].p1(&self.sqt);
+        squash(&self.sqt, (p10 * 7 + p11 + 4) >> 3)
+    }
+}
+
 impl Default for Predictor { fn default() -> Self { Self::new() } }
 
 // ====================================================================
@@ -5700,6 +5745,18 @@ mod tests {
         let p = Predictor::new();
         assert_eq!(p.predict(), 0.5);
         let _ = E; // silence unused
+    }
+
+    #[test]
+    fn final_mixer_prediction_returns_a_squashed_pr() {
+        let mut p = Predictor::new();
+        // Mix once so the first 9 mixer inputs are populated.
+        let _ = p.mix_byte_context_maps();
+        // Set mixer contexts so they're in-bounds.
+        p.set_mixer_contexts(/*c0_b=*/0xC0, /*is_match=*/0);
+        let pr = p.final_mixer_prediction();
+        assert!(pr >= 0 && pr <= 4095,
+            "final mixer pr out of range: {}", pr);
     }
 
     #[test]
