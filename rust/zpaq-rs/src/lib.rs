@@ -22,12 +22,14 @@
 #![forbid(unsafe_code)]
 
 pub mod arith;
+pub mod compiler;
 pub mod compress;
 pub mod decompress;
 pub mod format;
 pub mod io;
 pub mod models;
 pub mod predictor;
+pub mod preproc;
 pub mod predictor_tables;
 pub mod sha1;
 pub mod state_table;

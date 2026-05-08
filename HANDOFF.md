@@ -78,7 +78,7 @@ Remaining work (low priority):
   passes). The current SA-IS is the unoptimised reference Nong 2009
   paper — correct but ~2-3× slower than libsais proper.
 
-### `zpaq-rs` — decompress 0–5 + encode (stored + canned models 1/2/3)
+### `zpaq-rs` — decompress 0–5 + encode (stored, canned, *and* compiled configs)
 
 Files:
 ```
@@ -92,7 +92,9 @@ rust/zpaq-rs/src/
   predictor_tables.rs       ← squash/stretch/dt/dt2k tables
   state_table.rs            ← SNS[1024] next-state table
   decompress.rs             ← top-level decompress + PostProcessor
-  compress.rs               ← Compresser (stored + modeled), 4 unit tests
+  compress.rs               ← Compresser (stored + modeled + PCOMP)
+  compiler.rs               ← config-string → header bytecode (272-opcode tbl)
+  preproc.rs                ← E8E9 forward + inverse (CALL/JMP rel→abs)
   models.rs                 ← canned min/mid/max headers from upstream
   bin/zpaq_decompress.rs    ← decompress CLI
   bin/zpaq_compress.rs      ← compress CLI (methods 0=store, 1=min, 2=mid, 3=max)
@@ -100,7 +102,7 @@ rust/zpaq-rs/src/
 ```
 
 Test results:
-- 27 unit tests pass.
+- 37 unit tests pass.
 - Decompress end-to-end vs `/tmp/zpaq_make`:
   ```
   ok  m0..m5            — all fixtures (incl. random 1KB and 100KB)
@@ -137,11 +139,14 @@ Bugs fixed historically (don't re-introduce):
    `cxt+m ≤ cm.size()`. (This was the "method 4/5" bug.)
 
 Remaining zpaq-rs work:
-- Compiler — parse libzpaq config strings (`x4,3,1c0,0,255i1...`) to
-  bytecode. Without it we can compress with stored mode and the three
-  canned headers, but not arbitrary method strings.
-- Preprocessing (LZ77 / BWT / E8E9) — needed to match upstream's
-  default high-compression methods which run a PCOMP-driven preproc.
+- `makeConfig` — expand `"x4,3,..."` method strings into the full
+  ZPAQL config strings consumed by `compiler::compile`. Upstream
+  generates rich PCOMP programs (LZ77 decoders, BWT post-proc) per
+  level. Once `makeConfig` lands the high-level `compress(method)`
+  API can drive any libzpaq level.
+- LZ77 forward search (`LZBuffer` class) — the matching front-end
+  the upstream encoder uses for levels with `args[1] in {1,2,3,5,
+  6,7}`. Hash table + suffix-array variants. Significant work.
 - JIT path (intentionally skipped — interpret-only is fine).
 - More archive-format tests (multi-block, multi-segment).
 
@@ -191,17 +196,13 @@ Method IDs (community-aligned):
 
 ## Plan (priority order chosen 2026-05-08 by user)
 
-1. **Investigate GPU acceleration paths.** Map each algorithm in
-   bsc-rs / zpaq-rs / sevenz-rs to "parallel-friendly" vs
-   "inherently sequential". Identify highest-leverage targets
-   (likely: parallel byte histogram, suffix-array construction,
-   E8E9, multi-block ZPAQ decode). Land a design doc + a small
-   CUDA PoC for a representative kernel.
-2. **ZPAQ Compiler + preprocessor.** Lifts encode from "store + 3
-   canned models" to "any libzpaq method string". Compiler is ~500
-   lines of recursive-descent over `opcodelist`; LZ77/BWT/E8E9 are
-   another ~1K lines. After this `compressBlock(method)` is
-   reachable.
+1. ✅ **Investigate GPU acceleration paths** — `gpu-rs` crate +
+   design doc + histogram PoC landed.
+2. **ZPAQ Compiler + preprocessor** — Compiler + E8E9 landed. The
+   remaining piece is `makeConfig` (method-string expander) and
+   `LZBuffer` (LZ77 forward search). Without those, compress works
+   for any *config string* but not yet for `"x4,3,..."` style
+   method strings as upstream does.
 3. **libsais cache-aware optimisations.** Expected ~2-3× speedup on
    top of the current Nong-2009 reference SA-IS in
    `bsc-rs/src/sais.rs`.

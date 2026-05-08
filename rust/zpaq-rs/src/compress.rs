@@ -235,13 +235,44 @@ impl<W: Writer> Compresser<W> {
             // Modeled mode: the PostProcessor mode marker is the
             // first byte of the encoded stream.
             self.encode_byte(0);
-            // Stored-mode store_byte writes through `stored_buf`; the
-            // marker is the first body byte either way.
         } else {
             // Stored mode: the marker is the first byte of the
             // length-prefixed body stream.
             self.write_stored(0);
         }
+        self.state = State::SegBody;
+        Ok(())
+    }
+
+    /// Declare the post-processor as PROG (mode marker 1) with the
+    /// given PCOMP bytecode. After decoding, every byte is fed
+    /// through the PCOMP ZPAQL VM, whose OUT bytes flow to the
+    /// archive consumer. Mirror of upstream's `postProcess(pcomp, len)`.
+    ///
+    /// `pcomp` should be the raw bytecode from
+    /// [`crate::compiler::CompiledConfig::pcomp`] (without any
+    /// trailing 0 framing — we add that here).
+    pub fn post_process_prog(&mut self, pcomp: &[u8]) -> Result<(), CompressError> {
+        if self.state != State::SegPre { return Err(CompressError::InvalidState); }
+        if self.n == 0 {
+            // upstream forbids stored-mode + PCOMP.
+            return Err(CompressError::InvalidState);
+        }
+        // Wire format: 1 (PROG marker), len_lo, len_hi, pcomp[0..len].
+        // upstream's pcomp_len excludes the trailing 0 we added in the
+        // Compiler — strip it back off here so the decoder gets the
+        // exact byte count it expects.
+        let body: &[u8] = if pcomp.last() == Some(&0) {
+            &pcomp[..pcomp.len() - 1]
+        } else {
+            pcomp
+        };
+        let len = body.len();
+        if len > 0xFFFF { return Err(CompressError::InvalidState); }
+        self.encode_byte(1);
+        self.encode_byte((len & 0xFF) as u8);
+        self.encode_byte(((len >> 8) & 0xFF) as u8);
+        for &b in body { self.encode_byte(b); }
         self.state = State::SegBody;
         Ok(())
     }
@@ -347,6 +378,21 @@ pub fn compress_stored<W: Writer>(
     Ok(c.into_inner())
 }
 
+/// Convenience: compile a config string and encode `data` against
+/// the resulting header in one call. PASS post-processor only —
+/// callers that need PCOMP should drive `Compresser` manually.
+pub fn compress_with_config<W: Writer>(
+    out: W,
+    data: &[u8],
+    config: &str,
+    filename: &[u8],
+    comment: &[u8],
+) -> Result<W, CompressError> {
+    let cc = crate::compiler::compile(config)
+        .map_err(|_| CompressError::InvalidHeader)?;
+    compress_modeled(out, data, &cc.header, filename, comment)
+}
+
 /// Convenience: wrap a modeled-mode round-trip into one call.
 pub fn compress_modeled<W: Writer>(
     out: W,
@@ -391,6 +437,27 @@ mod tests {
         let mut w = VecWriter::new();
         decompress(&mut r, &mut w).unwrap();
         assert_eq!(w.into_inner(), b"");
+    }
+
+    /// End-to-end: compile a custom config, encode, decode (Rust),
+    /// verify round-trip.
+    #[test]
+    fn config_string_round_trip_min_cfg() {
+        let cfg = r#"
+            comp 1 2 0 0 2
+              0 icm 16
+              1 isse 19 0
+            hcomp
+              *b=a a=0 d=0 hash b-- hash *d=a d++ b-- hash b-- hash *d=a halt
+            post 0 end
+        "#;
+        let inp = b"The quick brown fox jumps over the lazy dog. ".repeat(20);
+        let out = compress_with_config(VecWriter::new(), &inp, cfg, b"", b"").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
     }
 
     #[test]
