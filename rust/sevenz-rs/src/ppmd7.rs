@@ -1059,7 +1059,7 @@ impl<'a> Ppmd7Decoder<'a> {
                 count_sub = count_sub.wrapping_sub(f);
                 if (count_sub as i32) < 0 {
                     let sym = st_symbol(&p.base, s);
-                    let start = (hi_cnt - count_sub).wrapping_sub(f);
+                    let start = hi_cnt.wrapping_sub(count_sub).wrapping_sub(f);
                     r.decode_final(start, f);
                     p.found_state = s;
                     p.update1();

@@ -364,6 +364,145 @@ pub fn compress_stored<W: Writer>(
     Ok(c.into_inner())
 }
 
+/// Expand a digit-style method ("0", "5", "5,128,1,2", …) into the
+/// canonical `"x..."` (or `"0..."`) form upstream's `compressBlock`
+/// would produce. Mirrors libzpaq.cpp:7556-7689 verbatim.
+///
+/// `data` is the input being compressed — used both to derive the
+/// block-size argument and (for level 5..=9) to detect periodic
+/// patterns and add matching context-map components.
+pub fn expand_digit_method(method: &str, data: &[u8]) -> Option<String> {
+    let bytes = method.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_digit() { return None; }
+    let level: i32 = (bytes[0] - b'0') as i32;
+    if !(0..=9).contains(&level) { return None; }
+
+    // Parse trailing comma-separated args (up to 4): arg[0..=3].
+    let mut commas = 0usize;
+    let mut arg = [0i32; 4];
+    let mut i = 1;
+    while i < bytes.len() && commas < 4 {
+        let c = bytes[i];
+        if c == b',' || c == b'.' { commas += 1; }
+        else if c.is_ascii_digit() { arg[commas] = arg[commas] * 10 + (c - b'0') as i32; }
+        i += 1;
+    }
+
+    let n = data.len();
+    let arg0 = lg_block_size(n);
+    // type=512 if no commas; otherwise R*4 + t (where R=arg[1], t=arg[2]).
+    let typ: i32 = if commas == 0 { 512 } else { arg[1] * 4 + arg[2] };
+
+    // Stored: "0<arg0>,0".
+    if level == 0 { return Some(format!("0{},0", arg0)); }
+
+    let doe8: i32 = (typ & 2) * 2;       // E8E9 enable bit (0 or 4).
+    let mut out = format!("x{}", arg0);
+    let htsz = format!(",{}", 19 + arg0 + (if arg0 <= 6 { 1 } else { 0 }));
+    let sasz = format!(",{}", 21 + arg0);
+
+    match level {
+        1 => {
+            if typ < 40 { out.push_str(",0"); }
+            else {
+                out.push_str(&format!(",{},", 1 + doe8));
+                if      typ < 80  { out.push_str("4,0,1,15"); }
+                else if typ < 128 { out.push_str("4,0,2,16"); }
+                else if typ < 256 { out.push_str(&format!("4,0,2{}", htsz)); }
+                else if typ < 960 { out.push_str(&format!("5,0,3{}", htsz)); }
+                else              { out.push_str(&format!("6,0,3{}", htsz)); }
+            }
+        }
+        2 => {
+            if typ < 32 { out.push_str(",0"); }
+            else {
+                out.push_str(&format!(",{},", 1 + doe8));
+                if typ < 64 { out.push_str(&format!("4,0,3{}", htsz)); }
+                else        { out.push_str(&format!("4,0,7{},1", sasz)); }
+            }
+        }
+        3 => {
+            if typ < 20 { out.push_str(",0"); }
+            else if typ < 48 {
+                out.push_str(&format!(",{},4,0,3{}", 1 + doe8, htsz));
+            } else if typ >= 640 || (typ & 1) != 0 {
+                out.push_str(&format!(",{}ci1", 3 + doe8));
+            } else {
+                out.push_str(&format!(",{},12,0,7{},1c0,0,511i2", 2 + doe8, sasz));
+            }
+        }
+        4 => {
+            if typ < 12 { out.push_str(",0"); }
+            else if typ < 24 {
+                out.push_str(&format!(",{},4,0,3{}", 1 + doe8, htsz));
+            } else if typ < 48 {
+                out.push_str(&format!(",{},5,0,7{}1c0,0,511", 2 + doe8, sasz));
+            } else if typ < 900 {
+                out.push_str(&format!(",{}ci1,1,1,1,2a", doe8));
+                if (typ & 1) != 0 { out.push('w'); }
+                out.push('m');
+            } else {
+                out.push_str(&format!(",{}ci1", 3 + doe8));
+            }
+        }
+        5..=9 => {
+            // Slow CM with lots of models.
+            out.push_str(&format!(",{}", doe8));
+            if (typ & 1) != 0 { out.push_str("w2c0,1010,255i1"); }
+            else              { out.push_str("w1i1"); }
+            out.push_str("c256ci1,1,1,1,1,1,2a");
+
+            // Periodic-model analysis: for each byte, count gap to its
+            // previous occurrence; pick the two strongest gaps and add
+            // matching context-map components.
+            const NR: usize = 1 << 12;
+            let mut pt = [0i32; 256];
+            let mut r = vec![0i32; NR];
+            for (i, &b) in data.iter().enumerate() {
+                let k = i as i32 - pt[b as usize];
+                if k > 0 && (k as usize) < NR { r[k as usize] += 1; }
+                pt[b as usize] = i as i32;
+            }
+            let mut n1 = n as i32 - r[1] - r[2] - r[3];
+            for _ in 0..2 {
+                let mut period = 0i32;
+                let mut score = 0.0f64;
+                let mut t = 0i32;
+                for j in 5..NR {
+                    if t >= n1 { break; }
+                    let s = r[j] as f64 / (256.0 + (n1 - t) as f64);
+                    if s > score { score = s; period = j as i32; }
+                    t += r[j];
+                }
+                if period > 4 && score > 0.1 {
+                    out.push_str(&format!("c0,0,{},255i1", 999 + period));
+                    if period <= 255 {
+                        out.push_str(&format!("c0,{}i1", period));
+                    }
+                    n1 -= r[period as usize];
+                    r[period as usize] = 0;
+                } else { break; }
+            }
+            out.push_str("c0,2,0,255i1c0,3,0,0,255i1c0,4,0,0,0,255i1mm16ts19t0");
+        }
+        _ => return None,
+    }
+
+    Some(out)
+}
+
+/// `MAX(lg(n+4095) - 20, 0)` — upstream's block-size argument
+/// computation. `lg` is the upstream "round-up log2" so e.g.
+/// `lg(1) = 1`, `lg(2) = 1`, `lg(3) = 2`, `lg(4) = 2`, `lg(5) = 3`.
+fn lg_block_size(n: usize) -> i32 {
+    let v = (n as u64).saturating_add(4095);
+    if v <= 1 { return 0; }
+    let mut log = 0i32;
+    let mut x = v - 1;
+    while x > 0 { log += 1; x >>= 1; }
+    (log - 20).max(0)
+}
+
 /// Convenience: compile a config string and encode `data` against
 /// the resulting header in one call. PASS post-processor only —
 /// callers that need PCOMP should drive `Compresser` manually.
@@ -400,15 +539,21 @@ pub fn compress_method<W: Writer>(
     data: &[u8],
     method: &str,
 ) -> Result<W, CompressError> {
-    // Resolve digit-method aliases up-front so the rest of the
-    // function works on a single canonical "x..." form.
-    let resolved: &str = match method {
-        "1" => "x4,1,4",
-        "2" => "x4,2,4",
-        "3" => "x4,3",
-        other => other,
+    // Expand digit-method strings (e.g. "5", "5,B,R,t") into the
+    // canonical "x..." form, mirroring upstream's `compressBlock`
+    // type-inference at libzpaq.cpp:7556-7689. Plain "0" keeps the
+    // dedicated stored-mode fast path below.
+    let expanded;
+    let method: &str = if !method.is_empty()
+        && method.as_bytes()[0].is_ascii_digit()
+        && method != "0"
+    {
+        expanded = expand_digit_method(method, data)
+            .ok_or(CompressError::InvalidHeader)?;
+        &expanded
+    } else {
+        method
     };
-    let method = resolved;
 
     let mut c = Compresser::new(out);
     c.write_tag()?;
@@ -586,6 +731,126 @@ mod tests {
 
     /// Digit-method aliases ("1", "2", "3") should resolve to the
     /// same `"x4,..."` paths and round-trip identically.
+    #[test]
+    #[test]
+    fn expand_digit_method_zero_stored() {
+        // Level 0 → "0<arg0>,0" with arg0 derived from n.
+        let exp = expand_digit_method("0", &vec![0u8; 100]).unwrap();
+        assert_eq!(exp, "00,0");
+    }
+
+    #[test]
+    fn expand_digit_method_no_commas_uses_type_512() {
+        // "1" with no commas → type=512 → falls into the `else if
+        // type<960` arm at level 1: "x<arg0>,1,5,0,3<htsz>".
+        let exp = expand_digit_method("1", &vec![0u8; 100]).unwrap();
+        assert_eq!(exp, "x0,1,5,0,3,20");
+    }
+
+    #[test]
+    fn expand_digit_method_level2_with_explicit_args() {
+        // Upstream's digit format is "LB,R,t": L=level digit, then B
+        // is one or more digits glued onto the level (arg[0]),
+        // followed by R (arg[1]) and t (arg[2]) after commas. Type
+        // is `R*4 + t`.
+        //
+        // "20,0,0" → arg=[0,0,0,0], type=0 → type<32 → just ",0".
+        let exp = expand_digit_method("20,0,0", &vec![0u8; 100]).unwrap();
+        assert_eq!(exp, "x0,0");
+        // "20,128,1" → arg=[0,128,1,0], type=128*4+1=513.
+        // type≥64 → "4,0,7<sasz>,1".
+        let exp = expand_digit_method("20,128,1", &vec![0u8; 100]).unwrap();
+        // doe8 = (513&2)*2 = 0; sasz = ",21" for arg0=0.
+        assert_eq!(exp, "x0,1,4,0,7,21,1");
+    }
+
+    #[test]
+    fn expand_digit_method_level3_default_text_branch() {
+        // "3" with no commas → type=512. Level 3 with type=512 ≥ 256
+        // takes the `else` branch (LZ77+CM), not the BWT branch.
+        let exp = expand_digit_method("3", &vec![0u8; 100]).unwrap();
+        // 1+doe8 where doe8 = (512&2)*2 = 0. Followed by ",2,12,0,7,21,1c0,0,511i2".
+        assert!(exp.contains("c0,0,511i2"),
+            "expected level-3 LZ77+CM expansion, got {}", exp);
+    }
+
+    #[test]
+    fn expand_digit_method_level5_includes_periodic_models() {
+        // Build a periodic input (period 7, 1024 bytes).
+        let data: Vec<u8> = (0..1024).map(|i| (i % 7) as u8).collect();
+        let exp = expand_digit_method("5", &data).unwrap();
+        // Should include the periodic model component
+        // `c0,0,<999+period>,255i1`. With period=7 → "c0,0,1006,255i1".
+        assert!(exp.contains("c0,0,1006,255i1") || exp.contains("c0,0,100"),
+            "expected periodic model in: {}", exp);
+        // Trailing tail is fixed.
+        assert!(exp.ends_with("c0,2,0,255i1c0,3,0,0,255i1c0,4,0,0,0,255i1mm16ts19t0"),
+            "missing fixed tail in: {}", exp);
+    }
+
+    #[test]
+    fn compress_method_level1_round_trip() {
+        // Level 1 with default type=512 → BWT-less LZ77 path.
+        let inp: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
+        let out = compress_method(VecWriter::new(), &inp, "1").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
+    }
+
+    #[test]
+    fn compress_method_level3_round_trip() {
+        // Level 3 with default type=512 takes the LZ77+CM branch
+        // (`,2,12,0,7<sasz>,1c0,0,511i2`).
+        let inp: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
+        let out = compress_method(VecWriter::new(), &inp, "3").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
+    }
+
+    #[test]
+    fn compress_method_level5_round_trip() {
+        // Level 5..9 share the slow-CM branch — periodic-model
+        // analysis + a long fixed component tail. Round-trip a small
+        // periodic input to exercise the path.
+        let inp: Vec<u8> = (0..1024).map(|i| (i % 7) as u8).collect();
+        let out = compress_method(VecWriter::new(), &inp, "5").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
+    }
+
+    #[test]
+    fn compress_method_level4_round_trip() {
+        // Level 4 with default type=512 (≥900) → ",3ci1" — BWT with
+        // CM+ISSE component spec, exercised end-to-end.
+        let inp: Vec<u8> = (0..2000).map(|i| (i % 251) as u8).collect();
+        let out = compress_method(VecWriter::new(), &inp, "4").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
+    }
+
+    #[test]
+    fn expand_digit_method_lg_block_size_scales_with_input() {
+        // n < 1MB → arg0 = 0; n in [1MB, 2MB) → arg0 = 1; etc.
+        let small  = expand_digit_method("0", &vec![0u8; 100]).unwrap();
+        let medium = expand_digit_method("0", &vec![0u8; 1 << 20]).unwrap();
+        assert_eq!(small,  "00,0");
+        // 1 MiB → block-size argument = 1 (or higher).
+        assert!(medium.starts_with("01,") || medium.starts_with("02,"),
+            "expected medium arg0 ≥ 1, got {}", medium);
+    }
+
     #[test]
     fn compress_method_digit_aliases() {
         let inp = b"the quick brown fox jumps over the lazy dog. ".repeat(20);
