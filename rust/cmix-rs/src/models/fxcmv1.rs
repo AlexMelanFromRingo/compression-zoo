@@ -4079,6 +4079,39 @@ impl FxcmState {
         }
     }
 
+    /// UTF-8 byte-stream tracker — fxcmv1.cpp:4310-4321. When the
+    /// previous c2 was the upstream ESCAPE marker (12), interpret
+    /// the next bytes as a UTF-8 sequence:
+    ///   * `0b110xxxxx` (>>5 == 6) → 2-byte sequence (1 left).
+    ///   * `0b1110xxxx` (>>4 == 0xE) → 3-byte sequence (2 left).
+    ///   * `0b11110xxx` (>>3 == 0x1E) → 4-byte sequence (3 left).
+    ///   * Anything else → ASCII or error.
+    /// Continuation bytes must match `0b10xxxxxx` (>>6 == 2);
+    /// otherwise the run is aborted.
+    ///
+    /// Folds each in-sequence byte into `u8w` via `u8w*191 + c1`.
+    pub fn track_utf8_byte(&mut self) {
+        if self.c2 != ESCAPE_CHR { return; }
+        if self.utf8_left == 0 {
+            let c1 = self.c1;
+            if (c1 >> 5) == 6 {
+                self.utf8_left = 1;
+                self.u8w = self.u8w.wrapping_mul(191).wrapping_add(c1 as u32);
+            } else if (c1 >> 4) == 0xE {
+                self.utf8_left = 2;
+                self.u8w = self.u8w.wrapping_mul(191).wrapping_add(c1 as u32);
+            } else if (c1 >> 3) == 0x1E {
+                self.utf8_left = 3;
+                self.u8w = self.u8w.wrapping_mul(191).wrapping_add(c1 as u32);
+            } else {
+                self.utf8_left = 0;
+            }
+        } else {
+            self.utf8_left -= 1;
+            if (self.c1 >> 6) != 2 { self.utf8_left = 0; }
+        }
+    }
+
     /// Indirect-byte / indirect-word rolling histories — port of
     /// fxcmv1.cpp:4290-4299. Updates:
     ///
@@ -4916,6 +4949,46 @@ mod tests {
         s.sen_word = 999;
         s.update_streams_for_word_type(&w, /*is_paragraph=*/true);
         assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn track_utf8_starts_two_byte_sequence() {
+        let mut s = FxcmState::new();
+        s.c2 = ESCAPE_CHR;
+        s.c1 = 0xC2;  // 11000010 → 2-byte start.
+        s.track_utf8_byte();
+        assert_eq!(s.utf8_left, 1);
+        assert!(s.u8w != 0);
+    }
+
+    #[test]
+    fn track_utf8_continues_then_resets() {
+        let mut s = FxcmState::new();
+        s.c2 = ESCAPE_CHR;
+        s.c1 = 0xE0; s.track_utf8_byte();          // 3-byte sequence start.
+        assert_eq!(s.utf8_left, 2);
+        s.c1 = 0xA4; s.track_utf8_byte();          // continuation.
+        assert_eq!(s.utf8_left, 1);
+        s.c1 = 0xB8; s.track_utf8_byte();          // continuation.
+        assert_eq!(s.utf8_left, 0);
+    }
+
+    #[test]
+    fn track_utf8_aborts_on_non_continuation() {
+        let mut s = FxcmState::new();
+        s.c2 = ESCAPE_CHR;
+        s.c1 = 0xE0; s.track_utf8_byte();          // 3-byte start.
+        s.c1 = 0x41; s.track_utf8_byte();          // ASCII 'A' — not continuation.
+        assert_eq!(s.utf8_left, 0);
+    }
+
+    #[test]
+    fn track_utf8_skips_when_no_escape() {
+        let mut s = FxcmState::new();
+        s.c2 = b'x';
+        s.c1 = 0xC2;
+        s.track_utf8_byte();
+        assert_eq!(s.utf8_left, 0, "non-ESCAPE c2 must be a no-op");
     }
 
     #[test]
