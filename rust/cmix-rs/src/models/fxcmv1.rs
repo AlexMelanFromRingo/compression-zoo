@@ -2003,6 +2003,151 @@ pub fn char_swap(c: i32) -> i32 {
 }
 
 // ====================================================================
+// `Word` — small fixed-buffer letter sequence with comparison /
+// suffix-edit helpers used by the Porter2 stemmer.
+// ====================================================================
+
+pub const MAX_WORD_SIZE: usize = 64;
+
+/// Bit flags used for word type classification (matches upstream
+/// `EngWordTypeFlags`).
+pub mod eng {
+    pub const VERB:                  u32 = 1 << 0;
+    pub const NOUN:                  u32 = 1 << 1;
+    pub const ADJECTIVE:             u32 = 1 << 2;
+    pub const PLURAL:                u32 = 1 << 3;
+    pub const PAST_TENSE:            u32 = (1 << 5) | VERB;
+    pub const PRESENT_PARTICIPLE:    u32 = (1 << 4) | VERB;
+    pub const ADJECTIVE_SUPERLATIVE: u32 = (1 << 5) | ADJECTIVE;
+    pub const ADJECTIVE_WITHOUT:     u32 = (1 << 6) | ADJECTIVE;
+    pub const ADJECTIVE_FULL:        u32 = (1 << 7) | ADJECTIVE;
+    pub const ADVERB_OF_MANNER:      u32 = 1 << 8;
+    pub const SUFFIX:                u32 = 1 << 9;
+    pub const PREFIX:                u32 = 1 << 10;
+    pub const MALE:                  u32 = 1 << 11;
+    pub const FEMALE:                u32 = 1 << 13;
+    pub const ARTICLE:               u32 = 1 << 14;
+    pub const CONJUNCTION:           u32 = 1 << 15;
+    pub const ADPOSITION:            u32 = 1 << 16;
+    pub const NUMBER:                u32 = 1 << 17;
+    pub const PREPOSITION:           u32 = 1 << 18;
+    pub const CONJUNCTIVE_ADVERB:    u32 = 1 << 19;
+}
+
+#[derive(Clone)]
+pub struct Word {
+    pub letters: [u8; MAX_WORD_SIZE],
+    pub start: u8,
+    pub end: u8,
+    pub hash: u32,
+    pub r#type: u32,
+    pub suffix: u32,
+    pub prefix: u32,
+}
+
+impl Word {
+    pub fn new() -> Self {
+        Self {
+            letters: [0; MAX_WORD_SIZE],
+            start: 0, end: 0,
+            hash: 0, r#type: 0, suffix: 0, prefix: 0,
+        }
+    }
+
+    pub fn equals_str(&self, s: &[u8]) -> bool {
+        let len = s.len();
+        let extra = if self.letters[self.start as usize] != 0 { 1 } else { 0 };
+        let cur_len = (self.end as usize - self.start as usize + extra) as usize;
+        if cur_len != len { return false; }
+        let st = self.start as usize;
+        self.letters[st..st + len] == *s
+    }
+
+    /// Append `c` to the end of the word (no-op if zero or full).
+    pub fn append(&mut self, c: u8) {
+        if c > 0 && (self.end as usize) < MAX_WORD_SIZE - 1 {
+            if self.letters[self.end as usize] > 0 { self.end += 1; }
+            self.letters[self.end as usize] = c;
+        }
+    }
+
+    /// Letter at offset `i` from `Start` (returns 0 if out of range).
+    pub fn at(&self, i: u8) -> u8 {
+        if self.end >= self.start && (self.end - self.start) >= i {
+            self.letters[(self.start + i) as usize]
+        } else { 0 }
+    }
+    /// Letter at offset `i` from `End` (returns 0 if out of range).
+    pub fn from_end(&self, i: u8) -> u8 {
+        if self.end >= self.start && (self.end - self.start) >= i {
+            self.letters[(self.end - i) as usize]
+        } else { 0 }
+    }
+
+    pub fn len(&self) -> u32 {
+        if self.letters[self.start as usize] != 0 {
+            (self.end - self.start + 1) as u32
+        } else { 0 }
+    }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Replace `old_suffix` (if present) with `new_suffix`. Returns
+    /// true if the swap happened.
+    pub fn change_suffix(&mut self, old_suffix: &[u8], new_suffix: &[u8]) -> bool {
+        let len = old_suffix.len();
+        if (self.len() as usize) <= len { return false; }
+        let start = self.end as usize - len + 1;
+        if &self.letters[start..start + len] != old_suffix { return false; }
+        if !new_suffix.is_empty() {
+            let n = new_suffix.len();
+            let cap = MAX_WORD_SIZE - 1;
+            let new_end = (self.end as usize + n - len).min(cap);
+            let copy_n = (new_end + 1).saturating_sub(start).min(n);
+            for i in 0..copy_n { self.letters[start + i] = new_suffix[i]; }
+            self.end = new_end as u8;
+        } else {
+            self.end -= len as u8;
+        }
+        true
+    }
+
+    pub fn matches_any(&self, list: &[&[u8]]) -> bool {
+        let len = self.len() as usize;
+        for &cand in list {
+            if cand.len() != len { continue; }
+            let st = self.start as usize;
+            if &self.letters[st..st + len] == cand { return true; }
+        }
+        false
+    }
+
+    pub fn ends_with(&self, suffix: &[u8]) -> bool {
+        let len = suffix.len();
+        if (self.len() as usize) <= len { return false; }
+        let start = self.end as usize - len + 1;
+        &self.letters[start..start + len] == suffix
+    }
+
+    pub fn starts_with(&self, prefix: &[u8]) -> bool {
+        let len = prefix.len();
+        if (self.len() as usize) <= len { return false; }
+        let st = self.start as usize;
+        &self.letters[st..st + len] == prefix
+    }
+}
+
+impl Default for Word { fn default() -> Self { Self::new() } }
+
+// ====================================================================
+// Stemmer reference tables (verbatim from upstream).
+// ====================================================================
+
+pub const VOWELS: &[u8] = b"aeiouy";
+pub const DOUBLES: &[u8] = b"bdfgmnprt";
+pub const LI_ENDINGS: &[u8] = b"cdeghkmnrt";
+pub const NON_SHORT_CONSONANTS: &[u8] = b"wxY";
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -2302,6 +2447,29 @@ mod tests {
         assert_eq!(v.last(), 8);
         assert_eq!(v.pop(), 8);
         assert_eq!(v.last(), 7);
+    }
+
+    #[test]
+    fn word_append_and_compare() {
+        let mut w = Word::new();
+        for c in b"hello".iter() { w.append(*c); }
+        assert_eq!(w.len(), 5);
+        assert!(w.equals_str(b"hello"));
+        assert!(w.starts_with(b"he"));
+        assert!(w.ends_with(b"lo"));
+        assert!(w.matches_any(&[b"world", b"hello", b"foo"]));
+        assert!(!w.matches_any(&[b"world", b"foo"]));
+    }
+
+    #[test]
+    fn word_change_suffix() {
+        let mut w = Word::new();
+        for c in b"running".iter() { w.append(*c); }
+        // "ing" → "ed".
+        assert!(w.change_suffix(b"ing", b"ed"));
+        assert!(w.equals_str(b"runned"));
+        // No-op when suffix doesn't match.
+        assert!(!w.change_suffix(b"xy", b"foo"));
     }
 
     #[test]
