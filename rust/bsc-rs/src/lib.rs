@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 pub mod adler32;
+pub mod format;
 // pub mod bwt;        // TODO
 // pub mod st;         // TODO
 // pub mod lzp;        // TODO
