@@ -4066,6 +4066,69 @@ impl FxcmState {
         }
     }
 
+    /// Comma handler — fxcmv1.cpp:4086-4089.
+    pub fn punct_comma(&mut self) {
+        self.words   |= 0xfc;
+        self.sen_word = 0;
+    }
+
+    /// `'('` handler — fxcmv1.cpp:4090-4092.
+    pub fn punct_open_paren(&mut self) { self.sen_word = 0; }
+
+    /// `':'` handler (link / list) — fxcmv1.cpp:4097-4102.
+    /// `c4` is the running 4-byte history (BlockData::c4).
+    pub fn punct_colon(&mut self, c4: u32) {
+        self.stream3b   = (self.stream3b   & 0xffff_fff8).wrapping_add(4);
+        self.stream2b  |= 12;
+        self.x5         = (self.x5 << 8).wrapping_add(c4 & 0xff);
+        self.sen_word   = 0;
+    }
+
+    /// `'{'` / `'}'` handler — fxcmv1.cpp:4103-4109.
+    pub fn punct_curly(&mut self, c4: u32) {
+        self.words      |= 0xfc;
+        self.stream3b_r &= 0xffff_ffc0;
+        self.x5         = (self.x5 << 8).wrapping_add(c4 & 0xff);
+        self.stream3b   = (self.stream3b & 0xffff_fff8).wrapping_add(3);
+    }
+
+    /// `']'` handler — fxcmv1.cpp:4110-4114. (`'['` opens a wiki link
+    /// and is tracked by the BracketContext; `']'` here is the
+    /// closing-bracket sentence-effect.)
+    pub fn punct_close_square(&mut self) {
+        self.stream3b = (self.stream3b & 0xffff_fff8).wrapping_add(3);
+        self.link_word = 0;
+    }
+
+    /// `'<'` (or `'&'` predecessor) handler — fxcmv1.cpp:4116-4118.
+    pub fn punct_less_than(&mut self) { self.words |= 0xfc; }
+
+    /// `'='` heading handler — fxcmv1.cpp:4124-4129.
+    /// Note: upstream also OVERWRITES `c2` to `'.'` here; we mirror
+    /// that, but callers should treat that c2 mutation as a hint
+    /// for the per-byte arith pipeline only.
+    pub fn punct_equals(&mut self) {
+        self.stream3b = (self.stream3b & 0xffff_fff8).wrapping_add(4);
+        self.c2       = b'.';
+        self.words    = self.words.wrapping_mul(2);
+    }
+
+    /// `'&nbsp;'` shortcut — fxcmv1.cpp:4131-4136. When the previous
+    /// char was `'&'` and the current is `'!'`, upstream substitutes
+    /// the byte-pair into a single SPACE so downstream models see a
+    /// real word break. Mutates `c1` and the low byte of the
+    /// returned `c4`. Caller passes in `c4` and uses the returned
+    /// value for the rest of the byte processing.
+    pub fn punct_nbsp(&mut self, c4: u32) -> u32 {
+        self.c1       = SPACE_CHR;
+        let new_c4    = (c4 & 0xffff_ff00) | SPACE_CHR as u32;
+        self.stream2b = (self.stream2b & 0xffff_fffc)
+                         .wrapping_add(WRT_2B[SPACE_CHR as usize] as u32);
+        self.stream3b = (self.stream3b & 0xffff_fff8)
+                         .wrapping_add(WRT_3B[SPACE_CHR as usize] as u32);
+        new_c4
+    }
+
     /// 2-bit and 3-bit serial/non-repeating stream update
     /// (fxcmv1.cpp:4148-4163), run unconditionally each byte after
     /// the word/punct branches. The non-repeating accumulators
@@ -4767,6 +4830,51 @@ mod tests {
         s.sen_word = 999;
         s.update_streams_for_word_type(&w, /*is_paragraph=*/true);
         assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn punct_comma_clears_senword_and_sets_words() {
+        let mut s = FxcmState::new();
+        s.words = 0; s.sen_word = 99;
+        s.punct_comma();
+        assert_eq!(s.words & 0xfc, 0xfc);
+        assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn punct_colon_folds_streams_and_x5() {
+        let mut s = FxcmState::new();
+        s.stream3b = 0xFFFF_FFF0;  // low 3 bits = 0
+        s.stream2b = 0x0;
+        s.x5 = 0;
+        s.punct_colon(/*c4=*/0xCAFE_BABE);
+        // stream3b low 3 = 4.
+        assert_eq!(s.stream3b & 7, 4);
+        // stream2b |= 12 (binary 1100).
+        assert_eq!(s.stream2b & 0xf, 12);
+        // x5 low byte = c4 low byte.
+        assert_eq!(s.x5 & 0xff, 0xBE);
+    }
+
+    #[test]
+    fn punct_curly_folds_3b_and_3b_r() {
+        let mut s = FxcmState::new();
+        s.stream3b   = 0xFFFF_FFF0;
+        s.stream3b_r = 0xFFFF_FFFF;
+        s.punct_curly(0);
+        // stream3b low 3 = 3.
+        assert_eq!(s.stream3b & 7, 3);
+        // stream3b_r masked to 0xffffffc0.
+        assert_eq!(s.stream3b_r & 0x3f, 0);
+    }
+
+    #[test]
+    fn punct_nbsp_substitutes_to_space() {
+        let mut s = FxcmState::new();
+        s.c1 = b'!'; s.c2 = b'&';
+        let new_c4 = s.punct_nbsp(/*c4=*/0xAABBCC00 | b'!' as u32);
+        assert_eq!(s.c1, SPACE_CHR);
+        assert_eq!(new_c4 & 0xff, SPACE_CHR as u32);
     }
 
     #[test]
