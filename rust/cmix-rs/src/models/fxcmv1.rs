@@ -338,6 +338,127 @@ impl StateTable {
 impl Default for StateTable { fn default() -> Self { Self::new() } }
 
 // ====================================================================
+// `dot_product(t, w, n)` — t · w with each pair scaled down by 8 bits.
+// Mirrors upstream's scalar fallback (we don't reach for SIMD in the
+// safe-Rust port; the optimiser can vectorise the small loop).
+// `n` must be rounded up to a multiple of 8 by the caller, matching
+// upstream's `n=(n+15)&-16` contract.
+// ====================================================================
+
+#[inline]
+pub fn dot_product(t: &[i16], w: &[i16], n: usize) -> i32 {
+    let n = (n + 15) & !15;
+    let mut sum = 0i32;
+    let mut i = 0;
+    while i < n {
+        sum += ((t[i]     as i32) * (w[i]     as i32)) >> 8;
+        if i + 1 < n {
+            sum += ((t[i + 1] as i32) * (w[i + 1] as i32)) >> 8;
+        }
+        i += 2;
+    }
+    sum
+}
+
+/// Train weights `w[0..n]` against inputs `t[0..n]` and the error
+/// `err`. `w[i] += ((t[i] * 2 * err) >> 16 + 1) >> 1`, clamped to
+/// `[-32768, 32767]`.
+#[inline]
+pub fn train(t: &[i16], w: &mut [i16], n: usize, err: i32) {
+    if err == 0 { return; }
+    let n = (n + 15) & !15;
+    for i in 0..n {
+        let tv = t[i] as i32;
+        let mut wt = w[i] as i32 + (((tv * 2 * err) >> 16) + 1) / 2;
+        wt = wt.clamp(-32768, 32767);
+        w[i] = wt as i16;
+    }
+}
+
+// ====================================================================
+// `Mixer1` — two-layer logistic mixer. Holds N inputs and M context
+// rows of N i16 weights each. `add()` is implicit via the upstream
+// caller writing into `tx`; `set(cxt)` selects a row; `p()` runs the
+// dot product through `squash`; `update(y)` trains the active row.
+// ====================================================================
+
+pub struct Mixer1 {
+    pub n: usize,            // inputs per context
+    pub m: usize,            // contexts
+    /// Weights — `m * n` entries, row-major (row = context).
+    pub wx: Vec<i16>,
+    /// Inputs (caller-owned). Upstream uses a raw pointer; we hand
+    /// in a slice through `set_inputs(...)`.
+    pub tx: Vec<i16>,
+    pub cxt: usize,
+    pub pr: i32,
+    pub shift1: u32,
+    pub elim: i32,
+    pub uperr: i32,
+    pub err: i32,
+}
+
+impl Mixer1 {
+    pub fn new(n: usize, m: usize, shift1: u32, elim: i32, uperr: i32) -> Self {
+        // Upstream allocates `(N*M)+32` aligned to 32; the +32 is
+        // padding so the SSE/AVX read past the end is safe. We pad
+        // by 32 too so the rounded-up loop in `dot_product` doesn't
+        // trip.
+        let mut wx = vec![129i16; n * m + 32];
+        let _ = &mut wx;
+        Self {
+            n, m,
+            wx,
+            tx: vec![0; n + 32],
+            cxt: 0, pr: 2048,
+            shift1, elim, uperr, err: 0,
+        }
+    }
+
+    /// Replace the input vector. Caller writes in stretched logits
+    /// via `tx_mut()` (or this method).
+    pub fn set_inputs(&mut self, inputs: &[i16]) {
+        let take = inputs.len().min(self.n);
+        self.tx[..take].copy_from_slice(&inputs[..take]);
+        for v in &mut self.tx[take..self.n] { *v = 0; }
+    }
+
+    pub fn tx_mut(&mut self) -> &mut [i16] { &mut self.tx[..self.n] }
+
+    /// Adjust weights to minimise prediction error for the bit `y`.
+    pub fn update(&mut self, y: i32) {
+        let mut e = ((y << 12) - self.pr) * self.uperr / 4;
+        e = e.clamp(-32768, 32767);
+        if e >= -self.elim && e <= self.elim { e = 0; }
+        self.err = e;
+        let row_lo = self.cxt * self.n;
+        let (t, w_full) = (&self.tx[..], &mut self.wx[..]);
+        let n = self.n;
+        let row = &mut w_full[row_lo .. row_lo + n + 16];
+        train(t, row, n, e);
+    }
+
+    /// Predict the next bit as a 12-bit probability (0..4095).
+    pub fn p(&mut self, sqt: &[i16]) -> i32 {
+        debug_assert!(self.cxt < self.m);
+        let row = &self.wx[self.cxt * self.n .. self.cxt * self.n + self.n + 16];
+        let dp = (dot_product(&self.tx, row, self.n) * self.shift1 as i32) >> 11;
+        self.pr = squash(sqt, dp);
+        self.pr
+    }
+
+    /// Like `p` but also returns the un-squashed (clamped) logit.
+    pub fn p1(&mut self, sqt: &[i16]) -> i32 {
+        debug_assert!(self.cxt < self.m);
+        let row = &self.wx[self.cxt * self.n .. self.cxt * self.n + self.n + 16];
+        let mut dp = (dot_product(&self.tx, row, self.n) * self.shift1 as i32) >> 11;
+        dp = dp.clamp(-2047, 2047);
+        self.pr = squash(sqt, dp);
+        dp
+    }
+}
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -449,6 +570,44 @@ mod tests {
         let p = Predictor::new();
         assert_eq!(p.predict(), 0.5);
         let _ = E; // silence unused
+    }
+
+    #[test]
+    fn dot_product_scaled_by_8_bits() {
+        // n=16 elements: t = [256; 16], w = [128; 16].
+        // Each pair contributes (256 * 128) >> 8 = 128 → sum = 16 * 128 = 2048.
+        // We pair-loop, so we cover all 16 entries.
+        let mut t = vec![0i16; 32];
+        let mut w = vec![0i16; 32];
+        for i in 0..16 { t[i] = 256; w[i] = 128; }
+        let r = dot_product(&t, &w, 16);
+        assert_eq!(r, 2048);
+    }
+
+    #[test]
+    fn train_moves_weights_toward_target() {
+        let mut w = vec![0i16; 32];
+        let t = vec![1024i16; 32];
+        train(&t, &mut w, 16, 4096);
+        // Each weight should have moved positive (err > 0, t > 0).
+        for &wi in &w[..16] {
+            assert!(wi > 0, "weight should ascend, got {}", wi);
+        }
+    }
+
+    #[test]
+    fn mixer_predict_and_train_changes_pr() {
+        let sqt = build_squash_table();
+        let mut m = Mixer1::new(/*n=*/16, /*m=*/4, /*shift1=*/8, /*elim=*/0, /*uperr=*/200);
+        m.cxt = 1;
+        // Set some logits.
+        for v in m.tx_mut() { *v = 500; }
+        let p_before = m.p(&sqt);
+        m.update(/*y=*/1);
+        let p_after = m.p(&sqt);
+        assert_ne!(p_before, p_after,
+            "training must shift the prediction (got p_before={}, p_after={})",
+            p_before, p_after);
     }
 
     #[test]
