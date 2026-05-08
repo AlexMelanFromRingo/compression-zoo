@@ -24,6 +24,7 @@
 pub mod byte_mixer;
 pub mod lstm;
 pub mod lstm_layer;
+pub mod sse;
 
 use std::collections::HashMap;
 
