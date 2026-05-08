@@ -94,6 +94,7 @@ rust/zpaq-rs/src/
   decompress.rs             ← top-level decompress + PostProcessor
   compress.rs               ← Compresser (stored + modeled + PCOMP)
   compiler.rs               ← config-string → header bytecode (272-opcode tbl)
+  lzbuffer.rs               ← LZ77 byte (level 2) + BWT (level 3) preproc
   preproc.rs                ← E8E9 forward + inverse (CALL/JMP rel→abs)
   models.rs                 ← canned min/mid/max headers from upstream
   bin/zpaq_decompress.rs    ← decompress CLI
@@ -102,7 +103,7 @@ rust/zpaq-rs/src/
 ```
 
 Test results:
-- 37 unit tests pass.
+- 40 unit tests pass.
 - Decompress end-to-end vs `/tmp/zpaq_make`:
   ```
   ok  m0..m5            — all fixtures (incl. random 1KB and 100KB)
@@ -140,13 +141,15 @@ Bugs fixed historically (don't re-introduce):
 
 Remaining zpaq-rs work:
 - `makeConfig` — expand `"x4,3,..."` method strings into the full
-  ZPAQL config strings consumed by `compiler::compile`. Upstream
-  generates rich PCOMP programs (LZ77 decoders, BWT post-proc) per
-  level. Once `makeConfig` lands the high-level `compress(method)`
-  API can drive any libzpaq level.
-- LZ77 forward search (`LZBuffer` class) — the matching front-end
-  the upstream encoder uses for levels with `args[1] in {1,2,3,5,
-  6,7}`. Hash table + suffix-array variants. Significant work.
+  ZPAQL config strings consumed by `compiler::compile`. ~400 LOC of
+  string concatenation for the per-level HCOMP and PCOMP programs
+  (`libzpaq.cpp:6887`). Once it lands the high-level
+  `compress(method)` API can drive any upstream level.
+- LZBuffer level 1 — the variable-bit Elias-gamma LZ77 path. Bit-
+  packed, trickier than level 2; deferred. Level 2 + 3 already work.
+- Wire-compat tests for LZBuffer + Compiler-generated PCOMP. The
+  pieces are all in place — just need a small C++ harness or canned
+  fixture corpus to compare against.
 - JIT path (intentionally skipped — interpret-only is fine).
 - More archive-format tests (multi-block, multi-segment).
 
@@ -197,15 +200,22 @@ Method IDs (community-aligned):
 ## Plan (priority order chosen 2026-05-08 by user)
 
 1. ✅ **Investigate GPU acceleration paths** — `gpu-rs` crate +
-   design doc + histogram PoC landed.
-2. **ZPAQ Compiler + preprocessor** — Compiler + E8E9 landed. The
-   remaining piece is `makeConfig` (method-string expander) and
-   `LZBuffer` (LZ77 forward search). Without those, compress works
-   for any *config string* but not yet for `"x4,3,..."` style
-   method strings as upstream does.
-3. **libsais cache-aware optimisations.** Expected ~2-3× speedup on
-   top of the current Nong-2009 reference SA-IS in
-   `bsc-rs/src/sais.rs`.
+   `docs/gpu-acceleration.md` design doc + 256-bin histogram CUDA
+   kernel + bench landed (1.6× crossover at 16 MiB on RTX 4080).
+2. **ZPAQ Compiler + preprocessor** —
+   ✅ Compiler (272 opcodes, byte-exact min.cfg validation),
+   ✅ E8E9 forward + inverse,
+   ✅ post_process_prog,
+   ✅ LZBuffer level 2 (byte LZ77) + level 3 (BWT, leverages
+      `bsc-rs::sais`).
+   ⏳ Remaining: `makeConfig` (method-string → config-string
+      expander, ~400 LOC string building) and LZBuffer level 1
+      (variable-bit Elias-gamma LZ77). With those the `compress(method)`
+      API matches upstream wire format for every level.
+3. **libsais cache-aware optimisations.** Reference SA-IS landed +
+   small single-pass refactor. Real 2-3× wins need bit-packed L/S,
+   prefetching, libsais's specific algorithmic improvements —
+   sizeable rewrite, deferred.
 4. **CMIX-rs.** Multi-session per the original handoff. Start from
    `predictor.cpp` (per-byte mix entry) and bisect against the
    upstream binary. ~30 K lines of intricate C++ — multi-week.
