@@ -44,6 +44,68 @@ pub const MAX_CFG: &[u8] = &[
     25, 25, 25, 112, 56, 0,
 ];
 
+/// Byte-aligned LZ77 (level 2) config template, extracted verbatim
+/// from upstream `makeConfig("x4,2,...", args)`. `$1` is the
+/// log-block-size and `$3` is the LZ77 minimum match length. The
+/// PCOMP runs the inverse LZ77 producing the original byte stream.
+pub const LZ77_BYTE_CFG: &str = r#"
+comp 9 16 0 $1+20 0
+hcomp
+c-- *c=a a+= 255 d=a *d=c
+  (decode lz77 into M. Codes:
+  00xxxxxx = literal length xxxxxx+1
+  xx......, xx > 0 = match with xx offset bytes to follow)
+
+  a=r 1 a== 0 if (init)
+    a= 111 (skip post code)
+  else a== 1 if  (new code?)
+    a=*c r=a 2  (save code in R2)
+    a> 63 if a>>= 6 a++ a++  (match)
+    else a++ a++ endif  (literal)
+  else (read rest of code)
+    a--
+  endif endif
+  r=a 1  (R1 = 1+expected bytes to next code)
+halt
+pcomp lzpre c ;
+  (Decode LZ77: d=state, M=output buffer, b=size)
+  a> 255 if (at EOF decode e8e9 and output)
+    b=0 c=0 d=0 a=0 r=a 1 r=a 2 (reset state)
+  halt
+  endif
+
+  (in state d==0, expect a new code)
+  (put length in r1 and inital part of offset in r2)
+  c=a a=d a== 0 if
+    a=c a>>= 6 a++ d=a
+    a== 1 if (literal?)
+      a+=c r=a 1 a=0 r=a 2
+    else (3 to 5 byte match)
+      d++ a=c a&= 63 a+= $3 r=a 1 a=0 r=a 2
+    endif
+  else
+    a== 1 if (writing literal)
+      a=c *b=a b++
+ out
+      a=r 1 a-- a== 0 if d=0 endif r=a 1 (if (--len==0) state=0)
+    else
+      a> 2 if (reading offset)
+        a=r 2 a<<= 8 a|=c r=a 2 d-- (off=off<<8|c, --state)
+      else (state==2, write match)
+        a=r 2 a<<= 8 a|=c c=a a=b a-=c a-- c=a (c=i-off-1)
+        d=r 1 (d=len)
+        do (copy and output d=len bytes)
+          a=*c *b=a c++ b++
+ out
+        d-- a=d a> 0 while
+        (d=state=0. off, len don't matter)
+      endif
+    endif
+  endif
+  halt
+end
+"#;
+
 /// BWT (level 3) config template, extracted verbatim from upstream
 /// `makeConfig("x4,3", args)`. `$1` substitutes the log-block-size
 /// (`args[0]`), so e.g. with `args[0] = 4` the H/M arrays both use

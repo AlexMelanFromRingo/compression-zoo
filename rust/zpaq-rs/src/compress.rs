@@ -431,6 +431,36 @@ pub fn compress_method<W: Writer>(
         return Ok(c.into_inner());
     }
 
+    if let Some(rest) = method.strip_prefix("x4,2,") {
+        // Byte-aligned LZ77, min match length supplied as the
+        // numeric tail (e.g. "x4,2,12" → min_match = 12).
+        let min_match: i32 = rest.parse().map_err(|_| CompressError::InvalidHeader)?;
+        if !(1..=64).contains(&min_match) { return Err(CompressError::InvalidHeader); }
+        let mut args = [0i32; 9];
+        args[0] = 4;
+        args[1] = 2;
+        args[2] = min_match;
+        let cc = crate::compiler::compile_with_args(crate::models::LZ77_BYTE_CFG, args)
+            .map_err(|_| CompressError::InvalidHeader)?;
+        let pcomp = cc.pcomp.clone().ok_or(CompressError::InvalidHeader)?;
+
+        c.start_block_modeled(&cc.header)?;
+        c.start_segment(b"", b"")?;
+        c.post_process_prog(&pcomp)?;
+        let lz_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
+            log_block_mib: 4,
+            level_flag: 2,
+            min_match: min_match as u32,
+            min_match2: 0,
+            log_bucket: 4,
+            log_ht_size: 16,
+        });
+        c.write_bytes(&lz_bytes)?;
+        c.end_segment(None)?;
+        c.end_block()?;
+        return Ok(c.into_inner());
+    }
+
     Err(CompressError::InvalidHeader)
 }
 
@@ -503,6 +533,24 @@ mod tests {
         let mut w = VecWriter::new();
         decompress(&mut r, &mut w).unwrap();
         assert_eq!(w.into_inner(), inp);
+    }
+
+    /// `x4,2,M` — byte-aligned LZ77. Repetitive input should
+    /// compress measurably while still round-tripping.
+    #[test]
+    fn compress_method_lz77_round_trip() {
+        let inp = b"the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let out = compress_method(VecWriter::new(), &inp, "x4,2,4").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
+        // Smoke check: compressed should be smaller than input for
+        // this very repetitive fixture.
+        assert!(wire.len() < inp.len(),
+            "lz77 didn't compress repetitive input: {} → {}",
+            inp.len(), wire.len());
     }
 
     /// End-to-end: compile a custom config, encode, decode (Rust),

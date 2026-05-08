@@ -212,15 +212,18 @@ Method IDs (community-aligned):
       EOF marker — required for transforms (BWT/E8E9) that
       buffer the whole input before emitting OUT bytes.
    ✅ LZBuffer level 2 (byte LZ77) + level 3 (BWT, via `bsc-rs::sais`).
-   ✅ `compress_method` high-level API: `"0"` (store) and `"x4,3"`
-      (BWT) work end-to-end; output decompresses correctly under
+   ✅ `compress_method` high-level API: `"0"` (store), `"x4,3"`
+      (BWT) and `"x4,2,M"` (byte-aligned LZ77 with min match `M`)
+      all work end-to-end; output decompresses correctly under
       both `zpaq_decompress` (Rust) and the upstream libzpaq
       decoder, validated on random binaries 100B..100KB plus the
-      273 KB `libzpaq.cpp` source.
-   ⏳ Remaining: `makeConfig` for the LZ77 method paths (level 1/2
-      configs, plus the 4 EXX E8E9 variants). LZBuffer level 1
-      (variable-bit Elias-gamma LZ77). With those, `compress_method`
-      covers every upstream method string.
+      273 KB `libzpaq.cpp` source. LZ77 ratio on libzpaq.cpp is
+      ~37%.
+   ⏳ Remaining: LZBuffer level 1 (variable-bit Elias-gamma LZ77),
+      `makeConfig` for the 4xxx E8E9 method variants and the
+      level-N digit-only entry points (`"1".."5"`) that pick a
+      method based on data statistics. With those, the full
+      upstream compression menu is reachable.
 3. **libsais cache-aware optimisations.** Reference SA-IS landed +
    small single-pass refactor. Real 2-3× wins need bit-packed L/S,
    prefetching, libsais's specific algorithmic improvements —
