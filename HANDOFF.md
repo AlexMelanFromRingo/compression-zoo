@@ -226,12 +226,23 @@ Method IDs (community-aligned):
       a small but real ratio improvement: 60.64% → 60.08% with
       `"x4,2,4"` → `"x4,6,4"`).
       Ratio on libzpaq.cpp: byte LZ77 = 37.4%, var-bit LZ77 = 30.4%.
-   ⏳ Remaining: component specs (`"ci1"`, `"i"`, `"m"`, `"s"`, ...)
-      that stack a context model on top of the LZ77/BWT preproc —
-      that's where upstream's best-ratio methods live, requires
-      porting the model spec branches of `makeConfig` (~300 LOC of
-      textual config building). Once those land the full upstream
-      compression menu is reachable.
+   ✅ Component-spec stacking (`make_config.rs`): the seven upstream
+      component letters (`c`, `i`, `m`, `t`, `s`, `a`, `w`) are
+      parsed and assembled into the textual ZPAQ config, mirroring
+      `makeConfig` from `libzpaq.cpp:6887`. `compress_method` now
+      pipes any `"x..."` method through this builder, so methods
+      like `"x4,3,ci1"` (BWT + ICM + ISSE) and
+      `"x4,2,4c0,0,0,255i1"` (byte-LZ77 + masked CM + ISSE) work
+      end-to-end via both Rust and upstream libzpaq decoders.
+      Validated byte-for-byte against upstream `makeConfig` output
+      on the simpler shapes; semantic-equivalence (mod whitespace)
+      on level-2 methods (the level-2 HCOMP prefix differs only in
+      indentation, both compile to identical bytecode).
+   ⏳ Remaining: digit-method type analysis — upstream's
+      `compressBlock` examines the input (entropy histogram +
+      type=binary/text/exe inference) before picking the `"x..."`
+      shape. Without that, `"4"` and `"5"` stay aliases; the user
+      has to pass `"x4,..."` explicitly for the heavy methods.
 3. **libsais cache-aware optimisations.** Reference SA-IS landed +
    small single-pass refactor. Real 2-3× wins need bit-packed L/S,
    prefetching, libsais's specific algorithmic improvements —

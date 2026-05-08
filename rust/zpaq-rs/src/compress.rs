@@ -423,79 +423,43 @@ pub fn compress_method<W: Writer>(
         return Ok(c.into_inner());
     }
 
-    // BWT, with or without E8E9 prefilter.
-    if method == "x4,3" || method == "x4,7" {
-        let doe8 = method == "x4,7";
-        let mut args = [0i32; 9];
-        args[0] = 4;
-        args[1] = if doe8 { 7 } else { 3 };
-        let cfg = if doe8 { crate::models::BWT_E8E9_CFG }
-                  else    { crate::models::BWT_CFG };
-        let cc = crate::compiler::compile_with_args(cfg, args)
+    // Any "x..." method goes through the upstream-compatible
+    // `make_config` builder. Component specs (`ci1`, `i`, `m`, `t`,
+    // `s`, `a`, `w`) are honoured here.
+    if method.starts_with('x') {
+        let (cfg, args) = crate::make_config::make_config(method)
             .map_err(|_| CompressError::InvalidHeader)?;
-        let pcomp = cc.pcomp.clone()
-            .ok_or(CompressError::InvalidHeader)?;
+        let cc = crate::compiler::compile_with_args(&cfg, args)
+            .map_err(|_| CompressError::InvalidHeader)?;
+        let level = args[1] & 3;
+        let pcomp_bytes = cc.pcomp.clone();
 
         c.start_block_modeled(&cc.header)?;
         c.start_segment(b"", b"")?;
-        c.post_process_prog(&pcomp)?;
-        let bwt_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
-            log_block_mib: 4,
-            level_flag: if doe8 { 7 } else { 3 },
-            min_match: 0, min_match2: 0, log_bucket: 0, log_ht_size: 0,
-        });
-        c.write_bytes(&bwt_bytes)?;
-        c.end_segment(None)?;
-        c.end_block()?;
-        return Ok(c.into_inner());
-    }
-
-    // LZ77 prefixes — handle 4 variants (level 1 var-bit and 2 byte,
-    // each with or without E8E9). The encoder-side LzArgs.level_flag
-    // already pipes through the E8E9 prefilter via preproc::e8e9_forward.
-    let lz_match: Option<(&str, i32, i32)> = if let Some(r) = method.strip_prefix("x4,1,") {
-        Some((r, 1, 1))
-    } else if let Some(r) = method.strip_prefix("x4,5,") {
-        Some((r, 1, 5))
-    } else if let Some(r) = method.strip_prefix("x4,2,") {
-        Some((r, 2, 2))
-    } else if let Some(r) = method.strip_prefix("x4,6,") {
-        Some((r, 2, 6))
-    } else {
-        None
-    };
-    if let Some((rest, level, level_flag)) = lz_match {
-        let min_match: i32 = rest.parse().map_err(|_| CompressError::InvalidHeader)?;
-        let lo = if level == 1 { 4 } else { 1 };
-        if !(lo..=64).contains(&min_match) { return Err(CompressError::InvalidHeader); }
-        let mut args = [0i32; 9];
-        args[0] = 4;
-        args[1] = level_flag;
-        args[2] = min_match;
-        let doe8 = level_flag >= 4;
-        let cfg = match (level, doe8) {
-            (1, false) => crate::models::LZ77_VAR_CFG,
-            (1, true)  => crate::models::LZ77_VAR_E8E9_CFG,
-            (2, false) => crate::models::LZ77_BYTE_CFG,
-            (2, true)  => crate::models::LZ77_BYTE_E8E9_CFG,
-            _ => unreachable!(),
+        match (level, pcomp_bytes) {
+            (0, _) => c.post_process_pass()?,
+            (_, Some(pc)) => c.post_process_prog(&pc)?,
+            _ => return Err(CompressError::InvalidHeader),
+        }
+        // Pre-process input per level (level 0 = no preproc).
+        let preprocessed: Vec<u8>;
+        let body: &[u8] = match level {
+            0 => data,
+            1 | 2 | 3 => {
+                let lvl_args = crate::lzbuffer::LzArgs {
+                    log_block_mib: args[0] as u32,
+                    level_flag: args[1] as u32,
+                    min_match: args[2].max(if level == 1 { 4 } else { 1 }) as u32,
+                    min_match2: args[3] as u32,
+                    log_bucket: args[4].max(0) as u32,
+                    log_ht_size: args[5].max(16) as u32,
+                };
+                preprocessed = crate::lzbuffer::preprocess(data, lvl_args);
+                &preprocessed
+            }
+            _ => return Err(CompressError::InvalidHeader),
         };
-        let cc = crate::compiler::compile_with_args(cfg, args)
-            .map_err(|_| CompressError::InvalidHeader)?;
-        let pcomp = cc.pcomp.clone().ok_or(CompressError::InvalidHeader)?;
-
-        c.start_block_modeled(&cc.header)?;
-        c.start_segment(b"", b"")?;
-        c.post_process_prog(&pcomp)?;
-        let lz_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
-            log_block_mib: 4,
-            level_flag: level_flag as u32,
-            min_match: min_match as u32,
-            min_match2: 0,
-            log_bucket: 4,
-            log_ht_size: 16,
-        });
-        c.write_bytes(&lz_bytes)?;
+        c.write_bytes(body)?;
         c.end_segment(None)?;
         c.end_block()?;
         return Ok(c.into_inner());
@@ -588,6 +552,28 @@ mod tests {
         inp.extend_from_slice(&[0xE9, 0x20, 0x00, 0x00, 0xFF]);
         inp.extend_from_slice(b" tail bytes for padding ".repeat(20).as_slice());
         for method in ["x4,5,4", "x4,6,4", "x4,7"] {
+            let out = compress_method(VecWriter::new(), &inp, method).unwrap();
+            let wire = out.into_inner();
+            let mut r = SliceReader::new(&wire);
+            let mut w = VecWriter::new();
+            decompress(&mut r, &mut w).unwrap();
+            assert_eq!(w.into_inner(), inp,
+                "round-trip failed for method='{}'", method);
+        }
+    }
+
+    /// Component-spec methods round-trip through both the Rust
+    /// decoder and the upstream wire format. Adds a context model
+    /// on top of the LZ77 / BWT preprocessor.
+    #[test]
+    fn compress_method_with_component_specs() {
+        let inp = b"The quick brown fox jumps over the lazy dog. ".repeat(20);
+        for method in [
+            "x4,3,ci1",                 // BWT + ICM + ISSE
+            "x4,3,c0,0,0,255i1",        // BWT + masked CM + ISSE
+            "x4,2,4ci1",                // byte-LZ77 + ICM + ISSE
+            "x4,1,4ci1",                // var-bit LZ77 + ICM + ISSE
+        ] {
             let out = compress_method(VecWriter::new(), &inp, method).unwrap();
             let wire = out.into_inner();
             let mut r = SliceReader::new(&wire);
