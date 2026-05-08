@@ -3974,6 +3974,56 @@ impl FxcmState {
         }
     }
 
+    /// Stream3b / stream2b updates driven by the most-recent word's
+    /// type (fxcmv1.cpp:3971-3994). Mutates the running stream
+    /// accumulators when the latest word is a Number, Conjunction,
+    /// Article, Adposition, or PresentParticiple-in-paragraph.
+    ///
+    /// `worcxt` is the active WordsContext. `is_paragraph` mirrors
+    /// upstream's `isParagraph` flag (passed from the wiki tracker).
+    /// On a Conjunction the caller may also want to clear `senword`
+    /// (we do that here too — upstream pairs the two).
+    pub fn update_streams_for_word_type(
+        &mut self,
+        worcxt: &WordsContext,
+        is_paragraph: bool,
+    ) {
+        // Most-recent word is index 1.
+        if worcxt.types(1) == eng::NUMBER {
+            self.stream3b_r = (self.stream3b_r << 7).wrapping_add(1);
+            self.stream3b   = (self.stream3b   << 7).wrapping_add(1);
+        }
+        let last_type = worcxt.types(1);
+        if (last_type & eng::CONJUNCTION) != 0 {
+            self.stream3b_r <<= 7;
+            self.stream3b   <<= 7;
+            if is_paragraph { self.sen_word = 0; }
+        }
+        if (last_type & eng::ARTICLE) != 0 {
+            self.stream3b_r = (self.stream3b_r << 7).wrapping_add(2);
+            self.stream3b   = (self.stream3b   << 7).wrapping_add(2);
+        }
+        if (last_type & eng::ADPOSITION) != 0
+            || (is_paragraph && (last_type & eng::PRESENT_PARTICIPLE) != 0)
+        {
+            self.stream2b_r = (self.stream2b_r << 2)
+                .wrapping_add(self.stream2b_r & 3);
+            self.stream2b   = (self.stream2b   << 2)
+                .wrapping_add(self.stream2b   & 3);
+        }
+    }
+
+    /// After a word run ends, reset the per-word stream-mask history
+    /// (fxcmv1.cpp:4014-4017). Cycles `_mask2 ← _mask1`,
+    /// `_mask1 ← current`, then zeros the live masks.
+    pub fn rotate_stream_masks(&mut self) {
+        self.stream3b_r_mask2 = self.stream3b_r_mask1;
+        self.stream3b_mask1   = self.stream3b_mask;
+        self.stream3b_mask    = 0;
+        self.stream2b_mask    = 0;
+        self.stream3b_r_mask1 = 0;
+    }
+
     /// Number-tracking sub-step (fxcmv1.cpp:3940-3953). Consumes the
     /// most-recent byte (`self.c1`) and updates `numbers`, `number0`,
     /// `number1`, `numlen0`, `numlen1`, `mybenum` per upstream's
@@ -4609,6 +4659,47 @@ mod tests {
         // Past the blpos threshold the cycle runs anyway.
         s.cycle_word_pipeline(463_139_794);
         assert_eq!(s.word1, 5 * 83);
+    }
+
+    #[test]
+    fn update_streams_for_number_word_appends_one() {
+        let mut s = FxcmState::new();
+        let mut w = WordsContext::new();
+        // Push a single word with type=NUMBER.
+        w.set(b'!', 0);
+        w.update(/*w=*/123, /*b=*/b' ', eng::NUMBER, /*s=*/123);
+        s.stream3b   = 0xAB;
+        s.stream3b_r = 0xCD;
+        s.update_streams_for_word_type(&w, /*is_paragraph=*/false);
+        assert_eq!(s.stream3b,   0xAB << 7 | 1);
+        assert_eq!(s.stream3b_r, 0xCD << 7 | 1);
+    }
+
+    #[test]
+    fn update_streams_conjunction_clears_senword_in_paragraph() {
+        let mut s = FxcmState::new();
+        let mut w = WordsContext::new();
+        w.set(b'!', 0);
+        w.update(1, b' ', eng::CONJUNCTION, 1);
+        s.sen_word = 999;
+        s.update_streams_for_word_type(&w, /*is_paragraph=*/true);
+        assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn rotate_stream_masks_cycles_two_levels() {
+        let mut s = FxcmState::new();
+        s.stream3b_mask    = 0x10;
+        s.stream3b_mask1   = 0x20;
+        s.stream3b_r_mask1 = 0x40;
+        s.stream3b_r_mask2 = 0x80;
+        s.stream2b_mask    = 0x100;
+        s.rotate_stream_masks();
+        assert_eq!(s.stream3b_r_mask2, 0x40, "_mask2 receives old _mask1");
+        assert_eq!(s.stream3b_mask1,   0x10, "_mask1 receives old current");
+        assert_eq!(s.stream3b_mask,    0);
+        assert_eq!(s.stream3b_r_mask1, 0);
+        assert_eq!(s.stream2b_mask,    0);
     }
 
     #[test]
