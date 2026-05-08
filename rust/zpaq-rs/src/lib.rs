@@ -27,6 +27,7 @@ pub mod compress;
 pub mod decompress;
 pub mod format;
 pub mod io;
+pub mod lzbuffer;
 pub mod models;
 pub mod predictor;
 pub mod preproc;

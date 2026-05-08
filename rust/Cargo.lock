@@ -21,3 +21,6 @@ version = "0.1.0"
 [[package]]
 name = "zpaq-rs"
 version = "0.0.1"
+dependencies = [
+ "bsc-rs",
+]
