@@ -552,7 +552,11 @@ impl StateMap1 {
         let pr1 = (p0 >> 12) as i32;
         let mut p_new = p0;
         if count < self.limit { p_new = p_new.wrapping_add(1); }
-        let delta = (((y << 20) - pr1) * dt[count as usize] + 512) & 0xFFFFFC00u32 as i32;
+        // Upstream C uses signed `int` and tolerates wrap. Match it
+        // with explicit wrapping arithmetic.
+        let diff = (y << 20).wrapping_sub(pr1);
+        let prod = diff.wrapping_mul(dt[count as usize]).wrapping_add(512);
+        let delta = prod & 0xFFFFFC00u32 as i32;
         p_new = p_new.wrapping_add(delta as u32);
         self.t[self.cxt] = p_new;
     }
@@ -2147,6 +2151,1000 @@ pub const DOUBLES: &[u8] = b"bdfgmnprt";
 pub const LI_ENDINGS: &[u8] = b"cdeghkmnrt";
 pub const NON_SHORT_CONSONANTS: &[u8] = b"wxY";
 
+// Negation / prefix sub-flags (upstream `EngWordTypeFlagsNegation`).
+pub mod neg {
+    pub const NEGATION:     u32 = 1 << 0;
+    pub const PREFIX_IRR:   u32 = (1 << 1) | NEGATION;
+    pub const PREFIX_OVER:  u32 = 1 << 2;
+    pub const PREFIX_UNDER: u32 = 1 << 3;
+    pub const PREFIX_UNN:   u32 = (1 << 4) | NEGATION;
+    pub const PREFIX_NON:   u32 = (1 << 5) | NEGATION;
+    pub const PREFIX_ANTI:  u32 = (1 << 6) | NEGATION;
+    pub const PREFIX_DIS:   u32 = (1 << 7) | NEGATION;
+}
+
+// Suffix sub-flags (upstream `EngWordTypeFlagsSuffix`). Note the
+// composite bits like `SUFFIX_AL = (1<<6)|Noun` — kept verbatim
+// to match upstream's behaviour.
+pub mod suf {
+    use super::eng::NOUN;
+    use super::eng::ADJECTIVE;
+    pub const SUFFIX_NESS:    u32 = 1 << 0;
+    pub const SUFFIX_ITY:     u32 = (1 << 1) | NOUN;
+    pub const SUFFIX_CAPABLE: u32 = 1 << 2;
+    pub const SUFFIX_NCE:     u32 = 1 << 3;
+    pub const SUFFIX_NT:      u32 = 1 << 4;
+    pub const SUFFIX_ION:     u32 = 1 << 5;
+    pub const SUFFIX_AL:      u32 = (1 << 6) | ADJECTIVE;
+    pub const SUFFIX_IC:      u32 = (1 << 7) | ADJECTIVE;
+    pub const SUFFIX_IVE:     u32 = 1 << 8;
+    pub const SUFFIX_OUS:     u32 = (1 << 9) | ADJECTIVE;
+}
+
+// ====================================================================
+// English-language reference word lists used by the stemmer.
+// All tables verbatim from `fxcmv1.cpp` (lines 2425-2654).
+// ====================================================================
+
+pub const VERB_WORDS1: &[&[u8]] = &[
+    b"has", b"had", b"have", b"was", b"were", b"may", b"might", b"must",
+    b"shall", b"should", b"can", b"could", b"will", b"would", b"is",
+    b"am", b"are", b"be", b"being", b"been", b"do", b"does", b"did",
+];
+
+pub const NUMBERS: &[&[u8]] = &[
+    b"one", b"two", b"three", b"four", b"five", b"six", b"seven",
+    b"eight", b"nine", b"ten", b"twenty", b"thirty", b"forty", b"fifty",
+    b"sixty", b"seventy", b"eighty", b"ninety", b"hundred", b"thousand",
+    b"million",
+];
+
+pub const CONJ_WORDS: &[&[u8]] = &[
+    b"for", b"and", b"nor", b"but", b"or", b"yet", b"so", b"than",
+    b"as", b"that", b"if", b"when", b"because", b"while", b"where",
+    b"after", b"though", b"whether", b"before", b"although", b"like",
+    b"once", b"unless", b"now", b"except",
+];
+
+pub const APO_WORDS: &[&[u8]] = &[
+    b"in", b"during", b"at", b"on", b"since", b"until", b"above",
+    b"across", b"against", b"along", b"among", b"around", b"behind",
+    b"below", b"beneath", b"beside", b"between", b"by", b"down",
+    b"from", b"into", b"near", b"of", b"off", b"to", b"toward",
+    b"under", b"upon", b"with", b"within",
+];
+
+pub const PREP_WORDS: &[&[u8]] = &[b"as", b"by", b"de", b"in", b"on"];
+
+pub const CON_AD_VER_PREP_WORDS: &[&[u8]] = &[b"also", b"thus"];
+
+pub const VERB_WORDS: &[&[u8]] = &[
+    b"be", b"do", b"an", b"could", b"may", b"must", b"need", b"ought",
+    b"shall", b"should", b"will", b"would",
+];
+
+pub const MALE_WORDS: &[&[u8]] = &[
+    b"he", b"him", b"his", b"himself", b"man", b"men", b"boy",
+    b"husband", b"actor",
+];
+
+pub const FEMALE_WORDS: &[&[u8]] = &[
+    b"she", b"her", b"herself", b"woman", b"women", b"girl", b"wife",
+    b"actress",
+];
+
+pub const ARTICLE_WORDS: &[&[u8]] = &[b"a", b"an", b"the"];
+
+// Step suffix tables.
+pub const SUFFIXES_STEP0: &[&[u8]] = &[b"'s'", b"'s", b"'"];
+
+pub const SUFFIXES_STEP1B: &[&[u8]] =
+    &[b"eedly", b"eed", b"ed", b"edly", b"ing", b"ingly"];
+
+pub const TYPES_STEP1B: &[u32] = &[
+    eng::ADVERB_OF_MANNER,
+    0,
+    eng::PAST_TENSE,
+    eng::ADVERB_OF_MANNER | eng::PAST_TENSE,
+    eng::PRESENT_PARTICIPLE,
+    eng::ADVERB_OF_MANNER | eng::PRESENT_PARTICIPLE,
+];
+
+pub const SUFFIXES_STEP2: &[(&[u8], &[u8])] = &[
+    (b"ization", b"ize"),
+    (b"ational", b"ate"),
+    (b"ousness", b"ous"),
+    (b"iveness", b"ive"),
+    (b"fulness", b"ful"),
+    (b"tional",  b"tion"),
+    (b"lessli",  b"less"),
+    (b"biliti",  b"ble"),
+    (b"entli",   b"ent"),
+    (b"ation",   b"ate"),
+    (b"alism",   b"al"),
+    (b"aliti",   b"al"),
+    (b"fulli",   b"ful"),
+    (b"ousli",   b"ous"),
+    (b"iviti",   b"ive"),
+    (b"enci",    b"ence"),
+    (b"anci",    b"ance"),
+    (b"abli",    b"able"),
+    (b"izer",    b"ize"),
+    (b"ator",    b"ate"),
+    (b"alli",    b"al"),
+    (b"bli",     b"ble"),
+];
+
+pub const TYPES_STEP2: &[u32] = &[
+    eng::SUFFIX,
+    eng::SUFFIX | eng::ADJECTIVE,
+    eng::SUFFIX,
+    eng::SUFFIX,
+    eng::SUFFIX,
+    eng::SUFFIX | eng::ADJECTIVE,
+    eng::ADVERB_OF_MANNER,
+    eng::ADVERB_OF_MANNER | eng::NOUN | eng::SUFFIX,
+    eng::ADVERB_OF_MANNER,
+    eng::SUFFIX,
+    0,
+    eng::NOUN | eng::SUFFIX,
+    eng::ADVERB_OF_MANNER,
+    eng::ADVERB_OF_MANNER,
+    eng::NOUN | eng::SUFFIX,
+    0,
+    0,
+    eng::ADVERB_OF_MANNER,
+    0,
+    0,
+    eng::ADVERB_OF_MANNER,
+    eng::ADVERB_OF_MANNER,
+];
+
+pub const TYPES_STEP2_SUFFIX: &[u32] = &[
+    suf::SUFFIX_ION,
+    suf::SUFFIX_ION | suf::SUFFIX_AL,
+    suf::SUFFIX_NESS,
+    suf::SUFFIX_NESS,
+    suf::SUFFIX_NESS,
+    suf::SUFFIX_ION | suf::SUFFIX_AL,
+    0,
+    suf::SUFFIX_ITY,
+    0,
+    suf::SUFFIX_ION,
+    0,
+    suf::SUFFIX_ITY,
+    0,
+    0,
+    suf::SUFFIX_ITY,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+];
+
+pub const SUFFIXES_STEP3: &[(&[u8], &[u8])] = &[
+    (b"ational", b"ate"),
+    (b"tional",  b"tion"),
+    (b"alize",   b"al"),
+    (b"icate",   b"ic"),
+    (b"iciti",   b"ic"),
+    (b"ical",    b"ic"),
+    (b"ful",     b""),
+    (b"ness",    b""),
+];
+
+pub const TYPES_STEP3: &[u32] = &[
+    eng::SUFFIX | eng::ADJECTIVE,
+    eng::SUFFIX | eng::ADJECTIVE,
+    0,
+    0,
+    eng::NOUN | eng::SUFFIX,
+    eng::SUFFIX | eng::ADJECTIVE,
+    eng::ADJECTIVE_FULL,
+    eng::SUFFIX,
+];
+
+pub const TYPES_STEP3_SUFFIX: &[u32] = &[
+    suf::SUFFIX_ION | suf::SUFFIX_AL,
+    suf::SUFFIX_ION | suf::SUFFIX_AL,
+    0,
+    0,
+    suf::SUFFIX_ITY,
+    suf::SUFFIX_AL,
+    0,
+    suf::SUFFIX_NESS,
+];
+
+pub const SUFFIXES_STEP4: &[&[u8]] = &[
+    b"al", b"ance", b"ence", b"er", b"ic", b"able", b"ible", b"ant",
+    b"ement", b"ment", b"ent", b"ou", b"ism", b"ate", b"iti", b"ous",
+    b"ive", b"ize", b"sion", b"tion",
+];
+
+pub const TYPES_STEP4: &[u32] = &[
+    eng::SUFFIX | eng::ADJECTIVE,
+    eng::SUFFIX,
+    eng::SUFFIX,
+    0,
+    eng::SUFFIX | eng::ADJECTIVE,
+    eng::SUFFIX,
+    eng::SUFFIX,
+    eng::SUFFIX,
+    0,
+    0,
+    eng::SUFFIX,
+    0,
+    0,
+    0,
+    eng::SUFFIX | eng::NOUN,
+    eng::SUFFIX | eng::ADJECTIVE,
+    eng::SUFFIX,
+    0,
+    eng::SUFFIX,
+    eng::SUFFIX,
+];
+
+pub const TYPES_STEP4_SUFFIX: &[u32] = &[
+    suf::SUFFIX_AL,
+    suf::SUFFIX_NCE,
+    suf::SUFFIX_NCE,
+    0,
+    suf::SUFFIX_IC,
+    suf::SUFFIX_CAPABLE,
+    suf::SUFFIX_CAPABLE,
+    suf::SUFFIX_NT,
+    0,
+    0,
+    suf::SUFFIX_NT,
+    0,
+    0,
+    0,
+    suf::SUFFIX_ITY,
+    suf::SUFFIX_OUS,
+    suf::SUFFIX_IVE,
+    0,
+    suf::SUFFIX_ION,
+    suf::SUFFIX_ION,
+];
+
+pub const EXCEPTIONS_REGION1: &[&[u8]] = &[b"gener", b"arsen", b"commun"];
+
+pub const EXCEPTIONS1: &[(&[u8], &[u8])] = &[
+    (b"skis",   b"ski"),
+    (b"skies",  b"sky"),
+    (b"dying",  b"die"),
+    (b"lying",  b"lie"),
+    (b"tying",  b"tie"),
+    (b"idly",   b"idle"),
+    (b"gently", b"gentle"),
+    (b"ugly",   b"ugli"),
+    (b"early",  b"earli"),
+    (b"only",   b"onli"),
+    (b"singly", b"singl"),
+    (b"sky",    b"sky"),
+    (b"news",   b"news"),
+    (b"howe",   b"howe"),
+    (b"atlas",  b"atlas"),
+    (b"cosmos", b"cosmos"),
+    (b"bias",   b"bias"),
+    (b"andes",  b"andes"),
+    (b"texas",  b"texas"),
+];
+
+pub const TYPES_EXCEPTIONS1: &[u32] = &[
+    eng::NOUN | eng::PLURAL,
+    eng::NOUN | eng::PLURAL,
+    eng::PRESENT_PARTICIPLE,
+    eng::PRESENT_PARTICIPLE,
+    eng::PRESENT_PARTICIPLE,
+    eng::ADVERB_OF_MANNER,
+    eng::ADVERB_OF_MANNER,
+    eng::ADJECTIVE,
+    eng::ADJECTIVE | eng::ADVERB_OF_MANNER,
+    0,
+    eng::ADVERB_OF_MANNER,
+    eng::NOUN,
+    eng::NOUN,
+    0,
+    eng::NOUN,
+    eng::NOUN,
+    eng::NOUN,
+    eng::NOUN | eng::PLURAL,
+    eng::NOUN,
+];
+
+pub const EXCEPTIONS2: &[&[u8]] = &[
+    b"inning", b"outing", b"canning", b"herring", b"earring",
+    b"proceed", b"exceed", b"succeed",
+];
+
+pub const TYPES_EXCEPTIONS2: &[u32] = &[
+    eng::NOUN, eng::NOUN, eng::NOUN, eng::NOUN, eng::NOUN,
+    eng::VERB, eng::VERB, eng::VERB,
+];
+
+const APOSTROPHE: u8 = b'\'';
+
+// ====================================================================
+// `EnglishStemmer` — Porter2-style stemmer used by FXCMv1's word
+// model. Stateless: all helpers operate on the supplied `Word` /
+// `&[u8]` arguments.
+// ====================================================================
+
+pub struct EnglishStemmer;
+
+impl EnglishStemmer {
+    fn is_vowel(c: u8) -> bool { VOWELS.contains(&c) }
+    fn is_consonant(c: u8) -> bool { !Self::is_vowel(c) }
+    fn is_short_consonant(c: u8) -> bool { !NON_SHORT_CONSONANTS.contains(&c) }
+    fn is_double(c: u8) -> bool { DOUBLES.contains(&c) }
+    fn is_li_ending(c: u8) -> bool { LI_ENDINGS.contains(&c) }
+
+    /// Word hash used by upstream's `Hash(Word*)` — fold `Letters[Start..=End]`
+    /// into a 32-bit FNV-style accumulator.
+    fn hash(w: &mut Word) {
+        w.hash = 0xb0a710ad;
+        for i in (w.start as usize)..=(w.end as usize) {
+            w.hash = w.hash.wrapping_mul(263).wrapping_mul(32)
+                .wrapping_add(w.letters[i] as u32);
+        }
+    }
+
+    /// Index of the first consonant after a vowel-run, starting at
+    /// `from` letters past `Start`. Returns `Length()` if no such
+    /// position exists.
+    fn get_region(w: &Word, from: u32) -> u32 {
+        let mut has_vowel = false;
+        let start = w.start as usize + from as usize;
+        for i in start..=(w.end as usize) {
+            if Self::is_vowel(w.letters[i]) {
+                has_vowel = true;
+                continue;
+            } else if has_vowel {
+                return (i - w.start as usize + 1) as u32;
+            }
+        }
+        w.len()
+    }
+
+    fn get_region1(w: &Word) -> u32 {
+        for &exc in EXCEPTIONS_REGION1 {
+            if w.starts_with(exc) { return exc.len() as u32; }
+        }
+        Self::get_region(w, 0)
+    }
+
+    fn suffix_in_rn(w: &Word, rn: u32, suffix: &[u8]) -> bool {
+        w.start != w.end && (rn as usize) <= (w.len() as usize - suffix.len())
+    }
+
+    fn ends_in_short_syllable(w: &Word) -> bool {
+        if w.end == w.start {
+            false
+        } else if w.end == w.start + 1 {
+            Self::is_vowel(w.from_end(1)) && Self::is_consonant(w.from_end(0))
+        } else {
+            Self::is_consonant(w.from_end(2))
+                && Self::is_vowel(w.from_end(1))
+                && Self::is_consonant(w.from_end(0))
+                && Self::is_short_consonant(w.from_end(0))
+        }
+    }
+
+    fn is_short_word(w: &Word) -> bool {
+        Self::ends_in_short_syllable(w) && Self::get_region1(w) == w.len()
+    }
+
+    fn has_vowels(w: &Word) -> bool {
+        for i in (w.start as usize)..=(w.end as usize) {
+            if Self::is_vowel(w.letters[i]) { return true; }
+        }
+        false
+    }
+
+    fn trim_starting_apostrophe(w: &mut Word) -> bool {
+        let mut result = false;
+        let mut cnt: u32 = 0;
+        while w.start != w.end && w.at(0) == APOSTROPHE {
+            result = true;
+            w.start += 1;
+            cnt += 1;
+        }
+        while w.start != w.end && w.from_end(0) == APOSTROPHE {
+            if cnt == 0 { break; }
+            w.end -= 1;
+            cnt -= 1;
+        }
+        if w.from_end(0) == b'-' { w.end -= 1; }
+        result
+    }
+
+    fn mark_ys_as_consonants(w: &mut Word) {
+        if w.at(0) == b'y' {
+            let s = w.start as usize;
+            w.letters[s] = b'Y';
+        }
+        for i in (w.start as usize + 1)..=(w.end as usize) {
+            if Self::is_vowel(w.letters[i - 1]) && w.letters[i] == b'y' {
+                w.letters[i] = b'Y';
+            }
+        }
+    }
+
+    fn process_prefixes(w: &mut Word) -> bool {
+        if w.starts_with(b"irr") && w.len() > 5
+            && (w.at(3) == b'a' || w.at(3) == b'e')
+        {
+            w.start += 2; w.r#type |= eng::PREFIX; w.prefix |= neg::PREFIX_IRR;
+        } else if w.starts_with(b"over") && w.len() > 5 {
+            w.start += 4; w.r#type |= eng::PREFIX; w.prefix |= neg::PREFIX_OVER;
+        } else if w.starts_with(b"under") && w.len() > 6 {
+            w.start += 5; w.r#type |= eng::PREFIX; w.prefix |= neg::PREFIX_UNDER;
+        } else if w.starts_with(b"unn") && w.len() > 5 {
+            w.start += 2; w.r#type |= eng::PREFIX; w.prefix |= neg::PREFIX_UNN;
+        } else if w.starts_with(b"non")
+            && w.len() > (5 + (w.at(3) == b'-') as u32)
+        {
+            w.start += 2 + (w.at(3) == b'-') as u8;
+            w.r#type |= eng::PREFIX; w.prefix |= neg::PREFIX_NON;
+        } else if w.starts_with(b"anti") && w.len() > 6 && w.at(4) == b'-' {
+            w.start += 4 + (w.at(4) == b'-') as u8;
+            w.r#type |= eng::PREFIX; w.prefix |= neg::PREFIX_ANTI;
+        } else if w.starts_with(b"dis") && w.len() > 5 && w.at(3) == b'-' {
+            w.start += 2 + (w.at(3) == b'-') as u8;
+            w.r#type |= eng::PREFIX; w.prefix |= neg::PREFIX_DIS;
+        } else {
+            return false;
+        }
+        true
+    }
+
+    fn process_superlatives(w: &mut Word) -> bool {
+        if w.ends_with(b"est") && w.len() > 4 {
+            let i = w.end;
+            w.end -= 3;
+            w.r#type |= eng::ADJECTIVE_SUPERLATIVE;
+            // `memcmp("sugg", &(*W).Letters[(*W).End-3], 4) == 0` → check window.
+            let sugg = w.len() >= 4
+                && w.end as usize >= 3
+                && &w.letters[(w.end as usize - 3)..(w.end as usize - 3 + 4)]
+                    == b"sugg";
+            if w.from_end(0) == w.from_end(1) && w.from_end(0) != b'r' && !sugg {
+                let last = w.from_end(0);
+                let cond_a = (last != b'f' && last != b'l' && last != b's')
+                    || (w.len() > 4 && w.from_end(1) == b'l'
+                        && (w.from_end(2) == b'u' || w.from_end(3) == b'u'
+                            || w.from_end(3) == b'v'));
+                let cond_b = !(w.len() == 3
+                    && w.from_end(1) == b'd' && w.from_end(2) == b'o');
+                if cond_a && cond_b { w.end -= 1; }
+                if w.len() == 2 && (w.at(0) != b'i' || w.at(1) != b'n') {
+                    w.end = i;
+                    w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                }
+            } else {
+                match w.from_end(0) {
+                    b'd' | b'k' | b'm' | b'y' => {}
+                    b'g' => {
+                        let cong = w.len() >= 4
+                            && w.end as usize >= 3
+                            && &w.letters[(w.end as usize - 3)..(w.end as usize - 3 + 4)]
+                                != b"cong";
+                        if !(w.len() > 3
+                            && (w.from_end(1) == b'n' || w.from_end(1) == b'r')
+                            && cong)
+                        {
+                            w.end = i;
+                            w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                        } else if w.from_end(2) == b'a' {
+                            w.end += 1;
+                        }
+                    }
+                    b'i' => {
+                        let e = w.end as usize;
+                        w.letters[e] = b'y';
+                    }
+                    b'l' => {
+                        let mo_match = w.end as usize >= 2
+                            && &w.letters[(w.end as usize - 2)..(w.end as usize - 2 + 2)]
+                                == b"mo";
+                        if w.end == w.start + 1 || mo_match {
+                            w.end = i;
+                            w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                        } else if Self::is_consonant(w.from_end(1)) {
+                            w.end += 1;
+                        }
+                    }
+                    b'n' => {
+                        if w.len() < 3
+                            || Self::is_consonant(w.from_end(1))
+                            || Self::is_consonant(w.from_end(2))
+                        {
+                            w.end = i;
+                            w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                        }
+                    }
+                    b'r' => {
+                        if w.len() > 3
+                            && Self::is_vowel(w.from_end(1))
+                            && Self::is_vowel(w.from_end(2))
+                        {
+                            if w.from_end(2) == b'u'
+                                && (w.from_end(1) == b'a' || w.from_end(1) == b'i')
+                            {
+                                w.end += 1;
+                            }
+                        } else {
+                            w.end = i;
+                            w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                        }
+                    }
+                    b's' => { w.end += 1; }
+                    b'w' => {
+                        if !(w.len() > 2 && Self::is_vowel(w.from_end(1))) {
+                            w.end = i;
+                            w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                        }
+                    }
+                    b'h' => {
+                        if !(w.len() > 2 && Self::is_consonant(w.from_end(1))) {
+                            w.end = i;
+                            w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                        }
+                    }
+                    _ => {
+                        w.end += 3;
+                        w.r#type &= !eng::ADJECTIVE_SUPERLATIVE;
+                    }
+                }
+            }
+        }
+        (w.r#type & eng::ADJECTIVE_SUPERLATIVE) > 0
+    }
+
+    fn step0(w: &mut Word) -> bool {
+        for &suf in SUFFIXES_STEP0 {
+            if w.ends_with(suf) {
+                w.end -= suf.len() as u8;
+                w.r#type |= eng::PLURAL;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn step1a(w: &mut Word) -> bool {
+        if w.ends_with(b"sses") {
+            w.end -= 2;
+            w.r#type |= eng::PLURAL;
+            return true;
+        }
+        if w.ends_with(b"ied") || w.ends_with(b"ies") {
+            w.r#type |= if w.from_end(0) == b'd' {
+                eng::PAST_TENSE
+            } else {
+                eng::PLURAL
+            };
+            w.end -= 1 + (w.len() > 4) as u8;
+            return true;
+        }
+        if w.ends_with(b"us") || w.ends_with(b"ss") { return false; }
+        if w.from_end(0) == b's' && w.len() > 2 {
+            for i in (w.start as usize)..=(w.end as usize - 2) {
+                if Self::is_vowel(w.letters[i]) {
+                    w.end -= 1;
+                    w.r#type |= eng::PLURAL;
+                    return true;
+                }
+            }
+        }
+        if w.ends_with(b"n't") && w.len() > 4 {
+            match w.from_end(3) {
+                b'a' => {
+                    if w.from_end(4) == b'c' {
+                        w.end -= 2;
+                    } else {
+                        w.change_suffix(b"n't", b"ll");
+                    }
+                }
+                b'i' => { w.change_suffix(b"in't", b"m"); }
+                b'o' => {
+                    if w.from_end(4) == b'w' {
+                        w.change_suffix(b"on't", b"ill");
+                    } else {
+                        w.end -= 3;
+                    }
+                }
+                _ => { w.end -= 3; }
+            }
+            w.r#type |= eng::PREFIX;
+            w.prefix |= neg::NEGATION;
+            return true;
+        }
+        if w.ends_with(b"hood") && w.len() > 7 {
+            w.end -= 4;
+            return true;
+        }
+        false
+    }
+
+    fn step1b(w: &mut Word, r1: u32) -> bool {
+        for (i, &suf) in SUFFIXES_STEP1B.iter().enumerate() {
+            if !w.ends_with(suf) { continue; }
+            match i {
+                0 | 1 => {
+                    if Self::suffix_in_rn(w, r1, suf) {
+                        w.end -= 1 + (i as u8) * 2;
+                    }
+                }
+                _ => {
+                    let j = w.end;
+                    w.end -= suf.len() as u8;
+                    if !Self::has_vowels(w) {
+                        w.end = j;
+                        return false;
+                    }
+                    if w.ends_with(b"at") || w.ends_with(b"bl")
+                        || w.ends_with(b"iz") || Self::is_short_word(w)
+                    {
+                        w.append(b'e');
+                    } else if w.len() > 2 {
+                        if w.from_end(0) == w.from_end(1)
+                            && Self::is_double(w.from_end(0))
+                        {
+                            w.end -= 1;
+                        } else if i == 2 || i == 3 {
+                            match w.from_end(0) {
+                                b'c' | b's' | b'v' => {
+                                    let keep = !(w.ends_with(b"ss")
+                                        || w.ends_with(b"ias"));
+                                    if keep { w.end += 1; }
+                                }
+                                b'd' => {
+                                    let n_allowed = [b'a', b'e', b'i', b'o'];
+                                    if Self::is_vowel(w.from_end(1))
+                                        && !n_allowed.contains(&w.from_end(2))
+                                    {
+                                        w.end += 1;
+                                    }
+                                }
+                                b'k' => {
+                                    if w.ends_with(b"uak") { w.end += 1; }
+                                }
+                                b'l' => {
+                                    let allowed1 = [
+                                        b'b', b'c', b'd', b'f', b'g', b'k',
+                                        b'p', b't', b'y', b'z',
+                                    ];
+                                    let allowed2 = [b'a', b'i', b'o', b'u'];
+                                    if allowed1.contains(&w.from_end(1))
+                                        || (allowed2.contains(&w.from_end(1))
+                                            && Self::is_consonant(w.from_end(2)))
+                                    {
+                                        w.end += 1;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        } else if i >= 4 {
+                            match w.from_end(0) {
+                                b'd' => {
+                                    if Self::is_vowel(w.from_end(1))
+                                        && w.from_end(2) != b'a'
+                                        && w.from_end(2) != b'e'
+                                        && w.from_end(2) != b'o'
+                                    {
+                                        w.append(b'e');
+                                    }
+                                }
+                                b'g' => {
+                                    let allowed = [
+                                        b'a', b'd', b'e', b'i', b'l', b'r', b'u',
+                                    ];
+                                    let cond = allowed.contains(&w.from_end(1))
+                                        || (w.from_end(1) == b'n'
+                                            && (w.from_end(2) == b'e'
+                                                || (w.from_end(2) == b'u'
+                                                    && w.from_end(3) != b'b'
+                                                    && w.from_end(3) != b'd')
+                                                || (w.from_end(2) == b'a'
+                                                    && (w.from_end(3) == b'r'
+                                                        || (w.from_end(3) == b'h'
+                                                            && w.from_end(4) == b'c')))
+                                                || (w.ends_with(b"ring")
+                                                    && (w.from_end(4) == b'c'
+                                                        || w.from_end(4) == b'f'))));
+                                    if cond { w.append(b'e'); }
+                                }
+                                b'l' => {
+                                    let cond = !(w.from_end(1) == b'l'
+                                        || w.from_end(1) == b'r'
+                                        || w.from_end(1) == b'w'
+                                        || (Self::is_vowel(w.from_end(1))
+                                            && Self::is_vowel(w.from_end(2))));
+                                    if cond { w.append(b'e'); }
+                                    if w.ends_with(b"uell") && w.len() > 4
+                                        && w.from_end(4) != b'q'
+                                    {
+                                        w.end -= 1;
+                                    }
+                                }
+                                b'r' => {
+                                    let cond = ((w.from_end(1) == b'i'
+                                        && w.from_end(2) != b'a'
+                                        && w.from_end(2) != b'e'
+                                        && w.from_end(2) != b'o')
+                                        || (w.from_end(1) == b'a'
+                                            && !(w.from_end(2) == b'e'
+                                                || w.from_end(2) == b'o'
+                                                || (w.from_end(2) == b'l'
+                                                    && w.from_end(3) == b'l')))
+                                        || (w.from_end(1) == b'o'
+                                            && !(w.from_end(2) == b'o'
+                                                || (w.from_end(2) == b't'
+                                                    && w.from_end(3) != b's')))
+                                        || w.from_end(1) == b'c'
+                                        || w.from_end(1) == b't')
+                                        && !w.ends_with(b"str");
+                                    if cond { w.append(b'e'); }
+                                }
+                                b't' => {
+                                    if w.from_end(1) == b'o'
+                                        && w.from_end(2) != b'g'
+                                        && w.from_end(2) != b'l'
+                                        && w.from_end(2) != b'i'
+                                        && w.from_end(2) != b'o'
+                                    {
+                                        w.append(b'e');
+                                    }
+                                }
+                                b'u' => {
+                                    if !(w.len() > 3
+                                        && Self::is_vowel(w.from_end(1))
+                                        && Self::is_vowel(w.from_end(2)))
+                                    {
+                                        w.append(b'e');
+                                    }
+                                }
+                                b'z' => {
+                                    if w.ends_with(b"izz") && w.len() > 3
+                                        && (w.from_end(3) == b'h'
+                                            || w.from_end(3) == b'u')
+                                    {
+                                        w.end -= 1;
+                                    } else if w.from_end(1) != b't'
+                                        && w.from_end(1) != b'z'
+                                    {
+                                        w.append(b'e');
+                                    }
+                                }
+                                b'k' => {
+                                    if w.ends_with(b"uak") { w.append(b'e'); }
+                                }
+                                b'b' | b'c' | b's' | b'v' => {
+                                    let cond = !((w.from_end(0) == b'b'
+                                        && (w.from_end(1) == b'm'
+                                            || w.from_end(1) == b'r'))
+                                        || w.ends_with(b"ss")
+                                        || w.ends_with(b"ias")
+                                        || w.equals_str(b"zinc"));
+                                    if cond { w.append(b'e'); }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            w.r#type |= TYPES_STEP1B[i];
+            return true;
+        }
+        false
+    }
+
+    fn step1c(w: &mut Word) -> bool {
+        if w.len() > 2 && w.from_end(0) == b'y' && Self::is_consonant(w.from_end(1)) {
+            let e = w.end as usize;
+            w.letters[e] = b'i';
+            return true;
+        }
+        false
+    }
+
+    fn step2(w: &mut Word, r1: u32) -> bool {
+        for (i, (old, new_)) in SUFFIXES_STEP2.iter().enumerate() {
+            if w.ends_with(old) && Self::suffix_in_rn(w, r1, old) {
+                w.change_suffix(old, new_);
+                w.r#type |= TYPES_STEP2[i];
+                w.suffix |= TYPES_STEP2_SUFFIX[i];
+                return true;
+            }
+        }
+        if w.ends_with(b"logi") && Self::suffix_in_rn(w, r1, b"ogi") {
+            w.end -= 1;
+            return true;
+        } else if w.ends_with(b"li") {
+            if Self::suffix_in_rn(w, r1, b"li") && Self::is_li_ending(w.from_end(2)) {
+                w.end -= 2;
+                w.r#type |= eng::ADVERB_OF_MANNER;
+                return true;
+            } else if w.len() > 3 {
+                match w.from_end(2) {
+                    b'b' => {
+                        let e = w.end as usize;
+                        w.letters[e] = b'e';
+                        w.r#type |= eng::ADVERB_OF_MANNER;
+                        return true;
+                    }
+                    b'i' => {
+                        if w.len() > 4 {
+                            w.end -= 2;
+                            w.r#type |= eng::ADVERB_OF_MANNER;
+                            return true;
+                        }
+                    }
+                    b'l' => {
+                        if w.len() > 5
+                            && (w.from_end(3) == b'a' || w.from_end(3) == b'u')
+                        {
+                            w.end -= 2;
+                            w.r#type |= eng::ADVERB_OF_MANNER;
+                            return true;
+                        }
+                    }
+                    b's' => {
+                        w.end -= 2;
+                        w.r#type |= eng::ADVERB_OF_MANNER;
+                        return true;
+                    }
+                    b'e' | b'g' | b'm' | b'n' | b'r' | b'w' => {
+                        if w.len() > (4 + (w.from_end(2) == b'r') as u32) {
+                            w.end -= 2;
+                            w.r#type |= eng::ADVERB_OF_MANNER;
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        false
+    }
+
+    fn step3(w: &mut Word, r1: u32, r2: u32) -> bool {
+        let mut res = false;
+        for (i, (old, new_)) in SUFFIXES_STEP3.iter().enumerate() {
+            if w.ends_with(old) && Self::suffix_in_rn(w, r1, old) {
+                w.change_suffix(old, new_);
+                w.r#type |= TYPES_STEP3[i];
+                w.suffix |= TYPES_STEP3_SUFFIX[i];
+                res = true;
+                break;
+            }
+        }
+        if w.ends_with(b"ative") && Self::suffix_in_rn(w, r2, b"ative") {
+            w.end -= 5;
+            w.r#type |= eng::SUFFIX;
+            w.suffix |= suf::SUFFIX_IVE;
+            return true;
+        }
+        if w.len() > 5 && w.ends_with(b"less") {
+            w.end -= 4;
+            w.r#type |= eng::ADJECTIVE_WITHOUT;
+            return true;
+        }
+        res
+    }
+
+    fn step4(w: &mut Word, r2: u32) -> bool {
+        let mut res = false;
+        for (i, &suf_) in SUFFIXES_STEP4.iter().enumerate() {
+            if w.ends_with(suf_) && Self::suffix_in_rn(w, r2, suf_) {
+                w.end -= (suf_.len() - if i > 17 { 1 } else { 0 }) as u8;
+                if i != 10 || w.from_end(0) != b'm' {
+                    w.r#type |= TYPES_STEP4[i];
+                    w.suffix |= TYPES_STEP4_SUFFIX[i];
+                }
+                if i == 0 && w.ends_with(b"nti") {
+                    w.end -= 1;
+                    res = true;
+                    continue;
+                }
+                return true;
+            }
+        }
+        res
+    }
+
+    fn step5(w: &mut Word, r1: u32, r2: u32) -> bool {
+        if w.from_end(0) == b'e' && !w.equals_str(b"here") {
+            if Self::suffix_in_rn(w, r2, b"e") {
+                w.end -= 1;
+            } else if Self::suffix_in_rn(w, r1, b"e") {
+                w.end -= 1;
+                if Self::ends_in_short_syllable(w) { w.end += 1; }
+            } else {
+                return false;
+            }
+            return true;
+        } else if w.len() > 1 && w.from_end(0) == b'l'
+            && Self::suffix_in_rn(w, r2, b"l")
+            && w.from_end(1) == b'l'
+        {
+            w.end -= 1;
+            return true;
+        }
+        false
+    }
+
+    /// Run the full Porter2-style pipeline. `blpos` mirrors upstream's
+    /// `x.blpos` global — it gates the `VerbWords1` table after an
+    /// empirical threshold.
+    pub fn stem(w: &mut Word, blpos: u32) -> bool {
+        let mut res = Self::trim_starting_apostrophe(w);
+        if Self::process_prefixes(w) { res = true; }
+        if Self::process_superlatives(w) { res = true; }
+        for (i, (key, repl)) in EXCEPTIONS1.iter().enumerate() {
+            if w.equals_str(key) {
+                if i < 11 {
+                    let st = w.start as usize;
+                    let len = repl.len();
+                    w.letters[st..st + len].copy_from_slice(repl);
+                    w.end = w.start + (len as u8) - 1;
+                }
+                Self::hash(w);
+                w.r#type |= TYPES_EXCEPTIONS1[i];
+                return i < 11;
+            }
+        }
+        Self::mark_ys_as_consonants(w);
+        let r1 = Self::get_region1(w);
+        let r2 = Self::get_region(w, r1);
+        if Self::step0(w)  { res = true; }
+        if Self::step1a(w) { res = true; }
+        for (i, &exc) in EXCEPTIONS2.iter().enumerate() {
+            if w.equals_str(exc) {
+                Self::hash(w);
+                w.r#type |= TYPES_EXCEPTIONS2[i];
+                return res;
+            }
+        }
+        if Self::step1b(w, r1)     { res = true; }
+        if Self::step1c(w)         { res = true; }
+        if Self::step2(w, r1)      { res = true; }
+        if Self::step3(w, r1, r2)  { res = true; }
+        if Self::step4(w, r2)      { res = true; }
+        if Self::step5(w, r1, r2)  { res = true; }
+        for i in (w.start as usize)..=(w.end as usize) {
+            if w.letters[i] == b'Y' { w.letters[i] = b'y'; }
+        }
+        if w.r#type == 0 || w.r#type == eng::PLURAL {
+            if w.matches_any(MALE_WORDS) {
+                res = true; w.r#type |= eng::MALE;
+            } else if w.matches_any(FEMALE_WORDS) {
+                res = true; w.r#type |= eng::FEMALE;
+            } else if w.matches_any(ARTICLE_WORDS) {
+                res = true; w.r#type |= eng::ARTICLE;
+            } else if w.matches_any(CONJ_WORDS) {
+                res = true; w.r#type |= eng::CONJUNCTION;
+            } else if w.matches_any(APO_WORDS) {
+                res = true; w.r#type |= eng::ADPOSITION;
+            } else if w.matches_any(CON_AD_VER_PREP_WORDS) {
+                res = true; w.r#type |= eng::CONJUNCTIVE_ADVERB;
+            } else if blpos < 451_531_986 && w.matches_any(VERB_WORDS1) {
+                res = true; w.r#type |= eng::VERB;
+            } else if w.matches_any(NUMBERS) {
+                res = true; w.r#type |= eng::NUMBER;
+            }
+        }
+        Self::hash(w);
+        res
+    }
+}
+
 // ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
@@ -2566,6 +3564,95 @@ mod tests {
         cm.set(0xCAFEBABE);
         cm.sets();
         assert_eq!(cm.cn, 3);
+    }
+
+    /// Helper: build a `Word` from a byte literal.
+    fn make_word(s: &[u8]) -> Word {
+        let mut w = Word::new();
+        for &c in s { w.append(c); }
+        w
+    }
+
+    #[test]
+    fn stemmer_basic_plural() {
+        let mut w = make_word(b"cats");
+        let _ = EnglishStemmer::stem(&mut w, 0);
+        // "cats" is plural; the stemmer returns the singular root
+        // and tags the word as Plural.
+        assert!((w.r#type & eng::PLURAL) != 0,
+            "type=0x{:x} should have PLURAL bit", w.r#type);
+    }
+
+    #[test]
+    fn stemmer_recognises_male_pronoun() {
+        let mut w = make_word(b"he");
+        EnglishStemmer::stem(&mut w, 0);
+        assert!((w.r#type & eng::MALE) != 0,
+            "type=0x{:x} should have MALE bit", w.r#type);
+    }
+
+    #[test]
+    fn stemmer_recognises_article() {
+        let mut w = make_word(b"the");
+        EnglishStemmer::stem(&mut w, 0);
+        assert!((w.r#type & eng::ARTICLE) != 0,
+            "type=0x{:x} should have ARTICLE bit", w.r#type);
+    }
+
+    #[test]
+    fn stemmer_recognises_number_word() {
+        let mut w = make_word(b"three");
+        EnglishStemmer::stem(&mut w, 0);
+        assert!((w.r#type & eng::NUMBER) != 0,
+            "type=0x{:x} should have NUMBER bit", w.r#type);
+    }
+
+    #[test]
+    fn stemmer_handles_exception1() {
+        // "skies" → "sky" via Exceptions1[1]; tagged Noun|Plural.
+        let mut w = make_word(b"skies");
+        EnglishStemmer::stem(&mut w, 0);
+        assert!(w.equals_str(b"sky"),
+            "letters[start..=end]={:?} should equal 'sky'",
+            std::str::from_utf8(&w.letters[w.start as usize..=w.end as usize]).ok());
+        assert!((w.r#type & (eng::NOUN | eng::PLURAL)) == (eng::NOUN | eng::PLURAL));
+    }
+
+    #[test]
+    fn stemmer_strips_step1b_suffix() {
+        // "running" → after Step1b drops "ing", IsDouble('n') fires
+        // → drop one more letter → "run".
+        let mut w = make_word(b"running");
+        EnglishStemmer::stem(&mut w, 0);
+        assert!(w.equals_str(b"run"),
+            "letters[start..=end]={:?} should equal 'run'",
+            std::str::from_utf8(&w.letters[w.start as usize..=w.end as usize]).ok());
+        assert!((w.r#type & eng::PRESENT_PARTICIPLE) != 0);
+    }
+
+    #[test]
+    fn stemmer_hash_changes_with_letters() {
+        let mut a = make_word(b"hello");
+        let mut b = make_word(b"world");
+        EnglishStemmer::stem(&mut a, 0);
+        EnglishStemmer::stem(&mut b, 0);
+        // Different letter sequences must produce different hashes.
+        assert_ne!(a.hash, b.hash);
+    }
+
+    #[test]
+    fn stemmer_blpos_threshold_disables_verb_words() {
+        // VerbWords1 has "is" — gated behind blpos < 451531986.
+        let mut w_below = make_word(b"is");
+        EnglishStemmer::stem(&mut w_below, 0);
+        assert!((w_below.r#type & eng::VERB) != 0,
+            "before threshold, 'is' should be tagged VERB");
+
+        let mut w_above = make_word(b"is");
+        EnglishStemmer::stem(&mut w_above, 451_531_986);
+        // After the threshold the VerbWords1 branch is disabled.
+        assert!((w_above.r#type & eng::VERB) == 0,
+            "at threshold, VerbWords1 branch must be skipped");
     }
 
     #[test]
