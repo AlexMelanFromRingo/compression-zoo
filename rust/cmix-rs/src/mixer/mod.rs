@@ -1,5 +1,11 @@
 //! Online context mixer — port of `mixer/{mixer,mixer-input}.{h,cpp}`.
 //!
+//! Submodules:
+//!   * [`lstm_layer`] — single LSTM layer with Adam + BPTT.
+//!
+//! The full LSTM stack and LSTM-driven byte mixer are TODO; see
+//! HANDOFF.
+//!
 //! [`MixerInput`] gathers per-model bit-1 probabilities (one per
 //! sub-model) plus a small set of "extra" stretched inputs, all
 //! mapped through the [`crate::sigmoid::Sigmoid`] logit table so
@@ -14,6 +20,10 @@
 //! (proportional to that context's hit count).
 
 #![allow(dead_code)]
+
+pub mod byte_mixer;
+pub mod lstm;
+pub mod lstm_layer;
 
 use std::collections::HashMap;
 
