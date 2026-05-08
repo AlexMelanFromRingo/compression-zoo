@@ -258,33 +258,50 @@ Method IDs (community-aligned):
    algorithmic rework (bit-packed L/S backed by SIMD shuffles, the
    gap-array trick to skip already-sorted bucket regions). Neither
    fits the cleanliness goal of this crate; future work, deferred.
-4. **CMIX-rs.** Significant progress this session — full foundation
-   plus the small-model layer:
-     - `coder.rs`     — float-probability arith encoder/decoder.
-     - `sigmoid.rs`   — Logit table + scalar Logistic.
+4. **CMIX-rs.** Substantial foundation in place — covers every
+   sub-module that doesn't pull in PAQ/PPMd/FXCM:
+     - `coder.rs`            — float-probability arith encoder/decoder.
+     - `sigmoid.rs`          — Logit table + scalar Logistic.
      - `state.rs` + `states/{run_map, nonstationary}.rs` — both
        PAQ-derived state machines, tables verbatim from upstream.
-     - `mixer.rs`     — `MixerInput` + `Mixer` (per-context weights
-       in `HashMap<u64, ContextData>`, online SGD with global +
-       per-context decay). Learning smoke-test passes.
-     - `contexts.rs`  — every Context type from `contexts/*.cpp`:
-       BitContext, ContextHash, CombinedContext, Interval,
-       IntervalHash, IndirectHash, Sparse, BracketContext.
-     - `models.rs`    — Direct, DirectHash, Indirect, Match,
-       ByteModel. Each with round-trip / convergence tests.
-   Tests: 25/25 in cmix-rs.
-   Remaining (still multi-week per the original handoff, but smaller
-   now):
-     - `models/bracket.cpp`           (~60 LOC, subclass of ByteModel
-                                       with vocab + match-pair stats).
-     - `mixer/{byte-mixer, lstm, lstm-layer, sse}.cpp` (~500 LOC) —
-       the LSTM-based refinement stack on top of the linear `Mixer`.
-     - `predictor.cpp` (~490 LOC) — the orchestrator that wires
-       every sub-model into the mixer pipeline.
-     - `context-manager.cpp` + `runner.cpp` — top-level driver.
+     - `context_manager.rs`  — per-byte shared state (history ring,
+       words rolling-hash, recent-bytes ring, line-break / WRT
+       counters). The `update_bit(bit) → bool` entry point fires
+       the byte-end side-effects automatically.
+     - `mixer/mod.rs`        — `MixerInput` + `Mixer` (per-context
+       weights in `HashMap<u64, ContextData>`, online SGD with
+       global + per-context decay).
+     - `mixer/lstm_layer.rs` — single LSTM layer with three
+       NeuronLayer gates (forget / input / output), per-cell layer
+       normalisation, Adam-optimised weights, BPTT through `horizon`
+       steps with gradient clipping.
+     - `mixer/lstm.rs`       — multi-layer LSTM orchestrator.
+       Forward+softmax, BPTT on horizon wrap-around.
+     - `mixer/byte_mixer.rs` — wraps the LSTM in a 256-byte
+       distribution model, masked by the caller-supplied vocab.
+     - `contexts.rs`         — every Context type (Bit, ContextHash,
+       Combined, Interval, IntervalHash, IndirectHash, Sparse,
+       Bracket).
+     - `models.rs`           — Direct, DirectHash, Indirect, Match,
+       ByteModel, Bracket. Each with convergence / round-trip /
+       smoke tests.
+   Tests: 32/32 in cmix-rs (~2200 LOC of Rust).
+   Remaining (still multi-day per the original handoff, but the
+   structural foundation is now in place):
+     - `mixer/sse.cpp` (~330 LOC) — Eugene Shelwien's templated
+       SSE smoother with several hundred MB of `SSEi<7>` /
+       `Mixer` instances. Mostly bit-fiddling; the port shape is
+       clear, just tedious.
+     - `predictor.cpp` (~490 LOC) — top-level orchestrator. Builds
+       the model graph (AddBracket, AddPAQ8, AddPPMD, AddWord,
+       AddDirect, AddMatch, AddDoubleIndirect, AddMixers, …) and
+       drives a layered Mixer + SSE pipeline. Once it lands the
+       bit-level CMIX is end-to-end runnable.
+     - `runner.cpp` (~330 LOC) — top-level driver / CLI.
      - **Big models** (the bulk of CMIX): `paq8.cpp` (~8.4 K LOC),
        `fxcmv1.cpp` (~4.9 K LOC), `ppmd.cpp` (~1.3 K LOC). These
-       are the heavy hitters — each is a multi-day port on its own.
+       are the heavy hitters — each is a multi-day port on its
+       own and dwarfs everything above.
    The shape of the work is mostly mechanical (one module at a
    time, with cross-validation via per-byte trace bisection against
    the upstream binary), but the *size* is real.
