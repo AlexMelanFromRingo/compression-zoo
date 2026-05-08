@@ -3701,6 +3701,166 @@ pub fn build_pre1_from_sta7(sta7: &[u8], strt: &[i16]) -> [i16; 256] {
 }
 
 // ====================================================================
+// `FxcmState` — captures the file-scope mutable globals that
+// upstream's `fxcmv1.cpp` shares between modelPrediction, update1
+// and PredictorInit. Carving them into a struct lets the per-bit
+// pipeline take a single `&mut FxcmState` instead of touching
+// dozens of separate variables.
+// ====================================================================
+
+pub struct FxcmState {
+    // Recent whole bytes (separate from `BlockData::c4` because text
+    // / wiki preprocessing sometimes overrides them).
+    pub c1: u8,
+    pub c2: u8,
+    pub c3: u8,
+
+    // 2/3/4-bit byte classifier outputs and their running streams.
+    pub n2b_state: u32,
+    pub n3b_state: u32,
+    pub n4b_state: u32,
+    pub o2b_state: u32,
+    pub o3b_state: u32,
+    pub o4b_state: u32,
+    pub stream2b:  u32,
+    pub stream3b:  u32,
+    pub stream4b:  u32,
+    pub stream2b_r: u32,
+    pub stream3b_r: u32,
+    pub stream4b_r: u32,
+
+    // Word/sentence rolling hashes.
+    pub word0:     u32,
+    pub word00:    u32,
+    pub word1:     u32,
+    pub word2:     u32,
+    pub word3:     u32,
+    pub wshift:    u32,
+    pub x4:        u32,
+    pub x5:        u32,
+    pub is_match:  u32,
+    pub first_word: u32,
+    pub link_word: u32,
+    pub sen_word:  u32,
+
+    // Number-tracking fields.
+    pub number0:   u32,
+    pub number1:   u32,
+    pub numlen0:   u32,
+    pub numlen1:   u32,
+    pub mybenum:   u32,
+
+    // Counters and APM hashes.
+    pub words:     u8,
+    pub spaces:    u8,
+    pub numbers:   u8,
+    pub fc_idx:    u32,
+    pub br_fc_idx: u32,
+    pub ah1:       u32,
+    pub ah2:       u32,  // initial: 0x765BA55C
+    pub fails:     u32,
+    pub failz:     u32,
+    pub failcount: u32,
+
+    // Line tracking.
+    pub nl:  i32,
+    pub nl1: i32,
+    pub col: i32,
+    pub fc:  i32,
+
+    // 14-element hash table consulted by MatchModel2 + ContextMaps.
+    pub t: [u32; 14],
+
+    // Position counter (bytes seen so far).
+    pub pos: u32,
+
+    // 3-bit / 2-bit / mask state.
+    pub stream3b_mask:  u32,
+    pub stream3b_mask1: u32,
+    pub stream3b_r_mask1: u32,
+    pub stream3b_r_mask2: u32,
+    pub stream2b_mask:  u32,
+
+    // Order counters used by ContextMap selection.
+    pub ord_x: i32,
+    pub ord_w: i32,
+
+    // Wiki/text mode flags.
+    pub is_text:        bool,
+    pub is_paragraph:   i32,
+    pub is_now_iki:     bool,
+    pub last_art:       bool,
+    pub utf8_left:      i32,
+
+    // SSE rate (APM update rate).
+    pub sscm_rate: i32,
+    pub rate:      i32,
+
+    // Other indices.
+    pub last_wt:        u32,
+    pub indirect_br_byte: u32,
+    pub indirect_byte:    u32,
+    pub indirect_word0_pos: u32,
+    pub indirect_word:    u32,
+    pub u8w:              u32,
+    pub context1_ind3:    u32,
+    pub cxt_ind3:         u32,
+    pub stem_index:       i32,
+    pub s_verb:           u32,
+    pub dec_code:         i32,
+
+    // Final prediction value (the `pr` upstream global).
+    pub pr: i32,
+
+    // 4-Word stemmer ring (`StemWords[4]` upstream).
+    pub stem_words: [Word; 4],
+    /// Index into stem_words for the current word.
+    pub c_word: usize,
+    /// Index into stem_words for the previous word.
+    pub p_word: usize,
+}
+
+impl FxcmState {
+    pub fn new() -> Self {
+        Self {
+            c1: 0, c2: 0, c3: 0,
+            n2b_state: 0xffffffff, n3b_state: 0xffffffff, n4b_state: 0,
+            o2b_state: 0, o3b_state: 0, o4b_state: 0,
+            stream2b: 0, stream3b: 0, stream4b: 0,
+            stream2b_r: 0, stream3b_r: 0, stream4b_r: 0,
+            word0: 0, word00: 0, word1: 0, word2: 0, word3: 0,
+            wshift: 0, x4: 0, x5: 0, is_match: 0,
+            first_word: 0, link_word: 0, sen_word: 0,
+            number0: 0, number1: 0, numlen0: 0, numlen1: 0, mybenum: 0,
+            words: 0, spaces: 0, numbers: 0,
+            fc_idx: 0, br_fc_idx: 0,
+            ah1: 0, ah2: 0x765BA55C,
+            fails: 0, failz: 0, failcount: 0,
+            nl: 0, nl1: 0, col: 0, fc: 0,
+            t: [0u32; 14],
+            pos: 0,
+            stream3b_mask: 0, stream3b_mask1: 0,
+            stream3b_r_mask1: 0, stream3b_r_mask2: 0,
+            stream2b_mask: 0,
+            ord_x: 0, ord_w: 0,
+            is_text: false, is_paragraph: 0, is_now_iki: false,
+            last_art: false, utf8_left: 0,
+            sscm_rate: 0, rate: 6,
+            last_wt: 0,
+            indirect_br_byte: 0, indirect_byte: 0,
+            indirect_word0_pos: 0, indirect_word: 0, u8w: 0,
+            context1_ind3: 0, cxt_ind3: 0,
+            stem_index: 0, s_verb: 0, dec_code: 0,
+            pr: 2048,
+            stem_words: [Word::new(), Word::new(), Word::new(), Word::new()],
+            c_word: 0, p_word: 3,
+        }
+    }
+}
+
+impl Default for FxcmState { fn default() -> Self { Self::new() } }
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -4208,6 +4368,24 @@ mod tests {
         // After the threshold the VerbWords1 branch is disabled.
         assert!((w_above.r#type & eng::VERB) == 0,
             "at threshold, VerbWords1 branch must be skipped");
+    }
+
+    #[test]
+    fn fxcm_state_initialises_to_known_constants() {
+        let s = FxcmState::new();
+        // Mirror of upstream's PredictorInit constants:
+        assert_eq!(s.n2b_state, 0xffffffff);
+        assert_eq!(s.n3b_state, 0xffffffff);
+        assert_eq!(s.ah2, 0x765BA55C);
+        assert_eq!(s.pr, 2048);
+        assert_eq!(s.rate, 6);
+        // 4 words, c_word=0 / p_word=3 to mirror upstream's
+        // `cWord=&StemWords[0], pWord=&StemWords[3]`.
+        assert_eq!(s.stem_words.len(), 4);
+        assert_eq!(s.c_word, 0);
+        assert_eq!(s.p_word, 3);
+        // 14-entry hash table all zero.
+        assert!(s.t.iter().all(|&x| x == 0));
     }
 
     #[test]
