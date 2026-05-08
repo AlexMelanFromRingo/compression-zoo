@@ -2,9 +2,11 @@
 //!
 //! Submodules:
 //!   * [`lstm_layer`] — single LSTM layer with Adam + BPTT.
-//!
-//! The full LSTM stack and LSTM-driven byte mixer are TODO; see
-//! HANDOFF.
+//!   * [`lstm`]        — multi-layer LSTM orchestrator with
+//!     horizon-based BPTT and a softmax output head.
+//!   * [`byte_mixer`]  — wraps the LSTM in a 256-byte distribution
+//!     model, masked by the caller-supplied vocabulary.
+//!   * [`sse`]         — Eugene Shelwien's two-stage SSE smoother.
 //!
 //! [`MixerInput`] gathers per-model bit-1 probabilities (one per
 //! sub-model) plus a small set of "extra" stretched inputs, all

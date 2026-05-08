@@ -1,26 +1,14 @@
 //! Per-context probability models — port of `models/*.{h,cpp}`.
 //!
-//! What's included this session: the four small models used by
-//! every CMIX configuration as the foundation of the per-byte
-//! probability mix:
+//! Small models (live in this file): [`Direct`], [`DirectHash`],
+//! [`Indirect`], [`Match`], [`ByteModel`], [`Bracket`].
 //!
-//!   * [`Direct`]      — `(byte_context, bit_context) → probability`,
-//!     with an adaptive divisor that ramps up toward `limit + delta`.
-//!   * [`DirectHash`]  — same shape, but `byte_context` is hashed
-//!     into `size` slots with 20-probe linear-probing checksum
-//!     collision detection.
-//!   * [`Indirect`]    — a state-machine probability where the
-//!     state index lives in a caller-owned byte map. Each
-//!     `perceive(bit)` walks the state via a [`crate::state::State`]
-//!     transition.
-//!   * [`Match`]       — longest-match predictor backed by a sliding
-//!     history buffer.
-//!
-//! Bigger models (PAQ8, FXCMv1, PPMd, ByteModel/Bracket with its
-//! vocabulary stack) are deferred to follow-up sessions and tracked
-//! in `HANDOFF.md`.
+//! Submodules:
+//!   * [`ppmd`]   — `models/ppmd.{h,cpp}` (mod_ppmd_v2).
 
 #![allow(dead_code)]
+
+pub mod ppmd;
 
 use crate::state::State;
 
