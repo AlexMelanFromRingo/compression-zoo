@@ -131,17 +131,16 @@ pub fn unbwt(t: &mut [u8], primary: i32) -> Result<(), BwtError> {
 ///     would have been the sentinel; libbsc squashes it out and
 ///     records its position via `primary = internal_index + 1`.
 ///
-/// The implementation builds the suffix array via prefix doubling
-/// (O(n log² n) and cache-friendly), avoiding the O(n² log n) cost
-/// of naïve byte-by-byte sorting. For very large inputs a libsais
-/// SA-IS port would be substantially faster, but for the sizes the
-/// bsc plugin handles in tests this is fine.
+/// The forward BWT runs in O(n) via the SA-IS suffix array
+/// constructor in [`crate::sais`]. The legacy O(n log² n) prefix-
+/// doubling implementation lives in [`suffix_array_prefix_doubling`]
+/// for cross-validation in tests.
 pub fn encode(input: &[u8]) -> (Vec<u8>, i32) {
     let n = input.len();
     if n == 0 { return (Vec::new(), 0); }
     if n == 1 { return (vec![input[0]], 1); }
 
-    let sa = suffix_array(input);
+    let sa = crate::sais::sais_u8(input);
 
     let mut bwt = vec![0u8; n];
     let mut internal_index = 0usize;
@@ -166,11 +165,9 @@ pub fn encode(input: &[u8]) -> (Vec<u8>, i32) {
 /// `t` sorted lexicographically (with the implicit "shorter suffix
 /// is smaller" tie-break that matches libbsc's BWT wire format).
 ///
-/// This is a straightforward O(n log² n) implementation:
-///   1. Rank each position by its first character (radix-sort-able).
-///   2. Sort positions by `(rank[i], rank[i+k])` pairs.
-///   3. Re-rank, double `k`, repeat until ranks are all unique.
-pub fn suffix_array(t: &[u8]) -> Vec<usize> {
+/// O(n log² n). Kept around as a reference / fuzzing oracle; the
+/// production path is [`crate::sais::sais_u8`].
+pub fn suffix_array_prefix_doubling(t: &[u8]) -> Vec<usize> {
     let n = t.len();
     let mut sa: Vec<usize> = (0..n).collect();
 

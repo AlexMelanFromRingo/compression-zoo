@@ -20,8 +20,5 @@ pub mod predictor;
 pub mod qlfc;
 pub mod qlfc_model;
 pub mod rangecoder;
+pub mod sais;
 pub mod st;
-// pub mod st;         // TODO
-// pub mod qlfc;       // TODO
-// pub mod libsais;    // TODO
-// pub mod libbsc;     // top-level public API (compress/decompress)

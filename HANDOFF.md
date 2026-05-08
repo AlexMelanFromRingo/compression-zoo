@@ -46,7 +46,7 @@ If any are missing, source files for them are at `/tmp/*.cpp`.
 
 ## Status summary
 
-### `bsc-rs` — DONE (encode + decode for all 5 libbsc levels)
+### `bsc-rs` — DONE (encode + decode for all 5 libbsc levels, SA-IS)
 
 Files:
 ```
@@ -55,19 +55,28 @@ rust/bsc-rs/src/
   format.rs    libbsc.rs (compress/decompress)
   lzp.rs       predictor.rs (ProbabilityCounter, ProbabilityMixer)
   qlfc.rs (static/adaptive/fast — encoder AND decoder)
-  qlfc_model.rs (Model1, Model2)   rangecoder.rs   st.rs (inverse)
+  qlfc_model.rs (Model1, Model2)
+  rangecoder.rs   sais.rs (Nong 2009 SA-IS)   st.rs (inverse)
 ```
 
 Test results:
-- 49 unit tests pass.
+- 61 unit tests pass (49 prior + 12 SA-IS).
 - **30/30** Rust enc → Rust+libbsc dec (5 levels × 6 fixtures).
 - **20/20** ST inverse vs libbsc (k=3..6 × 5 fixtures).
 - **6/6** unbwt vs libsais.
 - **8/8** range coder bidirectional vs libbsc.
+- **12/12** SA-IS vs naive lex sort (incl. 64K random + periodic 3K).
+
+Forward BWT now goes through `sais::sais_u8` (SA-IS, O(n)). On 1 MB
+random data this is ~3.5× faster than the prefix-doubling fallback
+(~115 ms vs ~400 ms). The prefix-doubling impl is kept as
+`bwt::suffix_array_prefix_doubling` for fuzzing parity.
 
 Remaining work (low priority):
 - Forward ST (most archives use BWT, not ST).
-- libsais SA-IS port for faster forward BWT (current is prefix-doubling, O(n log² n)).
+- libsais's heavy optimisations (cache-aware bucket layout, parallel
+  passes). The current SA-IS is the unoptimised reference Nong 2009
+  paper — correct but ~2-3× slower than libsais proper.
 
 ### `zpaq-rs` — decompress 0–5 + encode (stored + canned models 1/2/3)
 
@@ -186,10 +195,9 @@ Method IDs (community-aligned):
    canned models" to "any libzpaq method string". Compiler is ~500
    lines of recursive-descent over `opcodelist`; LZ77/BWT/E8E9 are
    another ~1K lines. After this `compressBlock(method)` is reachable.
-2. **libsais SA-IS Rust port.** Standalone, well-bounded (libsais.c
-   is ~5K lines, no global state). Replaces my prefix-doubling SA
-   in `bsc-rs/src/bwt.rs::suffix_array`.
-3. **CMIX-rs.** Start only if explicitly asked. Multi-session.
+2. **CMIX-rs.** Start only if explicitly asked. Multi-session.
+3. *(optional)* libsais cache-aware optimisations (currently the
+   SA-IS port is the unoptimised reference, ~2-3× slower than libsais).
 
 ## Tests at handoff
 
