@@ -748,6 +748,405 @@ impl SmallStationaryContextMap {
 }
 
 // ====================================================================
+// `EBucket<A, B>` — one cache-line hash bucket for the ContextMap
+// family. Layout:
+//
+//   chk[A]:  A × u16                          (2 * A bytes)
+//   last:    u8                               (1 byte)
+//   bh[A][7]: A * 7 × u8                      (7 * A bytes)
+//   pad to B
+//
+// The bucket is stored as a flat `[u8; B]` (cache-line aligned by
+// the containing Vec) with helper accessors.
+// ====================================================================
+
+#[derive(Clone, Copy)]
+pub struct EBucket<const A: usize, const B: usize> {
+    pub data: [u8; B],
+}
+
+impl<const A: usize, const B: usize> EBucket<A, B> {
+    pub fn new() -> Self { Self { data: [0; B] } }
+
+    #[inline] fn chk_off(i: usize) -> usize { 2 * i }
+    #[inline] fn last_off() -> usize { 2 * A }
+    #[inline] fn bh_off(i: usize, j: usize) -> usize { 2 * A + 1 + i * 7 + j }
+
+    #[inline] pub fn chk(&self, i: usize) -> u16 {
+        let o = Self::chk_off(i);
+        u16::from_le_bytes([self.data[o], self.data[o + 1]])
+    }
+    #[inline] pub fn set_chk(&mut self, i: usize, v: u16) {
+        let o = Self::chk_off(i);
+        self.data[o..o + 2].copy_from_slice(&v.to_le_bytes());
+    }
+    #[inline] pub fn last(&self) -> u8 { self.data[Self::last_off()] }
+    #[inline] pub fn set_last(&mut self, v: u8) { self.data[Self::last_off()] = v; }
+    #[inline] pub fn bh(&self, i: usize, j: usize) -> u8 { self.data[Self::bh_off(i, j)] }
+    #[inline] pub fn set_bh(&mut self, i: usize, j: usize, v: u8) {
+        self.data[Self::bh_off(i, j)] = v;
+    }
+
+    /// Find / insert an element matching `ch`. Returns the row
+    /// index `i` (caller indexes `bh[i][0..7]` from there).
+    pub fn get(&mut self, ch: u16, keep: u8) -> usize {
+        let last = self.last();
+        let last_lo = (last & 15) as usize;
+        if last_lo < A && self.chk(last_lo) == ch {
+            return last_lo;
+        }
+        let mut best_priority = 0xFFFFu16;
+        let mut best_i = 0usize;
+        for i in 0..A {
+            if self.chk(i) == ch {
+                self.set_last(((last & 0x0F) << 4) as u8 | i as u8);
+                return i;
+            }
+            let pri = self.bh(i, 0) as u16;
+            let last_hi = (last >> 4) as usize;
+            if pri < best_priority && last_lo != i && last_hi != i {
+                best_priority = pri;
+                best_i = i;
+            }
+        }
+        // Replace.
+        self.set_last(((last & 0x0F) << 4) as u8 | best_i as u8 | (keep & 0x0F));
+        self.set_chk(best_i, ch);
+        for j in 0..7 { self.set_bh(best_i, j, 0); }
+        best_i
+    }
+}
+
+// ====================================================================
+// `getStateByteLocation(bp, c0)` — pick which byte slot inside the
+// 7-byte bh row to use given the current bit position and partial
+// byte. Mirrors upstream's macro.
+// ====================================================================
+
+#[inline]
+pub fn get_state_byte_location(bpos: i32, c0: i32) -> u32 {
+    let smask = (0x31031010u32 >> (bpos << 2)) & 0x0F;
+    smask + (c0 as u32 & smask)
+}
+
+#[inline]
+pub fn sc(p: i32) -> i32 {
+    if p > 0 { p >> 7 } else { (p + 127) >> 7 }
+}
+
+#[inline]
+pub fn ctx_pre(nn: &[u8], state: i32) -> i32 {
+    let n0 = nn[(state * 4 + 2) as usize] as i32 * 3 + 1;
+    let n1 = nn[(state * 4 + 3) as usize] as i32 * 3 + 1;
+    (n1 << 12) / (n0 + n1).max(1)
+}
+
+// ====================================================================
+// `ContextMap` over generic bucket size. Upstream parameterises this
+// as `E<7,64>` (regular ContextMap), `E<3,32>` (ContextMap1), and
+// `E<14,128>` (ContextMap2). Each variant differs only in bucket
+// size; the algorithm is identical.
+// ====================================================================
+
+pub const MAX_CXT: usize = 8;
+
+pub struct ContextMap<const A: usize, const B: usize> {
+    pub c: usize,             // max contexts (≤ MAX_CXT)
+    pub buckets: Vec<EBucket<A, B>>,
+    pub tmask: u32,
+    pub cn: usize,
+    pub cxt_mask: u16,
+    pub cxt: [u32; MAX_CXT],
+    /// Bucket index (linear) and row index inside the bucket.
+    pub cp_bucket: [u32; MAX_CXT],
+    pub cp_row:    [u8;  MAX_CXT],
+    pub cp_col:    [u8;  MAX_CXT],
+    pub cp0_col:   [u8;  MAX_CXT],
+    pub runp_off:  [u8;  MAX_CXT],
+    pub sm: Vec<StateMap>,
+    pub kep: u8,
+    pub skip2: i32,
+    pub cms: i32,
+    pub cms3: i32,
+    pub cms4: i32,
+    pub st1: Vec<i16>,        // [4096]
+    pub st2: Vec<i16>,        // [4096]
+    pub st32: [i16; 256],
+    pub st8:  [i16; 256],
+    pub rc1:  [i16; 512],
+    pub result: i32,
+    /// Whether `cp[i]` is "live" (mirrors upstream's null check on cp[i]).
+    pub cp_live: [bool; MAX_CXT],
+}
+
+impl<const A: usize, const B: usize> ContextMap<A, B> {
+    /// `m` is bucket-array size in BYTES (must be power-of-two,
+    /// ≥ 64). `c` packs C (low byte), cmul (next byte), cms (next).
+    pub fn new(
+        m: u32,
+        c: i32,
+        s3: i32,
+        nn: &[u8],
+        cs4: i32,
+        k: u8,
+        u_skip2: i32,
+        st_in: &[i16],
+        ilog: &[u8; 256],
+    ) -> Self {
+        debug_assert!(m >= 64 && (m & (m - 1)) == 0);
+        let cval = c & 0xFF;
+        let cmul = (c >> 8) & 0xFF;
+        let cms = (c >> 16) & 0xFF;
+        let bucket_count = (m / B as u32) as usize;
+        let tmask = bucket_count as u32 - 1;
+
+        let mut sm: Vec<StateMap> = Vec::with_capacity(cval as usize);
+        for _ in 0..cval { sm.push(StateMap::new(256, nn)); }
+
+        let mut rc1 = [0i16; 512];
+        for rc in 0..256 {
+            let mut cc = ilog[rc] as i32;
+            cc <<= 2 + ((!rc) & 1);
+            if (rc & 1) == 0 { cc = cc * cmul / 4; }
+            rc1[rc + 256] = clp(cc);
+            rc1[rc]       = clp(-cc);
+        }
+
+        let mut st1 = vec![0i16; 4096];
+        let strt_local = build_stretch_table();
+        for i in 0..4096 {
+            st1[i] = clp(sc(cms * (strt_local[i] as i32)));
+        }
+
+        let mut st32 = [0i16; 256];
+        let mut st8  = [0i16; 256];
+        for s in 0..256 {
+            let n0 = -((nn[(s * 4 + 2) as usize] == 0) as i32);
+            let n1 = -((nn[(s * 4 + 3) as usize] == 0) as i32);
+            let r;
+            let mut sp0 = 0;
+            let diff = n1 - n0;
+            if diff == 1       { r = 1; sp0 = 0; }
+            else if diff == -1 { r = 1; sp0 = 4095; }
+            else { r = 0; }
+            if r != 0 {
+                st8[s]  = clp(sc(cs4 * (ctx_pre(nn, s as i32) - sp0)));
+                st32[s] = clp(sc(s3 * (strt_local[ctx_pre(nn, s as i32) as usize] as i32)));
+                if s < 8 { st32[s] = 0; }
+            }
+        }
+
+        let mut buckets = Vec::with_capacity(bucket_count);
+        for _ in 0..bucket_count { buckets.push(EBucket::new()); }
+        let st2 = if st_in.is_empty() { vec![0i16; 4096] } else { st_in.to_vec() };
+
+        Self {
+            c: cval as usize,
+            buckets,
+            tmask,
+            cn: 0,
+            cxt_mask: 0,
+            cxt: [0; MAX_CXT],
+            cp_bucket: [0; MAX_CXT],
+            cp_row:    [0; MAX_CXT],
+            cp_col:    [0; MAX_CXT],
+            cp0_col:   [0; MAX_CXT],
+            runp_off:  [3; MAX_CXT],
+            sm,
+            kep: k,
+            skip2: u_skip2,
+            cms,
+            cms3: s3,
+            cms4: cs4,
+            st1,
+            st2,
+            st32,
+            st8,
+            rc1,
+            result: 0,
+            cp_live: [true; MAX_CXT],
+        }
+    }
+
+    /// Set the i'th context. Mirrors `inline void set(U32 cx)`.
+    pub fn set(&mut self, mut cx: u32) {
+        let i = self.cn;
+        debug_assert!(i < self.c);
+        cx = cx.wrapping_mul(987_654_323).wrapping_add(i as u32);
+        cx = (cx << 16) | (cx >> 16);
+        self.cxt[i] = cx.wrapping_mul(123_456_791).wrapping_add(i as u32);
+        self.cn += 1;
+        self.cxt_mask = self.cxt_mask.wrapping_mul(2);
+    }
+
+    pub fn sets(&mut self) {
+        self.cn += 1;
+        self.cxt_mask = self.cxt_mask.wrapping_add(1).wrapping_mul(2);
+    }
+
+    /// Returns the current bit-history state at `cp[i]`.
+    fn cp_state(&self, i: usize) -> u8 {
+        let b = &self.buckets[self.cp_bucket[i] as usize];
+        b.bh(self.cp_row[i] as usize, self.cp_col[i] as usize)
+    }
+
+    /// Set the current bit-history state at `cp[i]`.
+    fn set_cp_state(&mut self, i: usize, v: u8) {
+        let b = &mut self.buckets[self.cp_bucket[i] as usize];
+        b.set_bh(self.cp_row[i] as usize, self.cp_col[i] as usize, v);
+    }
+
+    /// runp slot byte (0..3 of the row, treated as count/value/unused/unused).
+    fn runp_byte(&self, i: usize, off: usize) -> u8 {
+        let b = &self.buckets[self.cp_bucket[i] as usize];
+        b.bh(self.cp_row[i] as usize, (self.runp_off[i] as usize + off) & 7)
+    }
+    fn set_runp_byte(&mut self, i: usize, off: usize, v: u8) {
+        let b = &mut self.buckets[self.cp_bucket[i] as usize];
+        b.set_bh(self.cp_row[i] as usize, (self.runp_off[i] as usize + off) & 7, v);
+    }
+
+    /// Inner mixer-input emit for state `s`. Adds 5 inputs to `out`
+    /// (or 4 if skip2 == 0). The two trailing prediction-tracker
+    /// helpers in upstream's `prediction_index--` are not modelled
+    /// here — callers count emitted inputs per upstream's flow.
+    fn mix3(&mut self, s: u8, sm_idx: usize, y: i32, out: &mut Vec<i16>) -> i32 {
+        if s == 0 {
+            out.push(0);
+            if self.skip2 == 1 { out.push(0); }
+            out.push(0);
+            out.push(0);
+            out.push(64); // 32 * 2
+            0
+        } else {
+            self.sm[sm_idx].set(y, s as usize);
+            let p1 = self.sm[sm_idx].pr;
+            out.push(self.st1[p1.clamp(0, 4095) as usize]);
+            if self.skip2 == 1 { out.push(self.st2[p1.clamp(0, 4095) as usize]); }
+            out.push(self.st8[s as usize]);
+            out.push(self.st32[s as usize]);
+            out.push(0);
+            1
+        }
+    }
+
+    fn mix4(&self, out: &mut Vec<i16>) {
+        out.push(0);
+        if self.skip2 == 1 { out.push(0); }
+        out.push(0);
+        out.push(0);
+        out.push(64);
+        out.push(0);
+    }
+
+    /// Per-bit update + predict. Mirrors `mix1(cc, bp, c1)` in the
+    /// upstream class. `y` is the just-decoded bit; `cc=c0`,
+    /// `bp=bpos`, `c1` is the most-recent whole byte (low byte of
+    /// `c4`). Outputs are appended to `out` (typically the
+    /// `mxInputs1` of a BlockData).
+    pub fn mix1(&mut self, cc: i32, bp: i32, c1: u8, y: i32, out: &mut Vec<i16>,
+                c0shift_bpos: i32, bposshift: i32, nn: &[u8])
+        -> i32
+    {
+        self.result = 0;
+        let cn = self.cn;
+        for i in 0..cn {
+            if (self.cxt_mask >> (cn - i)) & 1 != 0 {
+                self.mix4(out);
+                continue;
+            }
+
+            // Update bit-history with y.
+            if self.cp_live[i] {
+                let s = self.cp_state(i);
+                let next_s = nn[(s as usize) * 4 + y as usize];
+                self.set_cp_state(i, next_s);
+            }
+
+            // Refresh context pointers.
+            let mut s = 0u8;
+            if bp > 1 && self.runp_byte(i, 0) == 0 {
+                self.cp_live[i] = false;
+            } else {
+                let chksum = ((self.cxt[i] >> 16) ^ i as u32) as u16;
+                if bp != 0 {
+                    if bp == 2 || bp == 5 {
+                        let bidx = (self.cxt[i].wrapping_add(cc as u32) & self.tmask) as usize;
+                        let row = self.buckets[bidx].get(chksum, self.kep);
+                        self.cp_bucket[i] = bidx as u32;
+                        self.cp_row[i] = row as u8;
+                        self.cp_col[i] = 0;
+                        self.cp0_col[i] = 0;
+                    } else {
+                        self.cp_col[i] = (self.cp0_col[i] as u32
+                            + get_state_byte_location(bp, cc)) as u8 & 7;
+                    }
+                } else {
+                    let bidx = (self.cxt[i].wrapping_add(cc as u32) & self.tmask) as usize;
+                    let row = self.buckets[bidx].get(chksum, self.kep);
+                    self.cp_bucket[i] = bidx as u32;
+                    self.cp_row[i] = row as u8;
+                    self.cp_col[i] = 0;
+                    self.cp0_col[i] = 0;
+                    // Pending bit-history update for bits 2..7.
+                    let bh3 = self.buckets[bidx].bh(row, 3);
+                    if bh3 == 2 {
+                        let cv = self.buckets[bidx].bh(row, 4) as i32 + 256;
+                        // First half (3 bits).
+                        let half_idx_a = (self.cxt[i].wrapping_add((cv as u32) >> 6)
+                                          & self.tmask) as usize;
+                        let row_a = self.buckets[half_idx_a].get(chksum, self.kep);
+                        self.buckets[half_idx_a].set_bh(row_a, 0, 1 + ((cv >> 5) & 1) as u8);
+                        let off1 = 1 + ((cv >> 5) & 1) as usize;
+                        self.buckets[half_idx_a].set_bh(row_a, off1, 1 + ((cv >> 4) & 1) as u8);
+                        let off2 = 3 + ((cv >> 4) & 3) as usize;
+                        self.buckets[half_idx_a].set_bh(row_a, off2, 1 + ((cv >> 3) & 1) as u8);
+                        let half_idx_b = (self.cxt[i].wrapping_add((cv as u32) >> 3)
+                                          & self.tmask) as usize;
+                        let row_b = self.buckets[half_idx_b].get(chksum, self.kep);
+                        self.buckets[half_idx_b].set_bh(row_b, 0, 1 + ((cv >> 2) & 1) as u8);
+                        let off3 = 1 + ((cv >> 2) & 1) as usize;
+                        self.buckets[half_idx_b].set_bh(row_b, off3, 1 + ((cv >> 1) & 1) as u8);
+                        let off4 = 3 + ((cv >> 1) & 3) as usize;
+                        self.buckets[half_idx_b].set_bh(row_b, off4, 1 + (cv & 1) as u8);
+                        self.buckets[bidx].set_bh(row, 6, 0);
+                    }
+                    // Run-count update.
+                    if self.runp_byte(i, 0) == 0 {
+                        self.set_runp_byte(i, 0, 2);
+                        self.set_runp_byte(i, 1, c1);
+                    } else if self.runp_byte(i, 1) != c1 {
+                        self.set_runp_byte(i, 0, 1);
+                        self.set_runp_byte(i, 1, c1);
+                    } else if self.runp_byte(i, 0) < 254 {
+                        let v = self.runp_byte(i, 0) + 2;
+                        self.set_runp_byte(i, 0, v);
+                    }
+                    self.runp_off[i] = (self.cp_col[i] as i32 + 3) as u8 & 7;
+                }
+                self.cp_live[i] = true;
+                s = self.cp_state(i);
+            }
+
+            self.result += self.mix3(s, i, y, out);
+
+            // Run-context inputs.
+            let runp_count = self.runp_byte(i, 0);
+            let runp_value = self.runp_byte(i, 1);
+            let mut bb = c0shift_bpos ^ ((runp_value >> bposshift) as i32);
+            if bb <= 1 {
+                bb *= 256;
+                out.push(self.rc1[(runp_count as i32 + bb) as usize]);
+            } else {
+                out.push(0);
+            }
+        }
+        if bp == 7 { self.cn = 0; self.cxt_mask = 0; }
+        self.result
+    }
+}
+
+// ====================================================================
 // Top-level Predictor scaffolding (state owner). Models in the tree
 // (added in subsequent turns) live in fields of this struct.
 // ====================================================================
@@ -955,6 +1354,72 @@ mod tests {
         let mut out = Vec::new();
         s.mix(/*y=*/1, /*r=*/0, &sqt, &strt, &mut out);
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn ebucket_set_and_lookup() {
+        let mut b: EBucket<7, 64> = EBucket::new();
+        let row = b.get(0xABCD, 0);
+        // First call inserts at slot 0 (priority lowest of empties).
+        // Re-look-up returns the same row.
+        let row2 = b.get(0xABCD, 0);
+        assert_eq!(row, row2);
+        assert_eq!(b.chk(row), 0xABCD);
+    }
+
+    #[test]
+    fn context_map_mix1_emits_inputs_per_context() {
+        let strt = build_stretch_table();
+        let ilog_t = build_ilog();
+        let mut nn = vec![0u8; 1024];
+        let mut st = StateTable::new();
+        let mut tbl = [0u8; 1024];
+        st.init(18, 12, 8, 6, 4, 43, 5, &mut tbl);
+        nn.copy_from_slice(&tbl);
+
+        let mut cm: ContextMap<7, 64> = ContextMap::new(
+            4096, 2, 16, &nn, 16, 0, 1, &strt, &ilog_t);
+        cm.set(0x12345);
+        cm.set(0x67890);
+        let mut out: Vec<i16> = Vec::new();
+        cm.mix1(/*cc=*/1, /*bp=*/0, /*c1=*/0, /*y=*/0, &mut out, 0, 7, &nn);
+        // Each context emits 5+1 inputs (skip2=1 ⇒ 5 from mix3, +1 run-context).
+        assert_eq!(out.len(), cm.cn * 6);
+    }
+
+    #[test]
+    fn context_map_compiles_with_other_sizes() {
+        // ContextMap1 = ContextMap<3, 32>; ContextMap2 = ContextMap<14, 128>.
+        let strt = build_stretch_table();
+        let ilog_t = build_ilog();
+        let mut nn = vec![0u8; 1024];
+        let mut st = StateTable::new();
+        let mut tbl = [0u8; 1024];
+        st.init(18, 12, 8, 6, 4, 43, 5, &mut tbl);
+        nn.copy_from_slice(&tbl);
+        let _cm1: ContextMap<3, 32>   = ContextMap::new(2048, 1, 16, &nn, 16, 0, 1, &strt, &ilog_t);
+        let _cm2: ContextMap<14, 128> = ContextMap::new(4096, 1, 16, &nn, 16, 0, 1, &strt, &ilog_t);
+    }
+
+    #[test]
+    fn context_map_init_and_set() {
+        let strt = build_stretch_table();
+        let ilog_t = build_ilog();
+        // Build a minimal state table (256 states) for sm[].
+        let mut nn = vec![0u8; 1024];
+        let mut st = StateTable::new();
+        let mut tbl = [0u8; 1024];
+        st.init(18, 12, 8, 6, 4, 43, 5, &mut tbl);
+        nn.copy_from_slice(&tbl);
+
+        let mut cm: ContextMap<7, 64> = ContextMap::new(
+            /*m=*/4096, /*c=*/3, /*s3=*/16, &nn, /*cs4=*/16,
+            /*k=*/0, /*u_skip2=*/1, &strt, &ilog_t,
+        );
+        cm.set(0xDEADBEEF);
+        cm.set(0xCAFEBABE);
+        cm.sets();
+        assert_eq!(cm.cn, 3);
     }
 
     #[test]
