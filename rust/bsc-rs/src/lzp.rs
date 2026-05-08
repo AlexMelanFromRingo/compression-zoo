@@ -44,6 +44,12 @@ pub enum LzpError {
     /// from a position that hasn't been written yet, or the input ran
     /// out mid-token.
     DataCorrupt,
+    /// Encoder produced more bytes than libbsc's caller-imposed
+    /// `outputEOB` (= `input.len() - 1`). The top-level driver
+    /// interprets this as "LZP couldn't help" and falls back to
+    /// shipping the data uncompressed through the rest of the
+    /// pipeline (mode &= 0xff).
+    NotCompressible,
 }
 
 fn validate_params(hash_size: i32, min_len: i32) -> Result<(), LzpError> {
@@ -149,7 +155,11 @@ pub fn encode_block(
 /// single-block case: prepends a 1-byte `nBlocks=1` header before the
 /// LZP block bytes.
 ///
-/// Returns the number of bytes appended to `output`.
+/// Returns the number of bytes appended to `output`. If the encoder
+/// would produce a block as large or larger than the input itself
+/// (libbsc's "outputEOB = output + n - 1" cap), returns
+/// `LzpError::NotCompressible`. Callers should fall back to shipping
+/// the original bytes through the next compression stage instead.
 pub fn compress(
     input: &[u8],
     output: &mut Vec<u8>,
@@ -159,7 +169,16 @@ pub fn compress(
     let start = output.len();
     output.push(1u8); // nBlocks = 1
     encode_block(input, output, hash_size, min_len)?;
-    Ok(output.len() - start)
+    let written = output.len() - start;
+    // libbsc passes `output + n - 1` as outputEOB so the encoder bails
+    // when the body would equal/exceed n - 1 bytes. We replicate that
+    // post-hoc: total compressed (header + body) >= n is the trigger.
+    if written >= input.len() {
+        // Roll back the bytes we appended and report the failure.
+        output.truncate(start);
+        return Err(LzpError::NotCompressible);
+    }
+    Ok(written)
 }
 
 /// Inverse of [`compress`]. Reads the leading `nBlocks` byte and then
