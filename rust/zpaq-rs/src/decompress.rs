@@ -111,6 +111,16 @@ fn decompress_block<R: Reader, W: Writer>(
             pp_write(byte_or_eof, &mut pp_state, w, &mut sha, &mut written, ph, pm)
         })?;
 
+        // PCOMP may have buffered the entire input in M and only
+        // emit OUT bytes at end-of-stream (the BWT level-3 path is
+        // exactly this). Mirror the modeled-block code: drive the
+        // VM with the EOF marker once the body terminator lands.
+        if let PpState::Post { vm: ppvm } = &mut pp_state {
+            let mut sink = TrackedWriter { inner: w, sha: &mut sha, count: &mut written };
+            ppvm.run(0xFFFF_FFFF, Some(&mut sink), None)
+                .map_err(|_| DecompressError::Format(FormatError::HeaderInconsistent))?;
+        }
+
         let end = format::read_segment_end(r)?;
         let mut sha1_verified = false;
         if let SegmentEnd::Sha1(expected) = end {

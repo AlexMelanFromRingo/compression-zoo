@@ -44,6 +44,82 @@ pub const MAX_CFG: &[u8] = &[
     25, 25, 25, 112, 56, 0,
 ];
 
+/// BWT (level 3) config template, extracted verbatim from upstream
+/// `makeConfig("x4,3", args)`. `$1` substitutes the log-block-size
+/// (`args[0]`), so e.g. with `args[0] = 4` the H/M arrays both use
+/// `2^(4+20) = 16 MiB`. The PCOMP performs IBWT on the
+/// length-prefixed BWT byte stream produced by
+/// [`crate::lzbuffer::preprocess`] at `level_flag = 3`.
+pub const BWT_CFG: &str = r#"
+comp 9 16 $1+20 $1+20 0
+hcomp
+c-- *c=a a+= 255 d=a *d=c
+halt
+pcomp bwtrle c ;
+
+  (read BWT, index into M, size in b)
+  a> 255 ifnot
+    *b=a b++
+
+  (inverse BWT)
+  elsel
+
+    (index in last 4 bytes, put in c and R1)
+    b-- a=*b
+    b-- a<<= 8 a+=*b
+    b-- a<<= 8 a+=*b
+    b-- a<<= 8 a+=*b c=a r=a 1
+
+    (save size in R2)
+    a=b r=a 2
+
+    (count bytes in H[~1..~255, ~0])
+    do
+      a=b a> 0 if
+        b-- a=*b a++ a&= 255 d=a d! *d++
+      forever
+    endif
+
+    (cumulative counts: H[~i=0..255] = count of bytes before i)
+    d=0 d! *d= 1 a=0
+    do
+      a+=*d *d=a d--
+    d<>a a! a> 255 a! d<>a until
+
+    (build first part of linked list in H[0..idx-1])
+    b=0 do
+      a=c a>b if
+        d=*b d! *d++ d=*d d-- *d=b
+      b++ forever
+    endif
+
+    (rest of list in H[idx+1..n-1])
+    b=c b++ c=r 2 do
+      a=c a>b if
+        d=*b d! *d++ d=*d d-- *d=b
+      b++ forever
+    endif
+
+    (copy M to low 8 bits of H to reduce cache misses in next loop)
+    b=0 do
+      a=c a>b if
+        d=b a=*d a<<= 8 a+=*b *d=a
+      b++ forever
+    endif
+
+    (traverse list and output or copy to M)
+    d=r 1 b=0 do
+      a=d a== 0 ifnot
+        a=*d a>>= 8 d=a
+ a=*d out
+      forever
+    endif
+
+  endif
+  halt
+end
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;

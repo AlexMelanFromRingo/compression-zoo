@@ -167,11 +167,18 @@ struct Tokenizer<'a> {
     src: &'a [u8],
     pos: usize,
     line: u32,
+    /// Argument values for `$1..$9` substitution, mirroring upstream's
+    /// `args[]` parameter to the Compiler ctor.
+    args: [i32; 9],
 }
 
 impl<'a> Tokenizer<'a> {
     fn new(src: &'a str) -> Self {
-        Self { src: src.as_bytes(), pos: 0, line: 1 }
+        Self { src: src.as_bytes(), pos: 0, line: 1, args: [0; 9] }
+    }
+
+    fn with_args(src: &'a str, args: [i32; 9]) -> Self {
+        Self { src: src.as_bytes(), pos: 0, line: 1, args }
     }
 
     /// Advance to the start of the next token, skipping whitespace
@@ -263,12 +270,34 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    /// Match a number in `[low, high]`.
+    /// Match a number in `[low, high]`. With `args[]` set, an
+    /// argument-substitution token of the form `$N+M` resolves to
+    /// `args[N-1] + M` (and `$N` alone to `args[N-1]`).
     fn rtoken_num(&mut self, low: i32, high: i32) -> Result<i32, CompileError> {
         let word = self.read_word()?;
-        let n: i32 = match word.parse() {
-            Ok(v) => v,
-            Err(_) => return Err(CompileError::NotANumber(word.to_string())),
+        let n: i32 = if let Some(rest) = word.strip_prefix('$') {
+            // $N or $N+M
+            let bytes = rest.as_bytes();
+            if bytes.is_empty() || !(b'1'..=b'9').contains(&bytes[0]) {
+                return Err(CompileError::NotANumber(word.to_string()));
+            }
+            let idx = (bytes[0] - b'1') as usize;
+            let extra: i32 = if bytes.len() > 1 && bytes[1] == b'+' {
+                std::str::from_utf8(&bytes[2..])
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .ok_or_else(|| CompileError::NotANumber(word.to_string()))?
+            } else if bytes.len() == 1 {
+                0
+            } else {
+                return Err(CompileError::NotANumber(word.to_string()));
+            };
+            self.args.get(idx).copied().unwrap_or(0) + extra
+        } else {
+            match word.parse() {
+                Ok(v) => v,
+                Err(_) => return Err(CompileError::NotANumber(word.to_string())),
+            }
         };
         if n < low || n > high {
             return Err(CompileError::NumberOutOfRange {
@@ -279,11 +308,19 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
+/// Compile a config string with no `$N+M` argument substitutions.
+pub fn compile(config: &str) -> Result<CompiledConfig, CompileError> {
+    compile_with_args(config, [0; 9])
+}
+
 /// Compile a config string. The output `header` is exactly what
 /// `Compresser::start_block_modeled` wants. PCOMP bytecode and any
-/// `pcomp_cmd` text are returned alongside.
-pub fn compile(config: &str) -> Result<CompiledConfig, CompileError> {
-    let mut t = Tokenizer::new(config);
+/// `pcomp_cmd` text are returned alongside. `args` resolves
+/// `$N+M`-style operands as upstream's `Compiler` does.
+pub fn compile_with_args(
+    config: &str, args: [i32; 9],
+) -> Result<CompiledConfig, CompileError> {
+    let mut t = Tokenizer::with_args(config, args);
 
     // --- COMP section ---------------------------------------------------
     t.rtoken_lit("comp")?;

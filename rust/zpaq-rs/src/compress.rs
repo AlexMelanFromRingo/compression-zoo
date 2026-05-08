@@ -127,20 +127,18 @@ impl<W: Writer> Compresser<W> {
         Ok(())
     }
 
-    /// Start a modeled-mode block from a pre-built header.
+    /// Start a block from a pre-built header.
     ///
-    /// `hcomp_bytes` is the full upstream "z.read" payload starting
-    /// at the LE u16 hsize: `[hsize_lo, hsize_hi, hh, hm, ph, pm, n,
-    /// COMP_bytes..., 0, HCOMP_bytes..., 0]`.
+    /// `header` is the full upstream "z.read" payload starting at
+    /// the LE u16 hsize: `[hsize_lo, hsize_hi, hh, hm, ph, pm, n,
+    /// COMP_bytes..., 0, HCOMP_bytes..., 0]`. `n == 0` is valid —
+    /// it means "stored body with optional PCOMP postprocessor",
+    /// the layout used by upstream's BWT and LZ77 method paths.
     pub fn start_block_modeled(&mut self, header: &[u8]) -> Result<(), CompressError> {
         if self.state != State::Init { return Err(CompressError::InvalidState); }
         if header.len() < 8 { return Err(CompressError::InvalidHeader); }
 
-        let hsize = (header[0] as usize) | ((header[1] as usize) << 8);
-        // hsize counts COMP + COMP terminator(1) + HCOMP. Header layout
-        // bytes: [hsize_lo, hsize_hi, hh, hm, ph, pm, n, ...].
         let n = header[6];
-        if n == 0 { return Err(CompressError::InvalidHeader); }
 
         // Sanity-walk the COMP entries.
         let mut cp = 7usize;
@@ -155,33 +153,16 @@ impl<W: Writer> Compresser<W> {
             return Err(CompressError::InvalidHeader);
         }
         cp += 1;
-        // hsize must end at the HCOMP terminator. Layout:
-        //   2 (hsize prefix) + hh hm ph pm n | comp | 0 | hcomp | 0
-        //   hsize == cend-2 + (hend-hbegin), where cend-2 == 5+comp_len+1 (n..=COMP_term).
-        // So hsize == comp_len + 1 + hcomp_len(+terminator).
-        let total_after_prefix = 5 + (cp - 7) + (header.len() - cp);
-        // Forgive `total_after_prefix == hsize + 5` (header includes
-        // the post-COMP HCOMP body).
-        let _ = (hsize, total_after_prefix);
 
         // Build the cend/hbegin/hend triple needed by ZpaqlVm.
-        let comp_len = cp - 8; // bytes including COMP-terminator? cp-7-1 = comp_len; cp now points past terminator.
-        let cend = 7 + comp_len + 1; // hh..n=5, +comp, +0
+        let comp_len = cp - 8; // bytes between the n field and the 0 terminator.
+        let cend = 7 + comp_len + 1; // hh..n = 5, + comp_bytes, + 0 terminator.
         let hcomp_start = cp;
         let hcomp_len_with_term = header.len() - hcomp_start;
         if hcomp_len_with_term == 0 || header[header.len() - 1] != 0 {
             return Err(CompressError::InvalidHeader);
         }
 
-        // Materialise the upstream-style header buffer: prefix the
-        // user-supplied bytes with 0 padding so cend..hbegin contains
-        // 128 zero bytes (matches the layout the VM/predictor expect).
-        // Upstream layout:
-        //   [0..2]   hsize LE
-        //   [2..7]   hh hm ph pm n
-        //   [7..cend] COMP + 0
-        //   [cend..hbegin] 128 padding zeros
-        //   [hbegin..hend] HCOMP + 0
         let mut buf = vec![0u8; cend + 128 + hcomp_len_with_term + 16];
         buf[..cend].copy_from_slice(&header[..cend]);
         let hbegin = cend + 128;
@@ -189,22 +170,22 @@ impl<W: Writer> Compresser<W> {
             .copy_from_slice(&header[hcomp_start..]);
         let hend = hbegin + hcomp_len_with_term;
 
-        // Wire write: 'zPQ' + level + mtype + hsize + ... + HCOMP + 0
+        // Wire: 'zPQ' + level (1 if modeled, 2 if stored body) + mtype + header.
         self.out.put(b'z');
         self.out.put(b'P');
         self.out.put(b'Q');
-        self.out.put(1); // level 1 (modeled)
-        self.out.put(1); // mtype
-        // Write the rest of the header (everything after the magic
-        // and level/mtype): hsize_lo .. HCOMP terminator.
+        self.out.put(1 + (n == 0) as u8);
+        self.out.put(1);
         self.out.write(header);
 
-        // Initialise predictor + VM.
+        // Initialise predictor + VM only when there's a model to drive.
         let mut vm = ZpaqlVm::new(buf, hbegin, hend, cend);
-        self.predictor.init(&mut vm)
-            .map_err(|_| CompressError::InvalidHeader)?;
+        if n != 0 {
+            self.predictor.init(&mut vm)
+                .map_err(|_| CompressError::InvalidHeader)?;
+            self.enc.init();
+        }
         self.vm = Some(vm);
-        self.enc.init();
         self.n = n;
         self.state = State::Block;
         Ok(())
@@ -254,10 +235,6 @@ impl<W: Writer> Compresser<W> {
     /// trailing 0 framing — we add that here).
     pub fn post_process_prog(&mut self, pcomp: &[u8]) -> Result<(), CompressError> {
         if self.state != State::SegPre { return Err(CompressError::InvalidState); }
-        if self.n == 0 {
-            // upstream forbids stored-mode + PCOMP.
-            return Err(CompressError::InvalidState);
-        }
         // Wire format: 1 (PROG marker), len_lo, len_hi, pcomp[0..len].
         // upstream's pcomp_len excludes the trailing 0 we added in the
         // Compiler — strip it back off here so the decoder gets the
@@ -269,10 +246,19 @@ impl<W: Writer> Compresser<W> {
         };
         let len = body.len();
         if len > 0xFFFF { return Err(CompressError::InvalidState); }
-        self.encode_byte(1);
-        self.encode_byte((len & 0xFF) as u8);
-        self.encode_byte(((len >> 8) & 0xFF) as u8);
-        for &b in body { self.encode_byte(b); }
+        // Same dispatch as the data path: arith-encoded for n>0,
+        // stored-buffer for n=0 (the BWT/LZ77 method layout).
+        if self.n != 0 {
+            self.encode_byte(1);
+            self.encode_byte((len & 0xFF) as u8);
+            self.encode_byte(((len >> 8) & 0xFF) as u8);
+            for &b in body { self.encode_byte(b); }
+        } else {
+            self.write_stored(1);
+            self.write_stored((len & 0xFF) as u8);
+            self.write_stored(((len >> 8) & 0xFF) as u8);
+            for &b in body { self.write_stored(b); }
+        }
         self.state = State::SegBody;
         Ok(())
     }
@@ -393,6 +379,61 @@ pub fn compress_with_config<W: Writer>(
     compress_modeled(out, data, &cc.header, filename, comment)
 }
 
+/// High-level entry point — mirrors upstream's `compress(in, out,
+/// method, ...)` for a small subset of methods.
+///
+/// Supported methods today:
+///   * `"0"` — stored mode (no model, no preprocessing).
+///   * `"x4,3"` — BWT level 3, 16 MiB block, no E8E9. Uses
+///     [`crate::lzbuffer::preprocess`] to BWT-encode the input and
+///     [`crate::models::BWT_CFG`] as the IBWT post-processor.
+///
+/// Unsupported method strings return [`CompressError::InvalidHeader`].
+pub fn compress_method<W: Writer>(
+    out: W,
+    data: &[u8],
+    method: &str,
+) -> Result<W, CompressError> {
+    let mut c = Compresser::new(out);
+    c.write_tag()?;
+
+    if method == "0" {
+        c.start_block_stored()?;
+        c.start_segment(b"", b"")?;
+        c.post_process_pass()?;
+        c.write_bytes(data)?;
+        c.end_segment(None)?;
+        c.end_block()?;
+        return Ok(c.into_inner());
+    }
+
+    if method == "x4,3" {
+        // args[0]=4 (log block-MiB), args[1]=3 (BWT).
+        let mut args = [0i32; 9];
+        args[0] = 4;
+        args[1] = 3;
+        let cc = crate::compiler::compile_with_args(crate::models::BWT_CFG, args)
+            .map_err(|_| CompressError::InvalidHeader)?;
+        let pcomp = cc.pcomp.clone()
+            .ok_or(CompressError::InvalidHeader)?;
+
+        c.start_block_modeled(&cc.header)?;
+        c.start_segment(b"", b"")?;
+        c.post_process_prog(&pcomp)?;
+        let bwt_bytes = crate::lzbuffer::preprocess(data, crate::lzbuffer::LzArgs {
+            log_block_mib: 4,
+            level_flag: 3,
+            min_match: 0, min_match2: 0, log_bucket: 0, log_ht_size: 0,
+        });
+        c.write_bytes(&bwt_bytes)?;
+        c.end_segment(None)?;
+        c.end_block()?;
+        return Ok(c.into_inner());
+    }
+
+    Err(CompressError::InvalidHeader)
+}
+
 /// Convenience: wrap a modeled-mode round-trip into one call.
 pub fn compress_modeled<W: Writer>(
     out: W,
@@ -437,6 +478,31 @@ mod tests {
         let mut w = VecWriter::new();
         decompress(&mut r, &mut w).unwrap();
         assert_eq!(w.into_inner(), b"");
+    }
+
+    /// End-to-end via `compress_method("x4,3")`: BWT preproc +
+    /// canned IBWT PCOMP. Validates the LZBuffer-level-3 →
+    /// Compresser → Decompresser → IBWT pipeline.
+    #[test]
+    fn compress_method_bwt_round_trip() {
+        let inp = b"banana mining banana band ".repeat(40);
+        let out = compress_method(VecWriter::new(), &inp, "x4,3").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
+    }
+
+    #[test]
+    fn compress_method_zero_round_trip() {
+        let inp = b"Hello stored".to_vec();
+        let out = compress_method(VecWriter::new(), &inp, "0").unwrap();
+        let wire = out.into_inner();
+        let mut r = SliceReader::new(&wire);
+        let mut w = VecWriter::new();
+        decompress(&mut r, &mut w).unwrap();
+        assert_eq!(w.into_inner(), inp);
     }
 
     /// End-to-end: compile a custom config, encode, decode (Rust),
