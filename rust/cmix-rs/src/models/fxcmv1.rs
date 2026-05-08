@@ -4013,6 +4013,89 @@ impl FxcmState {
         }
     }
 
+    /// Punctuation handler: the `c1 == LF` branch
+    /// (fxcmv1.cpp:4056-4068). Resets line-tracking fields, folds
+    /// the line-end bits into the running accumulators, and
+    /// (caller-side) resets the WordsContext objects. This method
+    /// only touches `FxcmState` fields; resetting `worcxt` /
+    /// `worcxt1` is the caller's responsibility.
+    ///
+    /// Returns `true` if `is_now_iki` should also be cleared (when
+    /// the previous byte was already LF — empty line in nowiki).
+    pub fn line_break_lf(&mut self) -> bool {
+        self.fc           = 0;
+        self.is_paragraph = 0;
+        self.first_word   = 0;
+        self.last_wt      = 0;
+        self.nl1 = self.nl;
+        self.nl  = self.pos.wrapping_sub(1) as i32;
+        self.stream3b_r <<= 7;
+        self.stream2b   |= 0x3fc;
+        self.words      = 0xfc;
+        self.stream2b_r <<= 2;
+        self.stream4b   |= 0xfff0;
+        self.c2 == LF_CHR
+    }
+
+    /// Sentence-end punctuation handler: the `c1 ∈ {., ), ?}` branch
+    /// (fxcmv1.cpp:4069-4085). Ages `last_wt`, advances stream
+    /// accumulators, and folds the most-recent c4 byte into `x5`.
+    /// Caller is responsible for the `worcxt.Reset()` and
+    /// `senword=0` rules that gate on `'.'` plus context (those
+    /// require fccxt / colcxt access).
+    ///
+    /// `c4` is the running 4-byte history (BlockData::c4).
+    /// Returns `true` iff `c1 == '.'` (signals to the caller that
+    /// it should also handle the `wshift=1` and worcxt-reset rules).
+    pub fn sentence_end_punct(&mut self, c4: u32) -> bool {
+        self.last_wt = self.last_wt.wrapping_mul(16);
+        self.stream3b_r <<= 7;
+        self.stream3b   <<= 7;
+        self.words   |= 0xfe;
+        self.x5 = (self.x5 << 8).wrapping_add(c4 & 0xff);
+        self.stream2b   |= 204;
+        self.stream4b   = ((self.stream4b & 0xffff0) << 8)
+                          | (self.stream4b & 0xf);
+        self.stream2b_r &= 0xffff_ffc0;
+        if self.c1 == b'.' {
+            self.wshift = 1;
+            true
+        } else {
+            if self.c1 == b')' { self.sen_word = 0; }
+            false
+        }
+    }
+
+    /// 2-bit and 3-bit serial/non-repeating stream update
+    /// (fxcmv1.cpp:4148-4163), run unconditionally each byte after
+    /// the word/punct branches. The non-repeating accumulators
+    /// (`stream2b_r`, `stream3b_r`) only fold a fresh bit when the
+    /// classifier transitioned (`o*b != n*b`); the serial
+    /// accumulator (`stream3b`) folds every byte.
+    pub fn update_streams_after_byte(&mut self) {
+        // 2-bit non-repeating.
+        if self.o2b_state != self.n2b_state {
+            self.stream2b_r = (self.stream2b_r << 2)
+                .wrapping_add(self.n2b_state);
+            self.o2b_state = self.n2b_state;
+        }
+        self.stream2b_mask = (self.stream2b_mask << 2) | 3;
+
+        // 3-bit non-repeating.
+        if self.o3b_state != self.n3b_state {
+            self.stream3b_r = (self.stream3b_r << 3)
+                .wrapping_add(self.n3b_state);
+            self.stream3b_r_mask1 = (self.stream3b_r_mask1 << 3) | 7;
+            self.stream3b_r_mask2 = (self.stream3b_r_mask2 << 3) | 7;
+            self.o3b_state = self.n3b_state;
+        }
+        // 3-bit serial.
+        self.stream3b = (self.stream3b << 3)
+            .wrapping_add(self.n3b_state);
+        self.stream3b_mask  = (self.stream3b_mask  << 3) | 7;
+        self.stream3b_mask1 = (self.stream3b_mask1 << 3) | 7;
+    }
+
     /// After a word run ends, reset the per-word stream-mask history
     /// (fxcmv1.cpp:4014-4017). Cycles `_mask2 ← _mask1`,
     /// `_mask1 ← current`, then zeros the live masks.
@@ -4684,6 +4767,76 @@ mod tests {
         s.sen_word = 999;
         s.update_streams_for_word_type(&w, /*is_paragraph=*/true);
         assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn line_break_lf_resets_line_tracking() {
+        let mut s = FxcmState::new();
+        s.fc = 12; s.is_paragraph = 1; s.first_word = 99; s.last_wt = 0xAB;
+        s.pos = 1000; s.nl = 500;
+        s.stream3b_r = 0x10; s.stream2b = 0x100; s.words = 0;
+        let was_double_lf = s.line_break_lf();
+        assert_eq!(s.fc, 0);
+        assert_eq!(s.is_paragraph, 0);
+        assert_eq!(s.first_word, 0);
+        assert_eq!(s.last_wt, 0);
+        assert_eq!(s.nl1, 500);
+        assert_eq!(s.nl, 999);
+        assert_eq!(s.stream3b_r, 0x10 << 7);
+        assert_eq!(s.stream2b, 0x100 | 0x3fc);
+        assert_eq!(s.words, 0xfc);
+        assert!(!was_double_lf);
+
+        // c2 == LF_CHR triggers the double-LF return.
+        s.c2 = LF_CHR;
+        assert!(s.line_break_lf());
+    }
+
+    #[test]
+    fn sentence_end_punct_dot_returns_true() {
+        let mut s = FxcmState::new();
+        s.c1 = b'.';
+        let is_dot = s.sentence_end_punct(/*c4=*/0xCAFE_BABE);
+        assert!(is_dot);
+        assert_eq!(s.wshift, 1);
+        assert_eq!(s.x5, (0u32 << 8) | 0xBE);
+        assert!((s.stream2b & 204) == 204);
+        assert!((s.words & 0xfe) == 0xfe);
+    }
+
+    #[test]
+    fn sentence_end_punct_close_paren_clears_senword() {
+        let mut s = FxcmState::new();
+        s.c1 = b')';
+        s.sen_word = 999;
+        let is_dot = s.sentence_end_punct(0);
+        assert!(!is_dot);
+        assert_eq!(s.sen_word, 0);
+    }
+
+    #[test]
+    fn update_streams_after_byte_serial_always_folds_3b() {
+        let mut s = FxcmState::new();
+        s.n3b_state = 5;
+        s.o3b_state = 5;  // unchanged → non-repeating must NOT fold
+        s.stream3b   = 0xAB;
+        s.stream3b_r = 0xCD;
+        s.update_streams_after_byte();
+        // Serial: shifted 3 + 5.
+        assert_eq!(s.stream3b, (0xAB << 3) | 5);
+        // Non-repeating unchanged because o3b == n3b.
+        assert_eq!(s.stream3b_r, 0xCD);
+    }
+
+    #[test]
+    fn update_streams_after_byte_nonrepeating_folds_on_transition() {
+        let mut s = FxcmState::new();
+        s.o3b_state = 1;
+        s.n3b_state = 4;  // transition
+        s.stream3b_r = 0xCD;
+        s.update_streams_after_byte();
+        assert_eq!(s.stream3b_r, (0xCD << 3) | 4);
+        assert_eq!(s.o3b_state, 4, "non-repeating must remember new state");
     }
 
     #[test]
