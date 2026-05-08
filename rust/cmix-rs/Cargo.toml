@@ -1,0 +1,10 @@
+[package]
+name = "cmix-rs"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Memory-safe Rust port of CMIX (Byron Knoll). Work in progress."
+publish = false
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "sevenz-rs",
+    "bsc-rs",
+    "zpaq-rs",
+    "cmix-rs",
+]

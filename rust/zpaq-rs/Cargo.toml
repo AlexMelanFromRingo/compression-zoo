@@ -1,0 +1,10 @@
+[package]
+name = "zpaq-rs"
+version = "0.0.1"
+edition = "2024"
+license = "MIT OR Unlicense"
+description = "Memory-safe Rust port of libzpaq (Matt Mahoney). Work in progress."
+publish = false
+
+[lib]
+path = "src/lib.rs"
