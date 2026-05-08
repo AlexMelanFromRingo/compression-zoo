@@ -11,6 +11,10 @@ name = "cmix-rs"
 version = "0.0.1"
 
 [[package]]
+name = "gpu-rs"
+version = "0.0.1"
+
+[[package]]
 name = "sevenz-rs"
 version = "0.1.0"
 
