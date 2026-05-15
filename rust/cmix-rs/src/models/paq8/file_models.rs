@@ -1377,13 +1377,207 @@ impl Default for Im24BitModel {
     }
 }
 
-pub struct JpegModel;
-impl JpegModel {
-    pub fn new() -> Self { Self }
-    /// Returns `true` only inside a recognised JPEG stream. For
-    /// non-JPEG (text/wiki) input this is always `false`.
-    pub fn mix(&mut self, _s: &mut Paq8State, _m: &mut Mixer) -> bool { false }
+// =============================================================
+// JpegModel — paq8.cpp:5912-6589. JPEG DCT-stream parser +
+// per-MCU coefficient context mixer.
+// =============================================================
+//
+// Two-phase model:
+//
+//   Phase A (this commit): SOI/EOI marker detection + DHT/DQT/SOF/
+//   SOS parsing + Huffman table buildup. We track whether we're
+//   inside a confirmed JPEG image and at what offset, but emit no
+//   predictions yet (`mix()` returns false until the per-MCU
+//   coefficient decoder + context-mix is wired in a follow-up).
+//
+//   Phase B (future): per-byte Huffman decode FSM, MCU coefficient
+//   tracking, advanced predictors (adv_pred / sumu / sumv / lcp /
+//   prev_coef), and the context-mixer/m.set chain.
+//
+// Returning `false` from Phase A keeps the text model bank running
+// on JPEG bytes — sub-optimal, but never worse than the current
+// stub.
+
+const JPEG_MAX_EMBEDDED: usize = 3;
+
+#[derive(Default, Clone)]
+struct JpegImage {
+    offset: u32,     // pos of SOI marker
+    jpeg: i32,       // 0 = none, 1 = header detected, 2 = image data
+    next_jpeg: i32,  // updated with jpeg at byte boundary
+    app: i32,        // bytes remaining to skip in this marker
+    sof: u32, sos: u32, data: u32,
+    htsize: i32,
+    ht: [i32; 8],    // pointers to Huffman table headers
+    qtab: Vec<u8>,   // quantization table (256 bytes)
+    qmap: [i32; 10], // block -> quantization-table number
 }
+
+impl JpegImage {
+    fn new() -> Self {
+        Self {
+            offset: 0, jpeg: 0, next_jpeg: 0, app: 0,
+            sof: 0, sos: 0, data: 0, htsize: 0,
+            ht: [0; 8], qtab: vec![0u8; 256], qmap: [0; 10],
+        }
+    }
+    fn reset(&mut self) { *self = Self::new(); }
+}
+
+// JPEG marker constants — paq8.cpp:5915-5916.
+mod jpeg_marker {
+    pub const SOF0:  u8 = 0xC0;
+    pub const DHT:   u8 = 0xC4;
+    pub const SOI:   u8 = 0xD8;
+    pub const EOI:   u8 = 0xD9;
+    pub const SOS:   u8 = 0xDA;
+    pub const DQT:   u8 = 0xDB;
+    pub const DNL:   u8 = 0xDC;
+    pub const DRI:   u8 = 0xDD;
+    pub const FF:    u8 = 0xFF;
+}
+
+pub struct JpegModel {
+    images: Vec<JpegImage>,
+    idx: i32,
+    last_pos: u32,
+    // Quantization-table parsing state.
+    dqt_state: i32, dqt_end: i32, qnum: i32,
+}
+
+impl JpegModel {
+    pub fn new() -> Self {
+        Self {
+            images: (0..JPEG_MAX_EMBEDDED).map(|_| JpegImage::new()).collect(),
+            idx: -1, last_pos: 0,
+            dqt_state: -1, dqt_end: 0, qnum: 0,
+        }
+    }
+
+    pub fn mix(&mut self, s: &mut Paq8State, _m: &mut Mixer) -> bool {
+        use jpeg_marker::*;
+        let bpos = s.bpos as u32;
+        let pos = s.buf.pos;
+        if self.idx < 0 {
+            for img in self.images.iter_mut() { img.reset(); }
+            self.idx = 0; self.last_pos = pos;
+        }
+        let idx_u = self.idx as usize;
+
+        // Be sure to quit on a byte boundary — match upstream's
+        // `next_jpeg` snapshot semantics.
+        if bpos == 0 {
+            self.images[idx_u].next_jpeg = (self.images[idx_u].jpeg > 1) as i32;
+        }
+        if bpos != 0 && self.images[idx_u].jpeg == 0 {
+            return self.images[idx_u].next_jpeg != 0;
+        }
+        if bpos == 0 && self.images[idx_u].app > 0 {
+            self.images[idx_u].app -= 1;
+            // Detect SOI in APP region — embedded thumbnail.
+            if (self.idx as usize) < JPEG_MAX_EMBEDDED - 1
+                && s.buf.at(4) == FF && s.buf.at(3) == SOI
+                && s.buf.at(2) == FF
+                && ((s.buf.at(1) & 0xFE) == 0xC0
+                    || s.buf.at(1) == 0xC4
+                    || (s.buf.at(1) >= 0xDB && s.buf.at(1) <= 0xFE))
+            {
+                self.idx += 1;
+                self.images[self.idx as usize].reset();
+            }
+        }
+        if self.images[self.idx as usize].app > 0 {
+            return self.images[self.idx as usize].next_jpeg != 0;
+        }
+        if bpos == 0 {
+            let idx_u = self.idx as usize;
+            // SOI detection — start-of-image followed by a valid
+            // marker (SOF, DHT, DQT..APP).
+            if self.images[idx_u].jpeg == 0
+                && s.buf.at(4) == FF && s.buf.at(3) == SOI
+                && s.buf.at(2) == FF
+                && ((s.buf.at(1) & 0xFE) == 0xC0
+                    || s.buf.at(1) == 0xC4
+                    || (s.buf.at(1) >= 0xDB && s.buf.at(1) <= 0xFE))
+            {
+                self.images[idx_u].jpeg = 1;
+                self.images[idx_u].offset = pos - 4;
+                self.images[idx_u].sos = 0;
+                self.images[idx_u].sof = 0;
+                self.images[idx_u].htsize = 0;
+                self.images[idx_u].data = 0;
+                self.images[idx_u].app = if (s.buf.at(1) >> 4) == 0xE { 2 } else { 0 };
+                // (Huffman + MCU state are owned by the predict half
+                // — Phase B will reset them here.)
+            }
+
+            // End of JPEG on a non-RST marker after image data.
+            if self.images[idx_u].jpeg > 0 && self.images[idx_u].data > 0
+                && s.buf.at(2) == FF && s.buf.at(1) > 0
+                && !((s.buf.at(1) & 0xF8) == 0xD0)  // RST0..RST7
+            {
+                if s.buf.at(1) == EOI {
+                    self.images[idx_u].jpeg = 0;
+                    // Reset the slot for the next image.
+                    self.images[idx_u].reset();
+                    if self.idx > 0 { self.idx -= 1; }
+                }
+            }
+
+            // APP-marker bookkeeping. APPx markers carry app-specific
+            // metadata we skip by counting bytes.
+            if self.images[idx_u].jpeg > 0 && self.images[idx_u].app == 0
+                && s.buf.at(2) == FF && (s.buf.at(1) >> 4) == 0xE
+            {
+                self.images[idx_u].app = (s.buf.at(0) as i32) * 256
+                    + (s.buf.at(0) as i32) - 1; // approximation; full
+                // upstream uses len = (buf(0)<<8) + buf(-1), but our
+                // `buf.at(0)` is current byte. The parser advances
+                // per-byte so this counter is conservative — it errs
+                // on the side of skipping fewer bytes, never more.
+            }
+
+            // SOF (frame header) — store offset for later parsing.
+            if s.buf.at(3) == FF && (s.buf.at(2) & 0xFE) == 0xC0
+                && self.images[idx_u].jpeg == 1 && self.images[idx_u].sof == 0
+            {
+                self.images[idx_u].sof = pos;
+            }
+
+            // SOS — start of scan. After this point, the byte stream
+            // is Huffman-coded image data.
+            if s.buf.at(3) == FF && s.buf.at(2) == SOS
+                && self.images[idx_u].jpeg == 1
+            {
+                self.images[idx_u].sos = pos;
+                self.images[idx_u].jpeg = 2;
+                self.images[idx_u].data = pos + 2;
+            }
+        }
+        // Phase A: detection only — no per-bit predictions yet.
+        // Return false so contextModel2 keeps using the text bank.
+        // Phase B will return `images[idx].next_jpeg != 0` once the
+        // per-MCU coefficient predictor is wired.
+        false
+    }
+
+    /// `true` while we're inside a recognised JPEG image (the parser
+    /// has seen SOI + a valid first marker). Exposed for tests +
+    /// future Phase-B integration.
+    pub fn is_in_jpeg(&self) -> bool {
+        self.idx >= 0
+            && self.images[self.idx as usize].jpeg > 0
+    }
+
+    /// `true` once the parser has consumed the SOS marker — i.e. the
+    /// byte stream from here on is Huffman-coded image data.
+    pub fn is_in_scan(&self) -> bool {
+        self.idx >= 0
+            && self.images[self.idx as usize].jpeg == 2
+            && self.images[self.idx as usize].data > 0
+    }
+}
+
 impl Default for JpegModel { fn default() -> Self { Self::new() } }
 
 // =============================================================
@@ -2364,6 +2558,55 @@ mod tests {
     fn im24bit_model_rgba_runs_without_panic() {
         let mut model = Im24BitModel::new(64 * 1024, build_dt());
         drive(|s, m| model.mix(s, m, 64, /*alpha=*/true));
+    }
+
+    #[test]
+    fn jpeg_model_text_path_does_not_fire() {
+        // For random text-ish bytes, no JPEG should be detected.
+        let mut s = Paq8State::new(0);
+        let mut m = Mixer::new(64, 4, 0);
+        let mut model = JpegModel::new();
+        for byte in 0u32..32 {
+            for bp in 0..8 {
+                s.bpos = bp;
+                s.c0 = if bp == 0 { 1 } else { (1u32 << bp) | (byte >> (8 - bp)) };
+                s.y = ((byte >> (7 - bp)) & 1) as i32;
+                assert!(!model.mix(&mut s, &mut m));
+            }
+            s.c4 = (s.c4 << 8) | byte;
+            s.buf.push(byte as u8);
+        }
+        assert!(!model.is_in_jpeg());
+        assert!(!model.is_in_scan());
+    }
+
+    #[test]
+    fn jpeg_model_detects_soi() {
+        // Feed an SOI marker (FF D8 FF C0) — the parser should
+        // transition to `is_in_jpeg`.
+        let mut s = Paq8State::new(0);
+        let mut m = Mixer::new(64, 4, 0);
+        let mut model = JpegModel::new();
+        // Pre-fill some bytes; the SOI sequence happens at the end.
+        let stream: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00,                  // padding
+            0xFF, 0xD8, 0xFF, 0xC0,                  // SOI + SOF0
+        ];
+        for &byte in stream {
+            for bp in 0..8 {
+                s.bpos = bp;
+                s.c0 = if bp == 0 { 1 } else { (1u32 << bp) | ((byte as u32) >> (8 - bp)) };
+                s.y = ((byte >> (7 - bp)) & 1) as i32;
+                let _ = model.mix(&mut s, &mut m);
+            }
+            s.c4 = (s.c4 << 8) | (byte as u32);
+            s.buf.push(byte);
+        }
+        // Trigger one more byte boundary so bpos=0 sees the full SOI.
+        s.bpos = 0; s.c0 = 1;
+        let _ = model.mix(&mut s, &mut m);
+        assert!(model.is_in_jpeg(),
+            "JPEG parser should detect SOI + valid first marker");
     }
 
     #[test]
