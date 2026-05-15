@@ -96,6 +96,21 @@ pub struct Bh {
 }
 
 impl Bh {
+    /// Raw-byte read at absolute index — used by JpegModel's bit-
+    /// history pointer (`cp[i]` indexes into the slot payload by
+    /// raw offset rather than through the MRU lookup).
+    pub fn byte_at(&self, abs: usize) -> u8 {
+        if abs < self.t.len() { self.t[abs] } else { 0 }
+    }
+    /// Raw-byte write at absolute index.
+    pub fn set_byte_at(&mut self, abs: usize, v: u8) {
+        if abs < self.t.len() { self.t[abs] = v; }
+    }
+    /// Starting address of the underlying `Vec<u8>` storage.
+    /// Subtract this from a `&mut [u8]` returned by `get()` to
+    /// compute the absolute index.
+    pub fn storage_base(&self) -> usize { self.t.as_ptr() as usize }
+
     /// `n` is the number of B-byte items in the table; must be a
     /// power of two. `b` is bucket size in bytes (must be ≥ 4).
     pub fn new(n: usize, b: usize) -> Self {

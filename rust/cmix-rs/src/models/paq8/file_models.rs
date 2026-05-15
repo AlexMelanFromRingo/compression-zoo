@@ -1437,45 +1437,184 @@ mod jpeg_marker {
     pub const FF:    u8 = 0xFF;
 }
 
+/// Huffman-table entry — paq8.cpp:5898. One per (Tc, Th, length).
+#[derive(Default, Clone, Copy)]
+struct Huf { min: u32, max: u32, val: i32 }
+
+/// Zigzag tables — paq8.cpp:5971-5976.
+const JPEG_ZZU: [u8; 64] = [
+    0,1,0,0,1,2,3,2,1,0,0,1,2,3,4,5,4,3,2,1,0,0,1,2,3,4,5,6,7,6,5,4,
+    3,2,1,0,1,2,3,4,5,6,7,7,6,5,4,3,2,3,4,5,6,7,7,6,5,4,5,6,7,7,6,7,
+];
+const JPEG_ZZV: [u8; 64] = [
+    0,0,1,2,1,0,0,1,2,3,4,3,2,1,0,0,1,2,3,4,5,6,5,4,3,2,1,0,0,1,2,3,
+    4,5,6,7,7,6,5,4,3,2,1,2,3,4,5,6,7,7,6,5,4,3,4,5,6,7,7,6,5,6,7,7,
+];
+
+/// Standard Huffman bit-counts — paq8.cpp:5980-6046. Used to build
+/// default DC/AC luminance/chrominance tables when the stream omits
+/// its own DHT chunks.
+const BITS_DC_LUM: [u8; 16] = [0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0];
+const VALS_DC_LUM: [u8; 12] = [0,1,2,3,4,5,6,7,8,9,10,11];
+const BITS_DC_CHR: [u8; 16] = [0,3,1,1,1,1,1,1,1,1,1,0,0,0,0,0];
+const VALS_DC_CHR: [u8; 12] = [0,1,2,3,4,5,6,7,8,9,10,11];
+const BITS_AC_LUM: [u8; 16] = [0,2,1,3,3,2,4,3,5,5,4,4,0,0,1,0x7d];
+const VALS_AC_LUM: [u8; 162] = [
+    0x01,0x02,0x03,0x00,0x04,0x11,0x05,0x12,0x21,0x31,0x41,0x06,0x13,0x51,0x61,0x07,
+    0x22,0x71,0x14,0x32,0x81,0x91,0xa1,0x08,0x23,0x42,0xb1,0xc1,0x15,0x52,0xd1,0xf0,
+    0x24,0x33,0x62,0x72,0x82,0x09,0x0a,0x16,0x17,0x18,0x19,0x1a,0x25,0x26,0x27,0x28,
+    0x29,0x2a,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,0x49,
+    0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,0x69,
+    0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x83,0x84,0x85,0x86,0x87,0x88,0x89,
+    0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,0xa6,0xa7,
+    0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,0xc4,0xc5,
+    0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,0xe1,0xe2,
+    0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+    0xf9,0xfa,
+];
+const BITS_AC_CHR: [u8; 16] = [0,2,1,2,4,4,3,4,7,5,4,4,0,1,2,0x77];
+const VALS_AC_CHR: [u8; 162] = [
+    0x00,0x01,0x02,0x03,0x11,0x04,0x05,0x21,0x31,0x06,0x12,0x41,0x51,0x07,0x61,0x71,
+    0x13,0x22,0x32,0x81,0x08,0x14,0x42,0x91,0xa1,0xb1,0xc1,0x09,0x23,0x33,0x52,0xf0,
+    0x15,0x62,0x72,0xd1,0x0a,0x16,0x24,0x34,0xe1,0x25,0xf1,0x17,0x18,0x19,0x1a,0x26,
+    0x27,0x28,0x29,0x2a,0x35,0x36,0x37,0x38,0x39,0x3a,0x43,0x44,0x45,0x46,0x47,0x48,
+    0x49,0x4a,0x53,0x54,0x55,0x56,0x57,0x58,0x59,0x5a,0x63,0x64,0x65,0x66,0x67,0x68,
+    0x69,0x6a,0x73,0x74,0x75,0x76,0x77,0x78,0x79,0x7a,0x82,0x83,0x84,0x85,0x86,0x87,
+    0x88,0x89,0x8a,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9a,0xa2,0xa3,0xa4,0xa5,
+    0xa6,0xa7,0xa8,0xa9,0xaa,0xb2,0xb3,0xb4,0xb5,0xb6,0xb7,0xb8,0xb9,0xba,0xc2,0xc3,
+    0xc4,0xc5,0xc6,0xc7,0xc8,0xc9,0xca,0xd2,0xd3,0xd4,0xd5,0xd6,0xd7,0xd8,0xd9,0xda,
+    0xe2,0xe3,0xe4,0xe5,0xe6,0xe7,0xe8,0xe9,0xea,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,
+    0xf9,0xfa,
+];
+
+const JPEG_N_CONTEXTS: usize = 32;
+const JPEG_CBUF_SIZE:  usize = 0x20000;
+const JPEG_T_SIZE_LOG: u32   = 16;          // 64K slots × 9 bytes = 576 KB.
+const JPEG_T_BUCKET:   usize = 9;
+
 pub struct JpegModel {
     images: Vec<JpegImage>,
     idx: i32,
     last_pos: u32,
     // Quantization-table parsing state.
     dqt_state: i32, dqt_end: i32, qnum: i32,
+
+    // ---- Huffman decode state (paq8.cpp:5923-5929) ----
+    huffcode: u32, huffbits: i32, huffsize: i32, rs: i32,
+    mcupos: i32, mcusize: i32,
+    hufsel: [[i32; 10]; 2],
+    huf: Vec<Huf>,         // 128 entries (Tc × Th × m)
+    hbuf: Vec<u8>,         // 2048 bytes
+
+    // ---- Image / MCU state ----
+    color: [i32; 10], pred: [i32; 4], dc: i32,
+    width: i32, row: i32, column: i32,
+    cbuf: Vec<u8>,         // u8 rotating buffer of RS codes
+    cbuf2: Vec<i32>,       // i32 buffer of signed coefficient values
+    cpos: i32,
+    rs1: i32, rstpos: i32, rstlen: i32,
+    ssum: i32, ssum1: i32, ssum2: i32, ssum3: i32,
+
+    // ---- Advanced predictors (paq8.cpp:5962-5966) ----
+    adv_pred: [i32; 4],
+    sumu: [i32; 8], sumv: [i32; 8],
+    run_pred: [i32; 6],
+    prev_coef: i32, prev_coef2: i32, prev_coef_rs: i32,
+    ls: [i32; 10],
+    block_w: [i32; 10], block_n: [i32; 10],
+    sampling_factors: [i32; 4],
+    lcp: [i32; 7],
+    zpos: [i32; 64],
+
+    // ---- Context model (paq8.cpp:6498-6588) ----
+    t:    super::context_map::Bh,
+    cxt:  [u64; JPEG_N_CONTEXTS],
+    /// Per-context payload pointers: each entry holds a `(start, off)`
+    /// where `start` is the absolute index into `t`'s slot's payload
+    /// and `off` is the per-`hbcount` increment (0/1/3).
+    cp:   [(usize, usize); JPEG_N_CONTEXTS],
+    cp_valid: bool,
+    sm:   Vec<super::apm::StateMap>,
+    m1:   super::mixer::Mixer,
+    a1:   super::apm::Apm,
+    a2:   super::apm::Apm,
+    hbcount: i32,
 }
 
 impl JpegModel {
     pub fn new() -> Self {
+        use super::apm::{Apm, StateMap};
+        use super::context_map::Bh;
+        let sm: Vec<StateMap> = (0..JPEG_N_CONTEXTS).map(|_| StateMap::new()).collect();
         Self {
             images: (0..JPEG_MAX_EMBEDDED).map(|_| JpegImage::new()).collect(),
             idx: -1, last_pos: 0,
             dqt_state: -1, dqt_end: 0, qnum: 0,
+            huffcode: 0, huffbits: 0, huffsize: 0, rs: -1,
+            mcupos: 0, mcusize: 0,
+            hufsel: [[0; 10]; 2],
+            huf: vec![Huf::default(); 128],
+            hbuf: vec![0u8; 2048],
+            color: [0; 10], pred: [0; 4], dc: 0,
+            width: 0, row: 0, column: 0,
+            cbuf:  vec![0u8;  JPEG_CBUF_SIZE],
+            cbuf2: vec![0i32; JPEG_CBUF_SIZE],
+            cpos: 0,
+            rs1: 0, rstpos: 0, rstlen: 0,
+            ssum: 0, ssum1: 0, ssum2: 0, ssum3: 0,
+            adv_pred: [0; 4],
+            sumu: [0; 8], sumv: [0; 8],
+            run_pred: [0; 6],
+            prev_coef: 0, prev_coef2: 0, prev_coef_rs: 0,
+            ls: [0; 10],
+            block_w: [0; 10], block_n: [0; 10],
+            sampling_factors: [0; 4],
+            lcp: [0; 7],
+            zpos: [0; 64],
+            t: Bh::new(1 << JPEG_T_SIZE_LOG, JPEG_T_BUCKET),
+            cxt: [0; JPEG_N_CONTEXTS],
+            cp:  [(0, 0); JPEG_N_CONTEXTS],
+            cp_valid: false,
+            sm,
+            m1: super::mixer::Mixer::new(JPEG_N_CONTEXTS + 1, 2050, 3),
+            a1: Apm::new(0x8000, super::substrate::build_dt()),
+            a2: Apm::new(0x20000, super::substrate::build_dt()),
+            hbcount: 2,
         }
     }
 
-    pub fn mix(&mut self, s: &mut Paq8State, _m: &mut Mixer) -> bool {
+    /// `true` while we're inside a recognised JPEG image.
+    pub fn is_in_jpeg(&self) -> bool {
+        self.idx >= 0 && self.images[self.idx as usize].jpeg > 0
+    }
+    /// `true` once the parser has consumed the SOS marker.
+    pub fn is_in_scan(&self) -> bool {
+        self.idx >= 0
+            && self.images[self.idx as usize].jpeg == 2
+            && self.images[self.idx as usize].data > 0
+    }
+
+    pub fn mix(&mut self, s: &mut Paq8State, m: &mut Mixer) -> bool {
         use jpeg_marker::*;
         let bpos = s.bpos as u32;
         let pos = s.buf.pos;
+
         if self.idx < 0 {
             for img in self.images.iter_mut() { img.reset(); }
             self.idx = 0; self.last_pos = pos;
         }
-        let idx_u = self.idx as usize;
 
-        // Be sure to quit on a byte boundary — match upstream's
-        // `next_jpeg` snapshot semantics.
         if bpos == 0 {
+            let idx_u = self.idx as usize;
             self.images[idx_u].next_jpeg = (self.images[idx_u].jpeg > 1) as i32;
         }
-        if bpos != 0 && self.images[idx_u].jpeg == 0 {
-            return self.images[idx_u].next_jpeg != 0;
+        if bpos != 0 && self.images[self.idx as usize].jpeg == 0 {
+            return self.images[self.idx as usize].next_jpeg != 0;
         }
-        if bpos == 0 && self.images[idx_u].app > 0 {
+        if bpos == 0 && self.images[self.idx as usize].app > 0 {
+            let idx_u = self.idx as usize;
             self.images[idx_u].app -= 1;
-            // Detect SOI in APP region — embedded thumbnail.
-            if (self.idx as usize) < JPEG_MAX_EMBEDDED - 1
+            if (idx_u as usize) < JPEG_MAX_EMBEDDED - 1
                 && s.buf.at(4) == FF && s.buf.at(3) == SOI
                 && s.buf.at(2) == FF
                 && ((s.buf.at(1) & 0xFE) == 0xC0
@@ -1489,10 +1628,12 @@ impl JpegModel {
         if self.images[self.idx as usize].app > 0 {
             return self.images[self.idx as usize].next_jpeg != 0;
         }
+
+        // Header / marker parsing — paq8.cpp:6063-6160.
         if bpos == 0 {
             let idx_u = self.idx as usize;
-            // SOI detection — start-of-image followed by a valid
-            // marker (SOF, DHT, DQT..APP).
+
+            // SOI detection.
             if self.images[idx_u].jpeg == 0
                 && s.buf.at(4) == FF && s.buf.at(3) == SOI
                 && s.buf.at(2) == FF
@@ -1507,75 +1648,779 @@ impl JpegModel {
                 self.images[idx_u].htsize = 0;
                 self.images[idx_u].data = 0;
                 self.images[idx_u].app = if (s.buf.at(1) >> 4) == 0xE { 2 } else { 0 };
-                // (Huffman + MCU state are owned by the predict half
-                // — Phase B will reset them here.)
+                self.mcusize = 0; self.huffcode = 0;
+                self.huffbits = 0; self.huffsize = 0;
+                self.mcupos = 0; self.cpos = 0; self.rs = -1;
+                for h in self.huf.iter_mut() { *h = Huf::default(); }
+                for p in self.pred.iter_mut() { *p = 0; }
+                self.rstpos = 0; self.rstlen = 0;
             }
 
-            // End of JPEG on a non-RST marker after image data.
+            // End-of-JPEG: data section + non-RST marker.
             if self.images[idx_u].jpeg > 0 && self.images[idx_u].data > 0
-                && s.buf.at(2) == FF && s.buf.at(1) > 0
-                && !((s.buf.at(1) & 0xF8) == 0xD0)  // RST0..RST7
+                && (
+                    (s.buf.at(2) == FF && s.buf.at(1) > 0
+                        && (s.buf.at(1) & 0xF8) != 0xD0)
+                    || (pos.wrapping_sub(self.last_pos) > 1)
+                )
             {
-                if s.buf.at(1) == EOI {
-                    self.images[idx_u].jpeg = 0;
-                    // Reset the slot for the next image.
-                    self.images[idx_u].reset();
-                    if self.idx > 0 { self.idx -= 1; }
+                let length = pos.wrapping_sub(self.images[idx_u].offset);
+                self.images[idx_u].reset();
+                self.mcusize = 0; self.dqt_state = -1;
+                if self.idx > 0 {
+                    self.idx -= 1;
+                    let i_prev = self.idx as usize;
+                    self.images[i_prev].app -= length as i32;
+                    if self.images[i_prev].app < 0 {
+                        self.images[i_prev].app = 0;
+                    }
                 }
             }
+            self.last_pos = pos;
+            if self.images[self.idx as usize].jpeg == 0 {
+                return self.images[self.idx as usize].next_jpeg != 0;
+            }
+            let idx_u = self.idx as usize;
 
-            // APP-marker bookkeeping. APPx markers carry app-specific
-            // metadata we skip by counting bytes.
-            if self.images[idx_u].jpeg > 0 && self.images[idx_u].app == 0
-                && s.buf.at(2) == FF && (s.buf.at(1) >> 4) == 0xE
+            // APPx / COM / other marker skip — paq8.cpp:6121-6125.
+            if self.images[idx_u].data == 0 && self.images[idx_u].app == 0
+                && s.buf.at(4) == FF
+                && (((s.buf.at(3) > 0xC1) && (s.buf.at(3) <= 0xCF) && (s.buf.at(3) != DHT))
+                    || ((s.buf.at(3) >= 0xDC) && (s.buf.at(3) <= 0xFE)))
             {
-                self.images[idx_u].app = (s.buf.at(0) as i32) * 256
-                    + (s.buf.at(0) as i32) - 1; // approximation; full
-                // upstream uses len = (buf(0)<<8) + buf(-1), but our
-                // `buf.at(0)` is current byte. The parser advances
-                // per-byte so this counter is conservative — it errs
-                // on the side of skipping fewer bytes, never more.
+                self.images[idx_u].app = (s.buf.at(2) as i32) * 256
+                    + (s.buf.at(1) as i32) + 2;
             }
 
-            // SOF (frame header) — store offset for later parsing.
-            if s.buf.at(3) == FF && (s.buf.at(2) & 0xFE) == 0xC0
-                && self.images[idx_u].jpeg == 1 && self.images[idx_u].sof == 0
-            {
-                self.images[idx_u].sof = pos;
+            // SOS — paq8.cpp:6128-6132.
+            if s.buf.at(5) == FF && s.buf.at(4) == SOS {
+                let len = (s.buf.at(3) as i32) * 256 + (s.buf.at(2) as i32);
+                let ns = s.buf.at(1) as i32;
+                if len == 6 + 2 * ns && ns > 0 && ns <= 4 {
+                    self.images[idx_u].sos = pos - 5;
+                    self.images[idx_u].data = self.images[idx_u].sos
+                        + len as u32 + 2;
+                    self.images[idx_u].jpeg = 2;
+                }
             }
-
-            // SOS — start of scan. After this point, the byte stream
-            // is Huffman-coded image data.
-            if s.buf.at(3) == FF && s.buf.at(2) == SOS
-                && self.images[idx_u].jpeg == 1
+            // DHT — paq8.cpp:6133.
+            if s.buf.at(4) == FF && s.buf.at(3) == DHT
+                && self.images[idx_u].htsize < 8
             {
-                self.images[idx_u].sos = pos;
-                self.images[idx_u].jpeg = 2;
-                self.images[idx_u].data = pos + 2;
+                let h = self.images[idx_u].htsize as usize;
+                self.images[idx_u].ht[h] = (pos - 4) as i32;
+                self.images[idx_u].htsize += 1;
+            }
+            // SOFn — paq8.cpp:6134.
+            if s.buf.at(4) == FF && (s.buf.at(3) & 0xFE) == SOF0 {
+                self.images[idx_u].sof = pos - 4;
+            }
+            // DQT — paq8.cpp:6137-6152.
+            if s.buf.at(4) == FF && s.buf.at(3) == DQT {
+                self.dqt_end = (pos as i32)
+                    + (s.buf.at(2) as i32) * 256
+                    + (s.buf.at(1) as i32) - 1;
+                self.dqt_state = 0;
+            } else if self.dqt_state >= 0 {
+                if pos as i32 >= self.dqt_end {
+                    self.dqt_state = -1;
+                } else {
+                    if self.dqt_state % 65 == 0 {
+                        self.qnum = s.buf.at(1) as i32;
+                    } else {
+                        let qn = self.qnum.max(0).min(3) as usize;
+                        let off = ((self.dqt_state % 65) - 1) as usize;
+                        if s.buf.at(1) > 0 {
+                            self.images[idx_u].qtab[qn * 64 + off] = s.buf.at(1) - 1;
+                        }
+                    }
+                    self.dqt_state += 1;
+                }
+            }
+            // Restart marker — paq8.cpp:6155-6160.
+            if s.buf.at(2) == FF && (s.buf.at(1) & 0xF8) == 0xD0 {
+                self.huffcode = 0; self.huffbits = 0; self.huffsize = 0;
+                self.mcupos = 0; self.rs = -1;
+                for p in self.pred.iter_mut() { *p = 0; }
+                let cur = self.column + self.row * self.width;
+                self.rstlen = cur - self.rstpos;
+                self.rstpos = cur;
             }
         }
-        // Phase A: detection only — no per-bit predictions yet.
-        // Return false so contextModel2 keeps using the text bank.
-        // Phase B will return `images[idx].next_jpeg != 0` once the
-        // per-MCU coefficient predictor is wired.
-        false
+
+        // Build Huffman tables once at scan start — paq8.cpp:6166-6296.
+        if bpos == 1 && pos == self.images[self.idx as usize].data {
+            self.build_huffman_tables(s);
+        }
+
+        // Per-byte Huffman decode — paq8.cpp:6300-6383.
+        if self.mcusize > 0 {
+            // Skip stuffed 0x00 after FF.
+            let prev = if bpos != 0 { s.buf.at(1) } else { s.buf.at(2) };
+            if prev != FF {
+                self.huffman_decode_bit(s);
+            }
+        }
+
+        // Estimate next bit probability — paq8.cpp:6481-6588.
+        if self.images[self.idx as usize].jpeg == 0
+            || self.images[self.idx as usize].data == 0
+        {
+            return self.images[self.idx as usize].next_jpeg != 0;
+        }
+        let prev = if bpos != 0 { s.buf.at(1) } else { s.buf.at(2) };
+        if prev == FF {
+            m.add(128);
+            m.set(0, 9);
+            m.set(0, 1025);
+            m.set(s.buf.at(1) as u32, 1024);
+            return true;
+        }
+        if self.rstlen > 0 && self.rstlen == self.column + self.row * self.width - self.rstpos
+            && self.mcupos == 0
+            && (self.huffcode as i32) == (1 << self.huffbits) - 1
+        {
+            m.add(4095);
+            m.set(0, 9);
+            m.set(0, 1025);
+            m.set(s.buf.at(1) as u32, 1024);
+            return true;
+        }
+        self.context_model_predict(s, m);
+        true
     }
 
-    /// `true` while we're inside a recognised JPEG image (the parser
-    /// has seen SOI + a valid first marker). Exposed for tests +
-    /// future Phase-B integration.
-    pub fn is_in_jpeg(&self) -> bool {
-        self.idx >= 0
-            && self.images[self.idx as usize].jpeg > 0
+    // ---------- Huffman table buildup (paq8.cpp:6166-6296) ----------
+    fn build_huffman_tables(&mut self, s: &Paq8State) {
+        let idx_u = self.idx as usize;
+        let htsize = self.images[idx_u].htsize;
+        let mut all_ok = true;
+        for i in 0..htsize as usize {
+            let mut p = (self.images[idx_u].ht[i] + 4) as u32;
+            let end = p + (s.buf.at_abs(p - 2) as u32) * 256
+                + s.buf.at_abs(p - 1) as u32 - 2;
+            let pos_u = s.buf.pos;
+            let mut count = 0;
+            while p < end && end < pos_u && end < p + 2100 && count < 10 {
+                count += 1;
+                let tc = (s.buf.at_abs(p) >> 4) as i32;
+                let th = (s.buf.at_abs(p) & 15) as i32;
+                if tc >= 2 || th >= 4 { all_ok = false; break; }
+                let h_base = (tc * 64 + th * 16) as usize;
+                let mut val = p + 17;
+                let mut hval = (tc * 1024 + th * 256) as usize;
+                for j in 0..256 {
+                    self.hbuf[hval + j] = s.buf.at_abs(val + j as u32);
+                }
+                let mut code = 0u32;
+                for j in 0..16 {
+                    let len = s.buf.at_abs(p + 1 + j as u32) as u32;
+                    self.huf[h_base + j].min = code;
+                    code += len;
+                    self.huf[h_base + j].max = code;
+                    self.huf[h_base + j].val = hval as i32;
+                    val += len;
+                    hval += len as usize;
+                    code *= 2;
+                }
+                p = val;
+            }
+        }
+        let _ = all_ok;
+        self.huffcode = 0; self.huffbits = 0; self.huffsize = 0; self.rs = -1;
+
+        // Default tables if none provided — paq8.cpp:6199-6239.
+        if self.images[idx_u].htsize == 0 {
+            for tc in 0..2 {
+                for th in 0..2 {
+                    let h_base = (tc * 64 + th * 16) as usize;
+                    let mut hval_start = (tc * 1024 + th * 256) as usize;
+                    let mut code: u32 = 0;
+                    let mut c = 0i32;
+                    for i in 0..16 {
+                        let x = match tc * 2 + th {
+                            0 => BITS_DC_LUM[i] as u32,
+                            1 => BITS_DC_CHR[i] as u32,
+                            2 => BITS_AC_LUM[i] as u32,
+                            _ => BITS_AC_CHR[i] as u32,
+                        };
+                        self.huf[h_base + i].min = code;
+                        code += x;
+                        self.huf[h_base + i].max = code;
+                        self.huf[h_base + i].val = hval_start as i32;
+                        hval_start += x as usize;
+                        code += code;
+                        c += x as i32;
+                    }
+                    let mut hval = (tc * 1024 + th * 256) as usize;
+                    c -= 1;
+                    while c >= 0 {
+                        let x = match tc * 2 + th {
+                            0 => VALS_DC_LUM[c as usize],
+                            1 => VALS_DC_CHR[c as usize],
+                            2 => VALS_AC_LUM[c as usize],
+                            _ => VALS_AC_CHR[c as usize],
+                        };
+                        self.hbuf[hval + c as usize] = x;
+                        c -= 1;
+                    }
+                    let _ = hval;
+                }
+            }
+            self.images[idx_u].htsize = 4;
+        }
+
+        // Compute MCU size + sampling factors — paq8.cpp:6243-6296.
+        if self.images[idx_u].sof == 0 && self.images[idx_u].sos != 0 {
+            return;
+        }
+        let sos = self.images[idx_u].sos;
+        let sof = self.images[idx_u].sof;
+        let ns = s.buf.at_abs(sos + 4) as i32;
+        let nf = s.buf.at_abs(sof + 9) as i32;
+        self.mcusize = 0;
+        let mut hmax = 0i32;
+        for i in 0..ns {
+            for j in 0..nf {
+                let cs = s.buf.at_abs(sos + 2 * i as u32 + 5);
+                let c  = s.buf.at_abs(sof + 3 * j as u32 + 10);
+                if cs == c {
+                    let hv = s.buf.at_abs(sof + 3 * j as u32 + 11) as i32;
+                    if (j as usize) < 4 { self.sampling_factors[j as usize] = hv; }
+                    if (hv >> 4) > hmax { hmax = hv >> 4; }
+                    let mut blocks = (hv & 15) * (hv >> 4);
+                    if blocks < 1 { blocks = 1; }
+                    while blocks > 0 && (self.mcusize as usize) < 10 {
+                        let mc = self.mcusize as usize;
+                        self.hufsel[0][mc] = ((s.buf.at_abs(sos + 2 * i as u32 + 6) >> 4) & 15) as i32;
+                        self.hufsel[1][mc] = (s.buf.at_abs(sos + 2 * i as u32 + 6) & 15) as i32;
+                        self.color[mc] = i;
+                        let tq = s.buf.at_abs(sof + 3 * j as u32 + 12) as i32;
+                        self.images[idx_u].qmap[mc] = tq.clamp(0, 3);
+                        blocks -= 1;
+                        self.mcusize += 1;
+                    }
+                }
+            }
+        }
+        // ls[]: distance to the previous block of the same component.
+        for j in 0..self.mcusize as usize {
+            self.ls[j] = 0;
+            for i in 1..self.mcusize as usize {
+                if self.color[(j + i) % self.mcusize as usize] == self.color[j] {
+                    self.ls[j] = i as i32;
+                }
+            }
+            self.ls[j] = (self.mcusize - self.ls[j]) << 6;
+        }
+        for j in 0..64 {
+            self.zpos[(JPEG_ZZU[j] as usize) + 8 * (JPEG_ZZV[j] as usize)] = j as i32;
+        }
+        let raw_width = (s.buf.at_abs(sof + 7) as i32) * 256
+            + s.buf.at_abs(sof + 8) as i32;
+        let denom = (hmax.max(1)) * 8;
+        self.width = ((raw_width - 1) / denom) + 1;
+        if self.width <= 0 { self.width = 1; }
+        self.mcusize *= 64;
+        self.row = 0; self.column = 0;
+
+        // blockW / blockN — paq8.cpp:6287-6296.
+        let mut x = 0i32; let mut y = 0i32;
+        let mcusize_blocks = self.mcusize >> 6;
+        for j in 0..mcusize_blocks as usize {
+            let i = self.color[j] as usize;
+            let w_s = self.sampling_factors[i] >> 4;
+            let h_s = self.sampling_factors[i] & 0xF;
+            self.block_w[j] = if x == 0 { self.mcusize - 64 * (w_s - 1) } else { 64 };
+            self.block_n[j] = if y == 0 { self.mcusize * self.width - 64 * w_s * (h_s - 1) }
+                              else { w_s * 64 };
+            x += 1;
+            if x >= w_s { x = 0; y += 1; }
+            if y >= h_s { x = 0; y = 0; }
+        }
     }
 
-    /// `true` once the parser has consumed the SOS marker — i.e. the
-    /// byte stream from here on is Huffman-coded image data.
-    pub fn is_in_scan(&self) -> bool {
-        self.idx >= 0
-            && self.images[self.idx as usize].jpeg == 2
-            && self.images[self.idx as usize].data > 0
+    // ---------- Per-bit Huffman decode (paq8.cpp:6300-6383) ----------
+    fn huffman_decode_bit(&mut self, s: &Paq8State) {
+        let y = s.y as u32;
+        let idx_u = self.idx as usize;
+        if self.huffbits > 32 { return; }
+        self.huffcode = self.huffcode.wrapping_mul(2).wrapping_add(y);
+        self.huffbits += 1;
+        if self.rs < 0 {
+            if self.huffbits < 1 || self.huffbits > 16 { return; }
+            let ac = ((self.mcupos & 63) > 0) as usize;
+            let mc6 = ((self.mcupos >> 6).clamp(0, 9)) as usize;
+            let sel = self.hufsel[ac][mc6] as usize;
+            let i = (self.huffbits - 1) as usize;
+            let h = &self.huf[ac * 64 + sel * 16 + i];
+            if h.min <= h.max && (h.val as usize) < 2048 && self.huffbits > 0
+                && self.huffcode < h.max
+                && self.huffcode >= h.min
+            {
+                let k = h.val + (self.huffcode as i32 - h.min as i32);
+                if k >= 0 && (k as usize) < 2048 {
+                    self.rs = self.hbuf[k as usize] as i32;
+                    self.huffsize = self.huffbits;
+                }
+            }
+        }
+        if self.rs >= 0 && self.huffsize + (self.rs & 15) == self.huffbits {
+            self.rs1 = self.rs;
+            let mut xx: i32 = 0;
+            if (self.mcupos & 63) != 0 {
+                if self.rs == 0 {
+                    self.mcupos = (self.mcupos + 63) & !63;
+                    while (self.cpos & 63) != 0 {
+                        self.cbuf2[self.cpos as usize] = 0;
+                        self.cbuf[self.cpos as usize] = if self.rs == 0 { 0 }
+                            else { ((63 - (self.cpos & 63)) << 4) as u8 };
+                        self.cpos += 1;
+                        self.rs += 1;
+                    }
+                } else {
+                    let r = self.rs >> 4;
+                    let ss = self.rs & 15;
+                    self.mcupos += r + 1;
+                    let mask = (1i32 << ss).wrapping_sub(1);
+                    xx = (self.huffcode as i32) & mask;
+                    if ss > 0 && (xx >> (ss - 1)) == 0 {
+                        xx -= mask;
+                    }
+                    for i in (1..=r).rev() {
+                        let _ = i;
+                        self.cbuf2[self.cpos as usize] = 0;
+                        self.cbuf[self.cpos as usize] = (((r << 4) | ss) & 0xff) as u8;
+                        self.cpos += 1;
+                    }
+                    self.cbuf2[self.cpos as usize] = xx;
+                    self.cbuf[self.cpos as usize] = ((ss << 4)
+                        | (((self.huffcode as i32) << 2 >> ss) & 3)
+                        | 12) as u8;
+                    self.cpos += 1;
+                    self.ssum += ss;
+                }
+            } else {
+                // DC.
+                self.mcupos += 1;
+                let mask = (1i32 << self.rs).wrapping_sub(1);
+                xx = (self.huffcode as i32) & mask;
+                if self.rs > 0 && (xx >> (self.rs - 1)) == 0 {
+                    xx -= mask;
+                }
+                let comp = self.color[(self.mcupos >> 6).clamp(0, 9) as usize]
+                    .clamp(0, 3) as usize;
+                self.pred[comp] += xx;
+                self.dc = self.pred[comp];
+                self.cbuf2[self.cpos as usize] = self.dc;
+                self.cbuf[self.cpos as usize] = (((self.dc + 1023) >> 3) & 0xff) as u8;
+                self.cpos += 1;
+                if (self.mcupos >> 6) == 0 {
+                    self.ssum1 = 0;
+                    self.ssum2 = self.ssum3;
+                } else {
+                    let prev_mc = ((self.mcupos >> 6) - 1).clamp(0, 9) as usize;
+                    if self.color[prev_mc] == self.color[0] {
+                        self.ssum3 = self.ssum;
+                        self.ssum1 += self.ssum3;
+                    }
+                    self.ssum2 = self.ssum1;
+                }
+                self.ssum = self.rs;
+            }
+            self.cpos &= (JPEG_CBUF_SIZE as i32) - 1;
+            if self.mcupos >= self.mcusize {
+                self.mcupos = 0;
+                self.column += 1;
+                if self.column == self.width { self.column = 0; self.row += 1; }
+            }
+            self.huffcode = 0; self.huffsize = 0; self.huffbits = 0;
+            self.rs = -1;
+
+            // Advanced predictors — paq8.cpp:6385-6474.
+            self.update_adv_pred(idx_u);
+        }
     }
+
+    fn update_adv_pred(&mut self, idx_u: usize) {
+        let acomp = (self.mcupos >> 6).clamp(0, 9) as usize;
+        let q = 64 * self.images[idx_u].qmap[acomp] as usize;
+        let zz = (self.mcupos & 63) as usize;
+        let cpos_dc = self.cpos - zz as i32;
+        let norst = self.rstpos != self.column + self.row * self.width;
+
+        if zz == 0 {
+            for i in 0..8 { self.sumu[i] = 0; self.sumv[i] = 0; }
+            let offset_dc_w = cpos_dc - self.block_w[acomp];
+            let offset_dc_n = cpos_dc - self.block_n[acomp];
+            for i in 0..64 {
+                let zzu_i = JPEG_ZZU[i] as usize;
+                let zzv_i = JPEG_ZZV[i] as usize;
+                let cn = self.cbuf2_at(offset_dc_n + i as i32);
+                let cw = self.cbuf2_at(offset_dc_w + i as i32);
+                let qtab = self.images[idx_u].qtab[q + i] as i32 + 1;
+                let v_sign = if (JPEG_ZZV[i] & 1) != 0 { -1 } else { 1 };
+                let u_sign = if (JPEG_ZZU[i] & 1) != 0 { -1 } else { 1 };
+                let v_mul = if zzv_i != 0 { 16 * (16 + zzv_i as i32) } else { 185 };
+                let u_mul = if zzu_i != 0 { 16 * (16 + zzu_i as i32) } else { 185 };
+                self.sumu[zzu_i] = self.sumu[zzu_i]
+                    .wrapping_add(v_sign * v_mul * qtab * cn);
+                self.sumv[zzv_i] = self.sumv[zzv_i]
+                    .wrapping_add(u_sign * u_mul * qtab * cw);
+            }
+        } else {
+            let zzu_prev = JPEG_ZZU[zz - 1] as usize;
+            let zzv_prev = JPEG_ZZV[zz - 1] as usize;
+            let cn = self.cbuf2_at(self.cpos - 1);
+            let qtab = self.images[idx_u].qtab[q + zz - 1] as i32 + 1;
+            let v_mul = if zzv_prev != 0 { 16 * (16 + zzv_prev as i32) } else { 185 };
+            let u_mul = if zzu_prev != 0 { 16 * (16 + zzu_prev as i32) } else { 185 };
+            self.sumu[zzu_prev] = self.sumu[zzu_prev].wrapping_sub(v_mul * qtab * cn);
+            self.sumv[zzv_prev] = self.sumv[zzv_prev].wrapping_sub(u_mul * qtab * cn);
+        }
+
+        for i in 0..3 {
+            self.run_pred[i] = 0; self.run_pred[i + 3] = 0;
+            for st in 0..10 {
+                if zz + st >= 64 { break; }
+                let zz2 = zz + st;
+                let zzu2 = JPEG_ZZU[zz2] as usize;
+                let zzv2 = JPEG_ZZV[zz2] as usize;
+                let mut p = self.sumu[zzu2].wrapping_mul(i as i32)
+                    .wrapping_add(self.sumv[zzv2].wrapping_mul(2 - i as i32));
+                let qtab = self.images[idx_u].qtab[q + zz2] as i32 + 1;
+                let div = qtab * 185 * (16 + zzv2 as i32) * (16 + zzu2 as i32) / 128;
+                if div != 0 { p /= div; }
+                if zz2 == 0 && (norst || self.ls[acomp] == 64) {
+                    p -= self.cbuf2_at(cpos_dc - self.ls[acomp]);
+                }
+                let sign = if p < 0 { -1 } else { 1 };
+                let pq = sign * s_ilog(p.unsigned_abs() + 1);
+                if st == 0 {
+                    self.adv_pred[i] = pq;
+                } else if pq.abs() > self.adv_pred[i].abs() + 2
+                    && self.adv_pred[i].abs() < 210
+                {
+                    if self.run_pred[i] == 0 {
+                        self.run_pred[i] = (st as i32) * 2 + (pq > 0) as i32;
+                    }
+                    if pq.abs() > self.adv_pred[i].abs() + 21
+                        && self.run_pred[i + 3] == 0
+                    {
+                        self.run_pred[i + 3] = (st as i32) * 2 + (pq > 0) as i32;
+                    }
+                }
+            }
+        }
+
+        let zzu_z = JPEG_ZZU[zz] as usize;
+        let zzv_z = JPEG_ZZV[zz] as usize;
+        let mut x = 0i32;
+        for i in 0..8 {
+            x += if (zzu_z as i32) < i { self.sumu[i as usize] } else { 0 };
+            x += if (zzv_z as i32) < i { self.sumv[i as usize] } else { 0 };
+        }
+        let factor = (zzu_z as i32 + zzv_z as i32 + 16).max(1);
+        x = (self.sumu[zzu_z].wrapping_mul(2 + zzu_z as i32)
+            .wrapping_add(self.sumv[zzv_z].wrapping_mul(2 + zzv_z as i32))
+            .wrapping_sub(x.wrapping_mul(2))) * 4 / factor;
+        let qtab = self.images[idx_u].qtab[q + zz] as i32 + 1;
+        let div = qtab * 185;
+        if div != 0 { x /= div; }
+        if zz == 0 && (norst || self.ls[acomp] == 64) {
+            x -= self.cbuf2_at(cpos_dc - self.ls[acomp]);
+        }
+        let sign = if x < 0 { -1 } else { 1 };
+        self.adv_pred[3] = sign * s_ilog(x.unsigned_abs() + 1);
+
+        // lcp[0..6] — local coefficient predictors.
+        for i in 0..4 {
+            let a = if (i & 1) != 0 { zzv_z as i32 } else { zzu_z as i32 };
+            let b = if (i & 2) != 0 { 2 } else { 1 };
+            let xv = if a < b { 65535 } else {
+                let off = if (i & 1) != 0 { 8 } else { 1 };
+                let zz2 = self.zpos[(zzu_z as i32 + 8 * zzv_z as i32 - off * b) as usize] as usize;
+                let qtab2 = self.images[idx_u].qtab[q + zz2] as i32 + 1;
+                let mut x = qtab2 * self.cbuf2_at(cpos_dc + zz2 as i32);
+                let denom = self.images[idx_u].qtab[q + zz] as i32 + 1;
+                if denom != 0 { x /= denom; }
+                let sign = if x < 0 { -1 } else { 1 };
+                sign * (s_ilog(x.unsigned_abs() + 1) + if x != 0 { 17 } else { 0 })
+            };
+            self.lcp[i] = xv;
+        }
+        if (zzu_z * zzv_z) != 0 {
+            for ki in 0..3 {
+                let off = match ki {
+                    0 => (zzu_z as i32 + 8 * zzv_z as i32 - 9) as usize,
+                    1 => (8 * zzv_z) as usize,
+                    _ => zzu_z as usize,
+                };
+                let zz2 = self.zpos[off] as usize;
+                let qtab2 = self.images[idx_u].qtab[q + zz2] as i32 + 1;
+                let mut xv = qtab2 * self.cbuf2_at(cpos_dc + zz2 as i32);
+                let denom = self.images[idx_u].qtab[q + zz] as i32 + 1;
+                if denom != 0 { xv /= denom; }
+                let sign = if xv < 0 { -1 } else { 1 };
+                self.lcp[4 + ki] = sign * (s_ilog(xv.unsigned_abs() + 1) + if xv != 0 { 17 } else { 0 });
+            }
+        } else {
+            self.lcp[4] = 65535; self.lcp[5] = 65535; self.lcp[6] = 65535;
+        }
+
+        // prev_coef / prev_coef2.
+        let mut prev1 = 0i32; let mut prev2 = 0i32;
+        let mut cnt1 = 0i32; let mut cnt2 = 0i32;
+        let mut r = 0i32; let mut ss_ = 0i32;
+        self.prev_coef_rs = self.cbuf[((self.cpos - 64).rem_euclid(JPEG_CBUF_SIZE as i32)) as usize] as i32;
+        for i in 0..acomp {
+            let off = self.cpos - (acomp as i32 - i as i32) * 64;
+            let mut xv = self.cbuf2_at(off);
+            if zz == 0 && (norst || self.ls[i] == 64) {
+                xv -= self.cbuf2_at(cpos_dc - (acomp as i32 - i as i32) * 64 - self.ls[i]);
+            }
+            if self.color[i] == self.color[acomp] - 1 {
+                prev1 += xv; cnt1 += 1;
+                r += self.cbuf[off.rem_euclid(JPEG_CBUF_SIZE as i32) as usize] as i32 >> 4;
+                ss_ += self.cbuf[off.rem_euclid(JPEG_CBUF_SIZE as i32) as usize] as i32 & 0xF;
+            }
+            if self.color[acomp] > 1 && self.color[i] == self.color[0] {
+                prev2 += xv; cnt2 += 1;
+            }
+        }
+        if cnt1 > 0 {
+            prev1 /= cnt1; r /= cnt1; ss_ /= cnt1;
+            self.prev_coef_rs = (r << 4) | ss_;
+        }
+        if cnt2 > 0 { prev2 /= cnt2; }
+        let sign1 = if prev1 < 0 { -1 } else { 1 };
+        self.prev_coef = sign1 * s_ilog(11 * prev1.unsigned_abs() + 1) + (cnt1 << 20);
+        let sign2 = if prev2 < 0 { -1 } else { 1 };
+        self.prev_coef2 = sign2 * s_ilog(11 * prev2.unsigned_abs() + 1);
+
+        if self.column == 0 && self.block_w[acomp] > 64 * acomp as i32 {
+            self.run_pred[1] = self.run_pred[2]; self.run_pred[0] = 0;
+            self.adv_pred[1] = self.adv_pred[2]; self.adv_pred[0] = 0;
+        }
+        if self.row == 0 && self.block_n[acomp] > 64 * acomp as i32 {
+            self.run_pred[1] = self.run_pred[0]; self.run_pred[2] = 0;
+            self.adv_pred[1] = self.adv_pred[0]; self.adv_pred[2] = 0;
+        }
+    }
+
+    #[inline]
+    fn cbuf2_at(&self, off: i32) -> i32 {
+        let i = off.rem_euclid(JPEG_CBUF_SIZE as i32) as usize;
+        self.cbuf2[i]
+    }
+
+    // ---------- Context model + predict (paq8.cpp:6498-6588) ----------
+    fn context_model_predict(&mut self, s: &mut Paq8State, m: &mut Mixer) {
+        use super::substrate::{hash3, hash4, hash5, hash6, hash7, hash8, nex};
+        let y = s.y;
+
+        // Update bit-history state for the previous bit (when cp is
+        // valid from a prior `hbcount` cycle).
+        if self.cp_valid {
+            for i in 0..JPEG_N_CONTEXTS {
+                let (slot_base, off) = self.cp[i];
+                if slot_base + off < self.t_storage_len() {
+                    let cur = self.t_byte(slot_base + off);
+                    let ns = nex(cur, y as usize);
+                    self.t_set_byte(slot_base + off, ns);
+                }
+            }
+        }
+
+        let comp = self.color[(self.mcupos >> 6).clamp(0, 9) as usize].clamp(0, 3);
+        let coef = ((self.mcupos & 63) | (comp << 6)) as u64;
+        let hc = ((self.huffcode as i32 * 4)
+            + (((self.mcupos & 63) == 0) as i32 * 2)
+            + ((comp == 0) as i32))
+            | (1 << (self.huffbits + 2));
+        let firstcol = self.column == 0
+            && self.block_w[(self.mcupos >> 6).clamp(0, 9) as usize] > self.mcupos;
+        self.hbcount += 1;
+        if self.hbcount > 2 || self.huffbits == 0 { self.hbcount = 0; }
+
+        let zz = (self.mcupos & 63) as usize;
+        let zu = JPEG_ZZU[zz] as i32;
+        let zv = JPEG_ZZV[zz] as i32;
+
+        if self.hbcount == 0 {
+            // Rebuild all 32 contexts.
+            let mut n = (hc as u64).wrapping_mul(32);
+            let bump = |n: &mut u64| { *n = n.wrapping_add(1); *n };
+            self.cxt[0] = hash5(bump(&mut n), coef,
+                (self.adv_pred[2] / 12 + (self.run_pred[2] << 8)) as u64,
+                (self.ssum2 >> 6) as u64, (self.prev_coef / 72) as u64);
+            self.cxt[1] = hash5(bump(&mut n), coef,
+                (self.adv_pred[0] / 12 + (self.run_pred[0] << 8)) as u64,
+                (self.ssum2 >> 6) as u64, (self.prev_coef / 72) as u64);
+            self.cxt[2] = hash4(bump(&mut n), coef,
+                (self.adv_pred[1] / 11 + (self.run_pred[1] << 8)) as u64,
+                (self.ssum2 >> 6) as u64);
+            self.cxt[3] = hash5(bump(&mut n), self.rs1 as u64,
+                (self.adv_pred[2] / 7) as u64, (self.run_pred[5] / 2) as u64,
+                (self.prev_coef / 10) as u64);
+            self.cxt[4] = hash5(bump(&mut n), self.rs1 as u64,
+                (self.adv_pred[0] / 7) as u64, (self.run_pred[3] / 2) as u64,
+                (self.prev_coef / 10) as u64);
+            self.cxt[5] = hash4(bump(&mut n), self.rs1 as u64,
+                (self.adv_pred[1] / 11) as u64, self.run_pred[4] as u64);
+            self.cxt[6] = hash5(bump(&mut n), (self.adv_pred[2] / 14) as u64,
+                self.run_pred[2] as u64, (self.adv_pred[0] / 14) as u64,
+                self.run_pred[0] as u64);
+            self.cxt[7] = hash5(bump(&mut n),
+                (self.cbuf[((self.cpos - self.block_n[(self.mcupos >> 6).clamp(0, 9) as usize])
+                    .rem_euclid(JPEG_CBUF_SIZE as i32)) as usize] as u64) >> 4,
+                (self.adv_pred[3] / 17) as u64, self.run_pred[1] as u64,
+                self.run_pred[5] as u64);
+            self.cxt[8] = hash5(bump(&mut n),
+                (self.cbuf[((self.cpos - self.block_w[(self.mcupos >> 6).clamp(0, 9) as usize])
+                    .rem_euclid(JPEG_CBUF_SIZE as i32)) as usize] as u64) >> 4,
+                (self.adv_pred[3] / 17) as u64, self.run_pred[1] as u64,
+                self.run_pred[3] as u64);
+            self.cxt[9] = hash5(bump(&mut n), (self.lcp[0] / 22) as u64,
+                (self.lcp[1] / 22) as u64, (self.adv_pred[1] / 7) as u64,
+                self.run_pred[1] as u64);
+            self.cxt[10] = hash5(bump(&mut n), (self.lcp[0] / 22) as u64,
+                (self.lcp[1] / 22) as u64, (self.mcupos & 63) as u64,
+                (self.lcp[4] / 30) as u64);
+            self.cxt[11] = hash5(bump(&mut n), (zu / 2) as u64,
+                (self.lcp[0] / 13) as u64, (self.lcp[2] / 30) as u64,
+                (self.prev_coef / 40 + ((self.prev_coef2 / 28) << 20)) as u64);
+            self.cxt[12] = hash5(bump(&mut n), (zv / 2) as u64,
+                (self.lcp[1] / 13) as u64, (self.lcp[3] / 30) as u64,
+                (self.prev_coef / 40 + ((self.prev_coef2 / 28) << 20)) as u64);
+            self.cxt[13] = hash8(bump(&mut n), self.rs1 as u64,
+                (self.prev_coef / 42) as u64, (self.prev_coef2 / 34) as u64,
+                (self.lcp[0] / 60) as u64, (self.lcp[2] / 14) as u64,
+                (self.lcp[1] / 60) as u64, (self.lcp[3] / 14) as u64);
+            self.cxt[14] = hash3(bump(&mut n), (self.mcupos & 63) as u64,
+                (self.column >> 1) as u64);
+            self.cxt[15] = hash7(bump(&mut n), (self.column >> 3) as u64,
+                ((5 + 2 * (comp == 0) as i32).min(zu + zv)) as u64,
+                (self.lcp[0] / 10) as u64, (self.lcp[2] / 40) as u64,
+                (self.lcp[1] / 10) as u64, (self.lcp[3] / 40) as u64);
+            self.cxt[16] = hash3(bump(&mut n), (self.ssum >> 3) as u64,
+                (self.mcupos & 63) as u64);
+            self.cxt[17] = hash4(bump(&mut n), self.rs1 as u64,
+                (self.mcupos & 63) as u64, self.run_pred[1] as u64);
+            let alt = if comp != 0 { hash3(0, (self.prev_coef / 22) as u64, (self.prev_coef2 / 50) as u64) }
+                      else { (self.ssum / (((self.mcupos & 0x3F) + 1) as i32)) as u64 };
+            self.cxt[18] = hash5(bump(&mut n), coef, (self.ssum2 >> 5) as u64,
+                (self.adv_pred[3] / 30) as u64, alt);
+            let alt2 = if comp != 0 {
+                (self.prev_coef / 40 + ((self.prev_coef2 / 40) << 20)) as u64
+            } else { (self.lcp[4] / 22) as u64 };
+            self.cxt[19] = hash7(bump(&mut n), (self.lcp[0] / 40) as u64,
+                (self.lcp[1] / 40) as u64, (self.adv_pred[1] / 28) as u64,
+                alt2, ((7).min(zu + zv)) as u64,
+                (self.ssum / (2 * (zu + zv) + 1).max(1)) as u64);
+            self.cxt[20] = hash5(bump(&mut n), zv as u64,
+                self.cbuf[((self.cpos - self.block_n[(self.mcupos >> 6).clamp(0, 9) as usize])
+                    .rem_euclid(JPEG_CBUF_SIZE as i32)) as usize] as u64,
+                (self.adv_pred[2] / 28) as u64, self.run_pred[2] as u64);
+            self.cxt[21] = hash5(bump(&mut n), zu as u64,
+                self.cbuf[((self.cpos - self.block_w[(self.mcupos >> 6).clamp(0, 9) as usize])
+                    .rem_euclid(JPEG_CBUF_SIZE as i32)) as usize] as u64,
+                (self.adv_pred[0] / 28) as u64, self.run_pred[0] as u64);
+            self.cxt[22] = hash3(bump(&mut n), (self.adv_pred[2] / 7) as u64, self.run_pred[2] as u64);
+            self.cxt[23] = hash3(n, (self.adv_pred[0] / 7) as u64, self.run_pred[0] as u64);
+            self.cxt[24] = hash3(n, (self.adv_pred[1] / 7) as u64, self.run_pred[1] as u64);
+            self.cxt[25] = hash5(bump(&mut n), zv as u64,
+                (self.lcp[1] / 14) as u64, (self.adv_pred[2] / 16) as u64,
+                self.run_pred[5] as u64);
+            self.cxt[26] = hash5(bump(&mut n), zu as u64,
+                (self.lcp[0] / 14) as u64, (self.adv_pred[0] / 16) as u64,
+                self.run_pred[3] as u64);
+            self.cxt[27] = hash4(bump(&mut n), (self.lcp[0] / 14) as u64,
+                (self.lcp[1] / 14) as u64, (self.adv_pred[3] / 16) as u64);
+            self.cxt[28] = hash4(bump(&mut n), coef, (self.prev_coef / 10) as u64,
+                (self.prev_coef2 / 20) as u64);
+            self.cxt[29] = hash4(bump(&mut n), coef, (self.ssum >> 2) as u64,
+                self.prev_coef_rs as u64);
+            let i_zlt = (zu < zv) as usize;
+            self.cxt[30] = hash6(bump(&mut n), coef, (self.adv_pred[1] / 17) as u64,
+                (self.lcp[i_zlt] / 24) as u64, (self.lcp[2] / 20) as u64,
+                (self.lcp[3] / 24) as u64);
+            let zuv_gt1 = ((zu * zv) > 1) as usize * 3;
+            self.cxt[31] = hash6(bump(&mut n), coef, (self.adv_pred[3] / 11) as u64,
+                (self.lcp[i_zlt] / 50) as u64, (self.lcp[2 + zuv_gt1] / 50) as u64,
+                (self.lcp[3 + zuv_gt1] / 50) as u64);
+
+            // Refresh pointers into bit-history table.
+            for i in 0..JPEG_N_CONTEXTS {
+                let payload = self.t.get(self.cxt[i]);
+                let base_in_slice = payload.as_ptr() as usize;
+                let storage_base = self.t_storage_base();
+                // Compute absolute index into t.
+                let abs = base_in_slice.wrapping_sub(storage_base);
+                self.cp[i] = (abs, 1); // +1 to skip past second checksum byte
+            }
+            self.cp_valid = true;
+        } else {
+            // Advance cp by hc-derived offset (paq8.cpp:6569-6570).
+            let inc = if self.hbcount == 1 {
+                (1 + (self.huffcode & 1) * 3) as usize
+            } else {
+                (1 + (self.huffcode & 1)) as usize
+            };
+            for i in 0..JPEG_N_CONTEXTS {
+                self.cp[i].1 += inc;
+            }
+        }
+
+        // Predict and mix.
+        self.m1.update(y);
+        self.m1.add(128);
+        for i in 0..JPEG_N_CONTEXTS {
+            let (slot_base, off) = self.cp[i];
+            let cell = if slot_base + off < self.t_storage_len() {
+                self.t_byte(slot_base + off)
+            } else { 0 };
+            let p = self.sm[i].p(cell as u32, y);
+            m.add(((p - 2048) >> 2) as i16);
+            let p_str = s.stretch.get(p);
+            self.m1.add(p_str as i16);
+            m.add(p_str as i16);
+        }
+        self.m1.set(firstcol as u32, 2);
+        self.m1.set((coef as u32) + 256 * (3.min(self.huffbits as u32)), 1024);
+        self.m1.set(((hc & 0x1FE) * 2
+            + (3.min(super::substrate::ilog2((zu + zv).max(1) as u32) as i32))) as u32, 1024);
+        let pr = self.m1.p(y, &s.squash, &s.stretch);
+        m.add(s.stretch.get(pr) as i16);
+        m.add((pr - 2048) as i16);
+        let pr2 = self.a1.p(pr, ((hc & 511) | (((self.adv_pred[1] / 16) & 63) << 9)) as u32,
+            1023, y, &s.stretch);
+        m.add(s.stretch.get(pr2) as i16);
+        m.add((pr2 - 2048) as i16);
+        let pr3 = self.a2.p(pr2, ((hc & 511) | ((coef as i32) << 9)) as u32,
+            1023, y, &s.stretch);
+        m.add(s.stretch.get(pr3) as i16);
+        m.add((pr3 - 2048) as i16);
+        m.set((1 + ((zu + zv < 5) as i32)
+            + ((self.huffbits > 8) as i32) * 2
+            + (firstcol as i32) * 4) as u32, 9);
+        m.set((1 + (hc & 0xFF)
+            + 256 * (3.min((zu + zv) / 3))) as u32, 1025);
+        m.set((coef as u32) + 256 * (3.min(self.huffbits as u32 / 2)), 1024);
+    }
+
+    fn t_storage_len(&self) -> usize { (1 << JPEG_T_SIZE_LOG) * JPEG_T_BUCKET }
+    fn t_storage_base(&self) -> usize { self.t.storage_base() }
+    fn t_byte(&self, abs: usize) -> u8 { self.t.byte_at(abs) }
+    fn t_set_byte(&mut self, abs: usize, v: u8) { self.t.set_byte_at(abs, v); }
+}
+
+/// Signed-magnitude ilog wrapper used in JPEG predictors. Returns
+/// `floor(log2(x))` per paq8.cpp's `ilog(x)` which calls `Ilog::get`
+/// on x clamped to [0, 65535].
+#[inline]
+fn s_ilog(x: u32) -> i32 {
+    super::substrate::ilog2(x.max(1)) as i32
 }
 
 impl Default for JpegModel { fn default() -> Self { Self::new() } }

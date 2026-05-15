@@ -107,6 +107,15 @@ impl Buf {
         self.b[((self.pos.wrapping_sub(i)) & mask) as usize]
     }
 
+    /// Absolute byte read — `buf[i]` rather than `buf(i)`. Used by
+    /// JpegModel's header parsing which holds direct byte offsets
+    /// captured at marker time (SOF/SOS/DHT pointers into the buffer).
+    pub fn at_abs(&self, i: u32) -> u8 {
+        if self.b.is_empty() { return 0; }
+        let mask = (self.b.len() as u32).wrapping_sub(1);
+        self.b[(i & mask) as usize]
+    }
+
     /// `operator[](i)` — byte at absolute position `i` (mod size).
     pub fn abs(&self, i: u32) -> u8 {
         if self.b.is_empty() { return 0; }
