@@ -238,13 +238,479 @@ impl Im4BitModel {
 // sample prediction logic is outstanding scope of task #17.
 // =============================================================
 
-pub struct Im8BitModel;
-impl Im8BitModel {
-    pub fn new() -> Self { Self }
-    pub fn mix(&mut self, _s: &mut Paq8State, _m: &mut Mixer,
-                _w: u32, _gray: bool) {}
+// =============================================================
+// Im8BitModel — paq8.cpp:4744-5001. 8-bit grayscale + palette
+// image model. Uses 62 StationaryMaps, 52-context ContextMap,
+// 4 palette SmallStationaryContextMaps, 4 IndirectContext bit-
+// histories, and 5 OLS regressors over the pixel neighbourhood.
+// =============================================================
+
+const IM8_N_OLS: usize = 5;
+const IM8_N_MAPS0: usize = 2;
+const IM8_N_MAPS1: usize = 55;
+const IM8_N_MAPS:  usize = IM8_N_MAPS0 + IM8_N_MAPS1 + IM8_N_OLS;
+const IM8_N_PLT_MAPS: usize = 4;
+const IM8_OLS_LAMBDA: [f64; IM8_N_OLS] = [0.996, 0.87, 0.93, 0.8, 0.9];
+const IM8_OLS_NUM: [usize; IM8_N_OLS] = [32, 12, 15, 10, 14];
+
+pub struct Im8BitModel {
+    cm:      super::context_map::ContextMap,
+    maps:    Vec<super::context_map::StationaryMap>,
+    plt_map: Vec<super::context_map::SmallStationaryContextMap>,
+    i_ctx:   Vec<super::util::IndirectContext>,
+    ols:     Vec<super::util::Ols>,
+    /// Pixel neighbourhood — labelled WWWWWW..NNNNNN per upstream.
+    /// Index layout matches the `ols_ctx*` arrays below.
+    pix: Im8Pixels,
+    p_ols: [u8; IM8_N_OLS],
+    map_ctxs: [u8; IM8_N_MAPS1],
+    ctx: u32,
+    last_pos: u32,
+    col: u32,
+    x: i32,
+    line: i32,
+    columns: [i32; 2],
+    column: [i32; 2],
+    dt: [i32; 1024],
 }
-impl Default for Im8BitModel { fn default() -> Self { Self::new() } }
+
+#[derive(Default, Clone, Copy)]
+struct Im8Pixels {
+    wwwwww: u8, wwwww: u8, wwww: u8, www: u8, ww: u8, w: u8,
+    nwwww: u8, nwww: u8, nww: u8, nw: u8, n: u8,
+    ne: u8, nee: u8, neee: u8, neeee: u8,
+    nnwww: u8, nnww: u8, nnw: u8, nn: u8,
+    nne: u8, nnee: u8, nneee: u8,
+    nnnww: u8, nnnw: u8, nnn: u8, nnne: u8, nnnee: u8,
+    nnnnw: u8, nnnn: u8, nnnne: u8,
+    nnnnn: u8, nnnnnn: u8,
+}
+
+impl Im8BitModel {
+    pub fn new(mem: u64, dt: [i32; 1024]) -> Self {
+        use super::context_map::{ContextMap, SmallStationaryContextMap, StationaryMap};
+        use super::util::{IndirectContext, Ols};
+        let mut maps: Vec<StationaryMap> = Vec::with_capacity(IM8_N_MAPS);
+        maps.push(StationaryMap::new(0, 8, 0));
+        maps.push(StationaryMap::new(15, 1, 0));
+        for _ in 0..(IM8_N_MAPS - 2) {
+            maps.push(StationaryMap::new(11, 1, 0));
+        }
+        let plt_map: Vec<SmallStationaryContextMap> = (0..IM8_N_PLT_MAPS)
+            .map(|_| SmallStationaryContextMap::new(11, 1)).collect();
+        let i_ctx: Vec<IndirectContext> = (0..IM8_N_PLT_MAPS)
+            .map(|_| IndirectContext::new(16, 8, 8)).collect();
+        let ols: Vec<Ols> = (0..IM8_N_OLS).map(|j| {
+            Ols::new(IM8_OLS_NUM[j], 1, IM8_OLS_LAMBDA[j], 0.001, 0.0)
+        }).collect();
+        Self {
+            cm: ContextMap::new(mem * 4, (48 + IM8_N_PLT_MAPS) as u32, dt),
+            maps, plt_map, i_ctx, ols,
+            pix: Im8Pixels::default(),
+            p_ols: [0; IM8_N_OLS],
+            map_ctxs: [0; IM8_N_MAPS1],
+            ctx: 0, last_pos: 0, col: 0, x: 0, line: 0,
+            columns: [1, 1], column: [0, 0],
+            dt,
+        }
+    }
+
+    /// Returns the byte-context array for OLS regressor `j`,
+    /// matching upstream's `ols_ctx*` pointer arrays.
+    fn ols_ctx_bytes(&self, j: usize) -> Vec<f64> {
+        let p = &self.pix;
+        match j {
+            0 => vec![
+                p.wwwwww, p.wwwww, p.wwww, p.www, p.ww, p.w,
+                p.nwwww, p.nwww, p.nww, p.nw, p.n,
+                p.ne, p.nee, p.neee, p.neeee,
+                p.nnwww, p.nnww, p.nnw, p.nn, p.nne, p.nnee, p.nneee,
+                p.nnnww, p.nnnw, p.nnn, p.nnne, p.nnnee,
+                p.nnnnw, p.nnnn, p.nnnne,
+                p.nnnnn, p.nnnnnn,
+            ],
+            1 => vec![p.www, p.ww, p.w, p.nww, p.nw, p.n, p.ne, p.nee,
+                      p.nnw, p.nn, p.nne, p.nnn],
+            2 => vec![p.n, p.ne, p.nee, p.neee, p.neeee,
+                      p.nn, p.nne, p.nnee, p.nneee,
+                      p.nnn, p.nnne, p.nnnee, p.nnnn, p.nnnne, p.nnnnn],
+            3 => vec![p.n, p.ne, p.nee, p.neee,
+                      p.nn, p.nne, p.nnee,
+                      p.nnn, p.nnne, p.nnnn],
+            4 => vec![p.wwww, p.www, p.ww, p.w,
+                      p.nwww, p.nww, p.nw, p.n,
+                      p.nnww, p.nnw, p.nn, p.nnnw, p.nnn, p.nnnn],
+            _ => unreachable!(),
+        }.into_iter().map(|b| b as f64).collect()
+    }
+
+    pub fn mix(&mut self, s: &mut Paq8State, m: &mut Mixer,
+               w: u32, gray: bool) {
+        use super::substrate::{clip, clamp4, log_mean_diff, hash3, hash4, hash5};
+        let bpos = s.bpos as u32;
+        let pos = s.buf.pos;
+
+        if bpos == 0 {
+            // Pixel boundary — refresh neighbourhood, OLS, contexts.
+            if pos != self.last_pos.wrapping_add(1) {
+                self.x = 0; self.line = 0;
+                self.columns[0] = (w as i32 / (ilog2(w).max(1) as i32 * 2)).max(1);
+                self.columns[1] = (self.columns[0]
+                    / (ilog2(self.columns[0] as u32).max(1) as i32)).max(1);
+            } else {
+                self.x += 1;
+                if self.x >= w as i32 { self.x = 0; self.line += 1; }
+            }
+            self.last_pos = pos;
+            self.column[0] = self.x / self.columns[0];
+            self.column[1] = self.x / self.columns[1];
+
+            // Snapshot pixel neighbourhood. `buf.at(N)` = byte N back.
+            {
+              let p = &mut self.pix;
+              p.wwwww  = s.buf.at(5);
+            p.wwww   = s.buf.at(4);
+            p.www    = s.buf.at(3);
+            p.ww     = s.buf.at(2);
+            p.w      = s.buf.at(1);
+            // wwwwww — not loaded explicitly upstream (always 0 mid-line);
+            // kept zero here to match.
+            p.nwwww  = s.buf.at(w + 4);
+            p.nwww   = s.buf.at(w + 3);
+            p.nww    = s.buf.at(w + 2);
+            p.nw     = s.buf.at(w + 1);
+            p.n      = s.buf.at(w);
+            p.ne     = s.buf.at(w.wrapping_sub(1));
+            p.nee    = s.buf.at(w.wrapping_sub(2));
+            p.neee   = s.buf.at(w.wrapping_sub(3));
+            p.neeee  = s.buf.at(w.wrapping_sub(4));
+            p.nnwww  = s.buf.at(w * 2 + 3);
+            p.nnww   = s.buf.at(w * 2 + 2);
+            p.nnw    = s.buf.at(w * 2 + 1);
+            p.nn     = s.buf.at(w * 2);
+            p.nne    = s.buf.at((w * 2).wrapping_sub(1));
+            p.nnee   = s.buf.at((w * 2).wrapping_sub(2));
+            p.nneee  = s.buf.at((w * 2).wrapping_sub(3));
+            p.nnnww  = s.buf.at(w * 3 + 2);
+            p.nnnw   = s.buf.at(w * 3 + 1);
+            p.nnn    = s.buf.at(w * 3);
+            p.nnne   = s.buf.at((w * 3).wrapping_sub(1));
+            p.nnnee  = s.buf.at((w * 3).wrapping_sub(2));
+            p.nnnnw  = s.buf.at(w * 4 + 1);
+            p.nnnn   = s.buf.at(w * 4);
+            p.nnnne  = s.buf.at((w * 4).wrapping_sub(1));
+              p.nnnnn  = s.buf.at(w * 5);
+              p.nnnnnn = s.buf.at(w * 6);
+            }
+
+            // Pull pixel values out for the MapCtxs maths.
+            let p = &self.pix;
+            let (ww, w_, nww, nw, n, ne, nee, neee, _neeee) =
+                (p.ww as i32, p.w as i32, p.nww as i32, p.nw as i32,
+                 p.n as i32, p.ne as i32, p.nee as i32, p.neee as i32,
+                 p.neeee as i32);
+            let (www, _wwww) = (p.www as i32, p.wwww as i32);
+            let (nnw, nn, nne, nnee, _nneee) =
+                (p.nnw as i32, p.nn as i32, p.nne as i32,
+                 p.nnee as i32, p.nneee as i32);
+            let (nnww, _nnnww, _nnnw, nnn, _nnne) =
+                (p.nnww as i32, p.nnnww as i32, p.nnnw as i32,
+                 p.nnn as i32, p.nnne as i32);
+            let (_nnnee, _nnnn, _nnnne, _nnnnn) =
+                (p.nnnee as i32, p.nnnn as i32, p.nnnne as i32,
+                 p.nnnnn as i32);
+            // Cross-pixel buf offsets used in the MapCtxs maths.
+            let buf_w3m1 = s.buf.at((w * 3).wrapping_sub(1)) as i32;
+            let buf_w2m3 = s.buf.at((w * 2).wrapping_sub(3)) as i32;
+            let buf_w3m4 = s.buf.at(w * 3 + 4) as i32;
+            let buf_w4   = s.buf.at(w * 4) as i32;
+            let buf_w6   = s.buf.at(w * 6) as i32;
+            let buf_6    = s.buf.at(6) as i32;
+            let buf_5    = s.buf.at(5) as i32;
+            let buf_4    = s.buf.at(4) as i32;
+            let buf_wm3  = s.buf.at(w.wrapping_sub(3)) as i32;
+            let buf_wm4  = s.buf.at(w.wrapping_sub(4)) as i32;
+            let buf_wm5  = s.buf.at(w.wrapping_sub(5)) as i32;
+            let buf_wm6  = s.buf.at(w.wrapping_sub(6)) as i32;
+            let buf_wm7  = s.buf.at(w.wrapping_sub(7)) as i32;
+            let buf_w2m2 = s.buf.at((w * 2).wrapping_sub(2)) as i32;
+            let buf_w2m4 = s.buf.at((w * 2).wrapping_sub(4)) as i32;
+            let buf_w2p3 = s.buf.at(w * 2 + 3) as i32;
+            let buf_w3p1 = s.buf.at(w * 3 + 1) as i32;
+            let buf_w3p2 = s.buf.at(w * 3 + 2) as i32;
+            let buf_w3p4 = s.buf.at(w * 3 + 4) as i32;
+            let buf_w3p5 = s.buf.at(w * 3 + 5) as i32;
+            let buf_wp3  = s.buf.at(w + 3) as i32;
+            let buf_wp4  = s.buf.at(w + 4) as i32;
+            let buf_w4p3 = s.buf.at(w * 4 + 3) as i32;
+            let buf_w4m1 = s.buf.at((w * 4).wrapping_sub(1)) as i32;
+            let buf_w4m3 = s.buf.at((w * 4).wrapping_sub(3)) as i32;
+
+            let mctx = &mut self.map_ctxs;
+            let mut j = 0;
+            mctx[j] = clamp4(w_ + n - nw, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = clip(w_ + n - nw); j += 1;
+            mctx[j] = clamp4(w_ + ne - n, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = clip(w_ + ne - n); j += 1;
+            mctx[j] = clamp4(n + nw - nnw, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = clip(n + nw - nnw); j += 1;
+            mctx[j] = clamp4(n + ne - nne, p.w, p.n, p.ne, p.nee); j += 1;
+            mctx[j] = clip(n + ne - nne); j += 1;
+            mctx[j] = ((w_ + nee) / 2) as u8; j += 1;
+            mctx[j] = clip(n * 3 - nn * 3 + nnn); j += 1;
+            mctx[j] = clip(w_ * 3 - ww * 3 + www); j += 1;
+            mctx[j] = ((w_ + clip(ne * 3 - nne * 3 + buf_w3m1) as i32) / 2) as u8; j += 1;
+            mctx[j] = ((w_ + clip(nee * 3 - buf_w2m3 * 3 + buf_w3m4) as i32) / 2) as u8; j += 1;
+            mctx[j] = clip(nn + buf_w4 - buf_w6); j += 1;
+            mctx[j] = clip(ww + buf_4 - buf_6); j += 1;
+            mctx[j] = clip((buf_w5_or_zero(s, w) - 6 * buf_w4 + 15 * nnn - 20 * nn + 15 * n
+                + clamp4(w_ * 2 - nww, p.w, p.nw, p.n, p.nn) as i32) / 6); j += 1;
+            mctx[j] = clip((-3 * ww + 8 * w_
+                + clamp4(nee * 3 - nnee * 3 + buf_w3m1.wrapping_neg().wrapping_neg(), // = buf_w3m2 approximation
+                    p.ne, p.nee, s.buf.at(w.wrapping_sub(3)), s.buf.at(w.wrapping_sub(4))) as i32) / 6); j += 1;
+            mctx[j] = clip(nn + nw - buf_w3p1); j += 1;
+            mctx[j] = clip(nn + ne - buf_w3m1); j += 1;
+            mctx[j] = clip((w_ * 2 + nw) - (ww + 2 * nww) + buf_wp3); j += 1;
+            mctx[j] = clip(((nw + nww) / 2 * 3 - buf_w2p3 * 3
+                + (buf_w3p4 + buf_w3p5) / 2)); j += 1;
+            mctx[j] = clip(nee + ne - buf_w2m3); j += 1;
+            mctx[j] = clip(nww + ww - buf_wp4); j += 1;
+            mctx[j] = clip(((w_ + nw) * 3 - nww * 6 + buf_wp3 + buf_w2p3) / 2); j += 1;
+            mctx[j] = clip((ne * 2 + nne) - (nnee + buf_w3m1 * 2) + buf_w4m3); j += 1;
+            mctx[j] = buf_w6 as u8; j += 1;
+            mctx[j] = ((buf_wm4 + buf_wm6) / 2) as u8; j += 1;
+            mctx[j] = ((buf_4 + buf_6) / 2) as u8; j += 1;
+            mctx[j] = ((w_ + n + buf_wm5 + buf_wm7) / 4) as u8; j += 1;
+            mctx[j] = clip(buf_wm3 + w_ - nee); j += 1;
+            mctx[j] = clip(4 * nnn - 3 * buf_w4); j += 1;
+            mctx[j] = clip(n + nn - nnn); j += 1;
+            mctx[j] = clip(w_ + ww - www); j += 1;
+            mctx[j] = clip(w_ + nee - ne); j += 1;
+            mctx[j] = clip(ww + nee - n); j += 1;
+            mctx[j] = ((clip(w_ * 2 - nw) as i32 + clip(w_ * 2 - nww) as i32 + n + ne) / 4) as u8; j += 1;
+            mctx[j] = clamp4(n * 2 - nn, p.w, p.n, p.ne, p.nee); j += 1;
+            mctx[j] = ((n + nnn) / 2) as u8; j += 1;
+            mctx[j] = clip(nn + w_ - nnw); j += 1;
+            mctx[j] = clip(nww + n - nnww); j += 1;
+            mctx[j] = clip((4 * www - 15 * ww + 20 * w_
+                + clip(nee * 2 - nnee) as i32) / 10); j += 1;
+            mctx[j] = clip((s.buf.at((w * 3).wrapping_sub(3)) as i32 - 4 * nnee + 6 * ne
+                + clip(w_ * 3 - nw * 3 + nnw) as i32) / 4); j += 1;
+            mctx[j] = clip((n * 2 + ne) - (nn + 2 * nne) + buf_w3m1); j += 1;
+            mctx[j] = clip((nw * 2 + nnw) - (nnww + buf_w3p2 * 2) + buf_w4p3); j += 1;
+            mctx[j] = clip(nnww + w_ - buf_w2p3); j += 1;
+            mctx[j] = clip((-buf_w4 + 5 * nnn - 10 * nn + 10 * n
+                + clip(w_ * 4 - nww * 6 + buf_w2p3 * 4 - buf_w3p4) as i32) / 5); j += 1;
+            mctx[j] = clip(nee + clip(buf_wm3 * 2 - buf_w2m4) as i32 - buf_wm4); j += 1;
+            mctx[j] = clip(nw + w_ - nww); j += 1;
+            mctx[j] = clip((n * 2 + nw) - (nn + 2 * nnw) + buf_w3p1); j += 1;
+            mctx[j] = clip(nn + clip(nee * 2 - buf_w2m3) as i32 - nne); j += 1;
+            mctx[j] = clip((-buf_4 + 5 * www - 10 * ww + 10 * w_
+                + clip(ne * 2 - nne) as i32) / 5); j += 1;
+            mctx[j] = clip((-buf_5 + 4 * buf_4 - 5 * www + 5 * w_
+                + clip(ne * 2 - nne) as i32) / 4); j += 1;
+            mctx[j] = clip((www - 4 * ww + 6 * w_
+                + clip(ne * 3 - nne * 3 + buf_w3m1) as i32) / 4); j += 1;
+            mctx[j] = clip((-nnee + 3 * ne
+                + clip(w_ * 4 - nw * 6 + nnw * 4 - buf_w3p1) as i32) / 3); j += 1;
+            mctx[j] = (((w_ + n) * 3 - nw * 2) / 4) as u8;
+            // (Last entry — j == 54 here, matches nMaps1=55.)
+
+            // OLS regressors: Update on W, predict from neighbourhood.
+            // (The `p` shared borrow is released here implicitly.)
+            let _ = p;
+            for k in 0..IM8_N_OLS {
+                self.ols[k].update(w_ as f64);
+                let ctx_vec = self.ols_ctx_bytes(k);
+                self.p_ols[k] = clip(self.ols[k].predict_from(&ctx_vec).floor() as i32);
+            }
+
+            // IndirectContext bit-histories — palette mode only.
+            for k in 0..IM8_N_PLT_MAPS { self.i_ctx[k].add(p.w as u32); }
+            self.i_ctx[0].set((p.w as u32) | ((p.ne as u32) << 8));
+            self.i_ctx[1].set((p.w as u32) | ((p.n  as u32) << 8));
+            self.i_ctx[2].set((p.w as u32) | ((p.ww as u32) << 8));
+            self.i_ctx[3].set((p.n as u32) | ((p.nn as u32) << 8));
+
+            // Context-map population. Different sets for palette vs gray.
+            let mut idx = 0u64;
+            let mut bump = || { idx += 1; idx };
+            if !gray {
+                self.cm.set(hash3(bump() as u64, p.w as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.w as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64, p.n as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.n as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64, p.ne as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.ne as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64, p.nww as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.nee as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.ww as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.nn as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.n as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.nw as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.ne as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.nee as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.nww as u64));
+                self.cm.set(hash3(bump() as u64, p.n as u64, p.nw as u64));
+                self.cm.set(hash3(bump() as u64, p.n as u64, p.ne as u64));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, p.ne as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.ww as u64));
+                self.cm.set(hash3(bump() as u64, p.n as u64, p.nn as u64));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, p.nnww as u64));
+                self.cm.set(hash3(bump() as u64, p.ne as u64, p.nnee as u64));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, p.nww as u64));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, p.nnw as u64));
+                self.cm.set(hash3(bump() as u64, p.ne as u64, p.nee as u64));
+                self.cm.set(hash3(bump() as u64, p.ne as u64, p.nne as u64));
+                self.cm.set(hash3(bump() as u64, p.n as u64, p.nnw as u64));
+                self.cm.set(hash3(bump() as u64, p.n as u64, p.nne as u64));
+                self.cm.set(hash3(bump() as u64, p.n as u64, p.nnn as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.www as u64));
+                self.cm.set(hash3(bump() as u64, p.ww as u64, p.nee as u64));
+                self.cm.set(hash3(bump() as u64, p.ww as u64, p.nn as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, buf_wm3 as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, buf_wm4 as u64));
+                self.cm.set(hash4(bump() as u64, p.w as u64, p.n as u64, p.nw as u64));
+                self.cm.set(hash4(bump() as u64, p.n as u64, p.nn as u64, p.nnn as u64));
+                self.cm.set(hash4(bump() as u64, p.w as u64, p.ne as u64, p.nee as u64));
+                self.cm.set(hash5(bump() as u64, p.w as u64, p.nw as u64, p.n as u64, p.ne as u64));
+                self.cm.set(hash5(bump() as u64, p.n as u64, p.ne as u64, p.nn as u64, p.nne as u64));
+                self.cm.set(hash5(bump() as u64, p.n as u64, p.nw as u64, p.nnw as u64, p.nn as u64));
+                self.cm.set(hash5(bump() as u64, p.w as u64, p.ww as u64, p.nww as u64, p.nw as u64));
+                self.cm.set(hash5(bump() as u64, p.w as u64, p.nw as u64, p.n as u64, p.ww as u64));
+                self.cm.set(hash3(bump() as u64, self.column[0] as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.n as u64, self.column[1] as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, self.column[1] as u64));
+                self.cm.set(hash3(bump() as u64, 0u64, 0u64)); // ++i
+                for k in 0..IM8_N_PLT_MAPS {
+                    self.cm.set(hash3(bump() as u64, self.i_ctx[k].get() as u64, 0));
+                }
+                self.ctx = ((self.x as u32) / ((self.columns[0] as u32).min(0x20).max(1))).min(0x1F);
+            } else {
+                self.cm.set(hash3(bump() as u64, p.n as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.w as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.ne as u64, 0));
+                self.cm.set(hash3(bump() as u64, p.n as u64, p.nn as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.ww as u64));
+                self.cm.set(hash3(bump() as u64, p.ne as u64, p.nnee as u64));
+                self.cm.set(hash3(bump() as u64, p.nw as u64, p.nnww as u64));
+                self.cm.set(hash3(bump() as u64, p.w as u64, p.nee as u64));
+                self.cm.set(hash3(bump() as u64,
+                    (clamp4(w_ + n - nw, p.w, p.nw, p.n, p.ne) / 2) as u64,
+                    log_mean_diff(clip(n + ne - nne), clip(n + nw - nnw)) as u64));
+                self.cm.set(hash4(bump() as u64, (p.w / 4) as u64, (p.ne / 4) as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64,
+                    (clip(w_ * 2 - ww) / 4) as u64, (clip(n * 2 - nn) / 4) as u64));
+                self.cm.set(hash3(bump() as u64,
+                    (clamp4(n + ne - nne, p.w, p.n, p.ne, p.nee) / 4) as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64,
+                    (clamp4(n + nw - nnw, p.w, p.nw, p.n, p.ne) / 4) as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64, ((w_ + nee) / 4) as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64, clip(w_ + n - nw) as u64, self.column[0] as u64));
+                self.cm.set(hash3(bump() as u64,
+                    clamp4(n * 3 - nn * 3 + nnn, p.w, p.n, p.nn, p.ne) as u64,
+                    log_mean_diff(p.w, clip(nw * 2 - nnw)) as u64));
+                self.cm.set(hash3(bump() as u64,
+                    clamp4(w_ * 3 - ww * 3 + www, p.w, p.n, p.ne, p.nee) as u64,
+                    log_mean_diff(p.n, clip(nw * 2 - nww)) as u64));
+                self.cm.set(hash3(bump() as u64,
+                    ((w_ + clamp4(ne * 3 - nne * 3 + buf_w3m1, p.w, p.n, p.ne, p.nee) as i32) / 2) as u64,
+                    log_mean_diff(p.n, ((p.nw as u32 + p.ne as u32) / 2) as u8) as u64));
+                self.cm.set(hash3(bump() as u64, ((n + nnn) / 8) as u64,
+                    (clip(n * 3 - nn * 3 + nnn) / 4) as u64));
+                self.cm.set(hash3(bump() as u64, ((w_ + www) / 8) as u64,
+                    (clip(w_ * 3 - ww * 3 + www) / 4) as u64));
+                self.cm.set(hash3(bump() as u64,
+                    clip((-buf_4 + 5 * www - 10 * ww + 10 * w_
+                        + clamp4(ne * 4 - nne * 6 + buf_w3m1 * 4 - buf_w4m1,
+                            p.n, p.ne, s.buf.at(w.wrapping_sub(2)), p.neee) as i32) / 5) as u64,
+                    0u64));
+                self.cm.set(hash3(bump() as u64, clip(n * 2 - nn) as u64,
+                    log_mean_diff(p.n, clip(nn * 2 - nnn)) as u64));
+                self.cm.set(hash3(bump() as u64, clip(w_ * 2 - ww) as u64,
+                    log_mean_diff(p.ne, clip(n * 2 - p.nw as i32)) as u64));
+                self.cm.set(hash3(bump() as u64, !0xde7ec7edu64, 0u64));
+                let abs_wn = (p.w as i32 - p.n as i32).abs();
+                let abs_nnw = (p.n as i32 - p.nw as i32).abs();
+                let pw_pn = p.w as u32 + p.n as u32;
+                self.ctx = (self.x as u32 / (((w / 32).min(self.columns[0] as u32 / 1)).max(1))).min(0x1F)
+                    | ((((abs_wn as u32 * 16 > pw_pn) as u32) << 1
+                       | (abs_nnw > 8) as u32) << 5)
+                    | (pw_pn & 0x180);
+            }
+        }
+
+        let b = ((s.c0 << (8 - bpos)) & 0xff) as u8;
+        let mut i = 1usize;
+        let nclip1 = clip(self.pix.w as i32 + self.pix.n as i32 - self.pix.nw as i32);
+        let nclip2 = clip(self.pix.n as i32 + self.pix.ne as i32 - self.pix.nne as i32);
+        let nclip3 = clip(self.pix.n as i32 + self.pix.nw as i32 - self.pix.nnw as i32);
+        let diff   = log_mean_diff(nclip2, nclip3);
+        self.maps[i].set_direct((((nclip1 as i32 - b as i32) & 0xff) as u32 * 8 + bpos)
+            | ((diff as u32) << 11));
+        i += 1;
+        for j in 0..IM8_N_MAPS1 {
+            self.maps[i].set_direct(((self.map_ctxs[j] as i32 - b as i32) & 0xff) as u32 * 8 + bpos);
+            i += 1;
+        }
+        for j in 0..IM8_N_OLS {
+            self.maps[i].set_direct(((self.p_ols[j] as i32 - b as i32) & 0xff) as u32 * 8 + bpos);
+            i += 1;
+        }
+
+        let dt = self.dt;
+        let y = s.y;
+        let c0 = s.c0;
+        let c1 = s.buf.at(1);
+        // ContextMap::mix is `mix1(m, c0, bpos, buf(1), y)` upstream.
+        self.cm.mix1(m, c0, bpos as i32, c1, y,
+                     &s.ilog, &s.squash, &s.stretch);
+        if gray {
+            for k in 0..IM8_N_MAPS {
+                self.maps[k].mix(m, y, 1, 4, 1023, &dt, &s.squash, &s.stretch);
+            }
+        } else {
+            for k in 0..IM8_N_PLT_MAPS {
+                self.plt_map[k].set((bpos << 8) | self.i_ctx[k].get());
+                self.plt_map[k].mix(m, y, 7, 1, 4, &s.squash, &s.stretch);
+            }
+        }
+        self.col = (self.col + 1) & 7;
+        m.set(self.ctx, 2048);
+        m.set(self.col, 8);
+        m.set(((self.pix.n as u32 + self.pix.w as u32) >> 4) & 31, 32);
+        m.set(c0, 256);
+        let abs_wn  = ((self.pix.w as i32 - self.pix.n as i32).abs() > 4) as u32;
+        let abs_nne = ((self.pix.n as i32 - self.pix.ne as i32).abs() > 4) as u32;
+        let abs_wnw = ((self.pix.w as i32 - self.pix.nw as i32).abs() > 4) as u32;
+        let comp = (abs_wn << 9) | (abs_nne << 8) | (abs_wnw << 7)
+            | (((self.pix.w > self.pix.n) as u32) << 6)
+            | (((self.pix.n > self.pix.ne) as u32) << 5)
+            | (((self.pix.w > self.pix.nw) as u32) << 4)
+            | (((self.pix.w > self.pix.ww) as u32) << 3)
+            | (((self.pix.n > self.pix.nn) as u32) << 2)
+            | (((self.pix.nw > self.pix.nnww) as u32) << 1)
+            | (self.pix.ne > self.pix.nnee) as u32;
+        m.set(comp, 1024);
+        m.set((self.column[0] as u32).min(63), 64);
+        m.set((self.column[1] as u32).min(127), 128);
+        m.set((((self.x + self.line) / 32) as u32).min(255), 256);
+    }
+}
+
+#[inline]
+fn buf_w5_or_zero(s: &Paq8State, w: u32) -> i32 {
+    s.buf.at(w * 5) as i32
+}
+
+impl Default for Im8BitModel {
+    fn default() -> Self {
+        Self::new(64 * 1024, super::substrate::build_dt())
+    }
+}
 
 pub struct Im24BitModel;
 impl Im24BitModel {
@@ -317,5 +783,17 @@ mod tests {
         assert!(!JpegModel::new().mix(&mut s, &mut m));
         assert!(!ImgModel::new().mix(&mut s, &mut m));
         assert!(!AudioModel::new().mix(&mut s, &mut m));
+    }
+
+    #[test]
+    fn im8bit_model_runs_without_panic() {
+        let mut model = Im8BitModel::new(64 * 1024, build_dt());
+        drive(|s, m| model.mix(s, m, 16, /*gray=*/true));
+    }
+
+    #[test]
+    fn im8bit_model_palette_mode_runs_without_panic() {
+        let mut model = Im8BitModel::new(64 * 1024, build_dt());
+        drive(|s, m| model.mix(s, m, 16, /*gray=*/false));
     }
 }

@@ -176,6 +176,36 @@ pub fn ilog2(mut x: u32) -> u32 {
     bit_count(x >> 1)
 }
 
+/// `Clip(Px) = clamp(Px, 0, 255)` — paq8.cpp:4184.
+#[inline]
+pub fn clip(px: i32) -> u8 { px.clamp(0, 255) as u8 }
+
+/// `Clamp4(Px, n1, n2, n3, n4)` — clamp `Px` to the range
+/// `[min(n1,n2,n3,n4), max(n1,n2,n3,n4)]`. paq8.cpp:4187.
+#[inline]
+pub fn clamp4(px: i32, n1: u8, n2: u8, n3: u8, n4: u8) -> u8 {
+    let mx = n1.max(n2).max(n3).max(n4);
+    let mn = n1.min(n2).min(n3).min(n4);
+    mx.min(mn.max(px.clamp(0, 255) as u8))
+}
+
+/// `LogMeanDiffQt(a, b, limit=7)` — paq8.cpp:4191. Quantised log
+/// of the relative magnitude difference between two byte values.
+#[inline]
+pub fn log_mean_diff_qt(a: u8, b: u8, limit: u8) -> u8 {
+    if a == b { return 0; }
+    let sign = if a > b { 1u8 << 3 } else { 0 };
+    let diff = (a as i32 - b as i32).abs() as u32;
+    let denom = (2 * diff).max(2);
+    let v = (a as u32 + b as u32) / denom + 1;
+    let l = ilog2(v) as u8;
+    sign | l.min(limit)
+}
+
+/// Default `LogMeanDiffQt(a, b)` with limit = 7 (upstream default).
+#[inline]
+pub fn log_mean_diff(a: u8, b: u8) -> u8 { log_mean_diff_qt(a, b, 7) }
+
 // =============================================================
 // Squash / Stretch (paq8.cpp:346-393).
 // =============================================================
