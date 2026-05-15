@@ -13,7 +13,7 @@ use super::context_map::{ContextMap2, RunContextMap};
 use super::dmc::DmcForest;
 use super::exe_model::ExeModel;
 use super::file_models::{
-    AudioModel, Im1BitModel, Im4BitModel, Im8BitModel, ImgModel, JpegModel,
+    AudioModel, Im1BitModel, Im24BitModel, Im4BitModel, Im8BitModel, ImgModel, JpegModel,
 };
 use super::match_model::MatchModel;
 use super::mixer::Mixer;
@@ -106,6 +106,7 @@ pub struct Paq8Predictor {
     im1bit_model: Option<Im1BitModel>,
     im4bit_model: Option<Im4BitModel>,
     im8bit_model: Option<Im8BitModel>,
+    im24bit_model: Option<Im24BitModel>,
 
     // APM cascade.
     text_apms:    [Apm; 4],
@@ -156,6 +157,7 @@ impl Paq8Predictor {
             img_model: ImgModel::new(),
             audio_model: AudioModel::new(),
             im1bit_model: None, im4bit_model: None, im8bit_model: None,
+            im24bit_model: None,
             text_apms: [
                 Apm::new(0x10000, dt), Apm::new(0x10000, dt),
                 Apm::new(0x10000, dt), Apm::new(0x10000, dt),
@@ -305,9 +307,13 @@ impl Paq8Predictor {
                                 &self.state.stretch);
             }
             Filetype::Image24 | Filetype::Image32 => {
-                // Im24BitModel is still a stub — return the mixer's
-                // current prediction without per-pixel adjustment.
-                // Full Im24BitModel port is task #34.
+                if self.im24bit_model.is_none() {
+                    self.im24bit_model = Some(Im24BitModel::new(
+                        mem(self.state.level), self.state.dt));
+                }
+                let alpha = self.filetype == Filetype::Image32;
+                self.im24bit_model.as_mut().unwrap()
+                    .mix(&mut self.state, &mut self.m, w, alpha);
                 return self.m.p(self.state.y, &self.state.squash,
                                 &self.state.stretch);
             }
@@ -317,6 +323,47 @@ impl Paq8Predictor {
             && self.jpeg_model.mix(&mut self.state, &mut self.m);
         let img_hit = self.size > 0
             && self.img_model.mix(&mut self.state, &mut self.m);
+        if img_hit {
+            // ImgModel detected a BMP/TGA stream — dispatch to the
+            // correct per-bit-depth model with its discovered width
+            // and alpha/gray flags.
+            let w = self.img_model.width();
+            let alpha_img = self.img_model.has_alpha();
+            let gray_img = self.img_model.is_gray();
+            match self.img_model.bpp() {
+                1 => {
+                    if self.im1bit_model.is_none() {
+                        self.im1bit_model = Some(Im1BitModel::new(self.state.dt));
+                    }
+                    self.im1bit_model.as_mut().unwrap()
+                        .mix(&mut self.state, &mut self.m, w);
+                }
+                4 => {
+                    if self.im4bit_model.is_none() {
+                        self.im4bit_model = Some(Im4BitModel::new(
+                            mem(self.state.level), self.state.dt));
+                    }
+                    self.im4bit_model.as_mut().unwrap()
+                        .mix(&mut self.state, &mut self.m, w);
+                }
+                8 => {
+                    if self.im8bit_model.is_none() {
+                        self.im8bit_model = Some(Im8BitModel::new(
+                            mem(self.state.level), self.state.dt));
+                    }
+                    self.im8bit_model.as_mut().unwrap()
+                        .mix(&mut self.state, &mut self.m, w, gray_img);
+                }
+                _ => { // 24 / 32
+                    if self.im24bit_model.is_none() {
+                        self.im24bit_model = Some(Im24BitModel::new(
+                            mem(self.state.level), self.state.dt));
+                    }
+                    self.im24bit_model.as_mut().unwrap()
+                        .mix(&mut self.state, &mut self.m, w, alpha_img);
+                }
+            }
+        }
         let audio_hit = self.audio_model.mix(&mut self.state, &mut self.m);
         if jpeg_hit || img_hit || audio_hit {
             return self.m.p(self.state.y, &self.state.squash,

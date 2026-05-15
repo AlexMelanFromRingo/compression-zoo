@@ -712,13 +712,670 @@ impl Default for Im8BitModel {
     }
 }
 
-pub struct Im24BitModel;
-impl Im24BitModel {
-    pub fn new() -> Self { Self }
-    pub fn mix(&mut self, _s: &mut Paq8State, _m: &mut Mixer,
-                _w: u32, _alpha: bool) {}
+// =============================================================
+// Im24BitModel — paq8.cpp:5002-5354. 24-bit RGB / 32-bit RGBA
+// image model. Stride-aware OLS × 4 channels (R/G/B/A), 100
+// StationaryMaps, 59 SmallStationaryContextMaps, 47-context
+// ContextMap, plus the 46-byte pixel neighbourhood spanning the
+// adjacent-channel bytes (Wp1, Wp2, ..., NNp2).
+// =============================================================
+
+const IM24_N_MAPS0: usize = 18;
+const IM24_N_MAPS1: usize = 76;
+const IM24_N_OLS:   usize = 6;
+const IM24_N_MAPS:  usize = IM24_N_MAPS0 + IM24_N_MAPS1 + IM24_N_OLS;
+const IM24_N_SC_MAPS: usize = 59;
+const IM24_OLS_LAMBDA: [f64; IM24_N_OLS] = [0.98, 0.87, 0.9, 0.8, 0.9, 0.7];
+const IM24_OLS_NUM:    [usize; IM24_N_OLS] = [32, 12, 15, 10, 14, 8];
+
+pub struct Im24BitModel {
+    cm:    super::context_map::ContextMap,
+    maps:  Vec<super::context_map::StationaryMap>,
+    sc_map: Vec<super::context_map::SmallStationaryContextMap>,
+    /// `[regressor][channel]` — 6 OLS × 4 channels.
+    ols:   Vec<Vec<super::util::Ols>>,
+    pix:   Im24Pixels,
+    p_ols: [u8; IM24_N_OLS],
+    map_ctxs: [u8; IM24_N_MAPS1],
+    sc_map_ctxs: [i32; IM24_N_SC_MAPS - 1],
+    ctx: [u32; 2],
+    color: i32,
+    stride: i32,
+    padding: i32,
+    last_pos: u32,
+    x: i32,
+    line: i32,
+    columns: [i32; 2],
+    column: [i32; 2],
+    col: i32,
+    dt: [i32; 1024],
 }
-impl Default for Im24BitModel { fn default() -> Self { Self::new() } }
+
+#[derive(Default, Clone, Copy)]
+struct Im24Pixels {
+    // Base 32-byte neighbourhood (same labels as Im8 but with stride).
+    wwwwww: u8, wwwww: u8, wwww: u8, www: u8, ww: u8, w: u8,
+    nwwww: u8, nwww: u8, nww: u8, nw: u8, n: u8,
+    ne: u8, nee: u8, neee: u8, neeee: u8,
+    nnwww: u8, nnww: u8, nnw: u8, nn: u8,
+    nne: u8, nnee: u8, nneee: u8,
+    nnnww: u8, nnnw: u8, nnn: u8, nnne: u8, nnnee: u8,
+    nnnnw: u8, nnnn: u8, nnnne: u8,
+    nnnnn: u8, nnnnnn: u8,
+    // Adjacent-channel bytes (the "p1" suffix = +1 byte, "p2" = +2).
+    wwp1: u8, wp1: u8, p1: u8, nwp1: u8, np1: u8, nep1: u8, nnp1: u8,
+    wwp2: u8, wp2: u8, p2: u8, nwp2: u8, np2: u8, nep2: u8, nnp2: u8,
+}
+
+impl Im24BitModel {
+    pub fn new(mem: u64, dt: [i32; 1024]) -> Self {
+        use super::context_map::{ContextMap, SmallStationaryContextMap, StationaryMap};
+        use super::util::{Ols};
+        // 18 base maps with custom shapes, then 76 + 6 with `{11,1}`.
+        let mut maps: Vec<StationaryMap> = Vec::with_capacity(IM24_N_MAPS);
+        let base_shapes: &[(u32, u32)] = &[
+            (8,8), (8,8), (8,8), (2,8), (0,8), (15,1), (15,1), (15,1),
+            (15,1), (15,1), (17,1), (17,1), (17,1), (17,1),
+            (13,1), (13,1), (13,1), (13,1),
+        ];
+        for &(b, p) in base_shapes { maps.push(StationaryMap::new(b, p, 0)); }
+        for _ in 0..(IM24_N_MAPS - IM24_N_MAPS0) {
+            maps.push(StationaryMap::new(11, 1, 0));
+        }
+        let mut sc_map: Vec<SmallStationaryContextMap> =
+            (0..IM24_N_SC_MAPS - 1).map(|_| SmallStationaryContextMap::new(11, 1))
+            .collect();
+        sc_map.push(SmallStationaryContextMap::new(0, 8));
+        let ols: Vec<Vec<Ols>> = (0..IM24_N_OLS).map(|j| {
+            (0..4).map(|_| Ols::new(IM24_OLS_NUM[j], 1, IM24_OLS_LAMBDA[j], 0.001, 0.0))
+                .collect()
+        }).collect();
+        Self {
+            cm: ContextMap::new(mem * 4, 47, dt),
+            maps, sc_map, ols,
+            pix: Im24Pixels::default(),
+            p_ols: [0; IM24_N_OLS],
+            map_ctxs: [0; IM24_N_MAPS1],
+            sc_map_ctxs: [0; IM24_N_SC_MAPS - 1],
+            ctx: [0; 2],
+            color: -1, stride: 3, padding: 0,
+            last_pos: 0, x: 0, line: 0,
+            columns: [1, 1], column: [0, 0],
+            col: 0,
+            dt,
+        }
+    }
+
+    fn ols_ctx_bytes(&self, j: usize) -> Vec<f64> {
+        let p = &self.pix;
+        match j {
+            0 => vec![
+                p.wwwwww, p.wwwww, p.wwww, p.www, p.ww, p.w,
+                p.nwwww, p.nwww, p.nww, p.nw, p.n,
+                p.ne, p.nee, p.neee, p.neeee,
+                p.nnwww, p.nnww, p.nnw, p.nn, p.nne, p.nnee, p.nneee,
+                p.nnnww, p.nnnw, p.nnn, p.nnne, p.nnnee,
+                p.nnnnw, p.nnnn, p.nnnne, p.nnnnn, p.nnnnnn,
+            ],
+            1 => vec![p.www, p.ww, p.w, p.nww, p.nw, p.n, p.ne, p.nee,
+                      p.nnw, p.nn, p.nne, p.nnn],
+            2 => vec![p.n, p.ne, p.nee, p.neee, p.neeee,
+                      p.nn, p.nne, p.nnee, p.nneee,
+                      p.nnn, p.nnne, p.nnnee, p.nnnn, p.nnnne, p.nnnnn],
+            3 => vec![p.n, p.ne, p.nee, p.neee,
+                      p.nn, p.nne, p.nnee,
+                      p.nnn, p.nnne, p.nnnn],
+            4 => vec![p.wwww, p.www, p.ww, p.w,
+                      p.nwww, p.nww, p.nw, p.n,
+                      p.nnww, p.nnw, p.nn, p.nnnw, p.nnn, p.nnnn],
+            5 => vec![p.www, p.ww, p.w, p.nnn, p.nn, p.n, p.p1, p.p2],
+            _ => unreachable!(),
+        }.into_iter().map(|b| b as f64).collect()
+    }
+
+    pub fn mix(&mut self, s: &mut Paq8State, m: &mut Mixer,
+               w: u32, alpha: bool) {
+        use super::substrate::{clip, clamp4, log_mean_diff_qt, log_mean_diff,
+            hash3, hash4, hash5, finalize64, ilog2 as ilog2_fn};
+        let bpos = s.bpos as u32;
+        let pos  = s.buf.pos;
+        let stride_u = self.stride as u32;
+
+        if bpos == 0 {
+            if self.color < 0 || pos.wrapping_sub(self.last_pos) != 1 {
+                self.stride  = 3 + (alpha as i32);
+                self.padding = (w as i32) % self.stride;
+                self.x = 0; self.line = 0;
+                self.columns[0] = ((w as i32) / (ilog2_fn(w).max(1) as i32 * 3)).max(1);
+                self.columns[1] = (self.columns[0]
+                    / (ilog2_fn(self.columns[0] as u32).max(1) as i32)).max(1);
+            }
+            self.last_pos = pos;
+            self.x += 1;
+            if self.x >= w as i32 { self.x = 0; self.line += 1; }
+            if self.x + self.padding < w as i32 {
+                self.color = (self.color + 1) % self.stride;
+            } else {
+                self.color = if self.padding > 0 { self.stride + 1 } else { 0 };
+            }
+            self.column[0] = self.x / self.columns[0];
+            self.column[1] = self.x / self.columns[1];
+
+            let st = self.stride as u32;
+            // Pixel neighbourhood — every offset is `stride * k` for
+            // same-channel rows; `+1` / `+2` for the adjacent bytes.
+            {
+                let p = &mut self.pix;
+                p.wwwwww = s.buf.at(6 * st);
+                p.wwwww  = s.buf.at(5 * st);
+                p.wwww   = s.buf.at(4 * st);
+                p.www    = s.buf.at(3 * st);
+                p.ww     = s.buf.at(2 * st);
+                p.w      = s.buf.at(st);
+                p.nwwww  = s.buf.at(w + 4 * st);
+                p.nwww   = s.buf.at(w + 3 * st);
+                p.nww    = s.buf.at(w + 2 * st);
+                p.nw     = s.buf.at(w + st);
+                p.n      = s.buf.at(w);
+                p.ne     = s.buf.at(w.wrapping_sub(st));
+                p.nee    = s.buf.at(w.wrapping_sub(2 * st));
+                p.neee   = s.buf.at(w.wrapping_sub(3 * st));
+                p.neeee  = s.buf.at(w.wrapping_sub(4 * st));
+                p.nnwww  = s.buf.at(w * 2 + 3 * st);
+                p.nnww   = s.buf.at((w + st) * 2);
+                p.nnw    = s.buf.at(w * 2 + st);
+                p.nn     = s.buf.at(w * 2);
+                p.nne    = s.buf.at((w * 2).wrapping_sub(st));
+                p.nnee   = s.buf.at((w.wrapping_sub(st)) * 2);
+                p.nneee  = s.buf.at((w * 2).wrapping_sub(3 * st));
+                p.nnnww  = s.buf.at(w * 3 + 2 * st);
+                p.nnnw   = s.buf.at(w * 3 + st);
+                p.nnn    = s.buf.at(w * 3);
+                p.nnne   = s.buf.at((w * 3).wrapping_sub(st));
+                p.nnnee  = s.buf.at((w * 3).wrapping_sub(2 * st));
+                p.nnnnw  = s.buf.at(w * 4 + st);
+                p.nnnn   = s.buf.at(w * 4);
+                p.nnnne  = s.buf.at((w * 4).wrapping_sub(st));
+                p.nnnnn  = s.buf.at(w * 5);
+                p.nnnnnn = s.buf.at(w * 6);
+                p.wwp1 = s.buf.at(st * 2 + 1);
+                p.wp1  = s.buf.at(st + 1);
+                p.p1   = s.buf.at(1);
+                p.nwp1 = s.buf.at(w + st + 1);
+                p.np1  = s.buf.at(w + 1);
+                p.nep1 = s.buf.at(w.wrapping_sub(st) + 1);
+                p.nnp1 = s.buf.at(w * 2 + 1);
+                p.wwp2 = s.buf.at(st * 2 + 2);
+                p.wp2  = s.buf.at(st + 2);
+                p.p2   = s.buf.at(2);
+                p.nwp2 = s.buf.at(w + st + 2);
+                p.np2  = s.buf.at(w + 2);
+                p.nep2 = s.buf.at(w.wrapping_sub(st) + 2);
+                p.nnp2 = s.buf.at(w * 2 + 2);
+            }
+
+            // Pull pixel values as i32 for the arithmetic.
+            let p = &self.pix;
+            let (ww, w_) = (p.ww as i32, p.w as i32);
+            let (nww, nw, n, ne, nee, neee, neeee) =
+                (p.nww as i32, p.nw as i32, p.n as i32,
+                 p.ne as i32, p.nee as i32, p.neee as i32, p.neeee as i32);
+            let (www, wwww, _wwwww, wwwwww) =
+                (p.www as i32, p.wwww as i32, p.wwwww as i32, p.wwwwww as i32);
+            let (nnw, nn, nne, nnee, nneee) =
+                (p.nnw as i32, p.nn as i32, p.nne as i32,
+                 p.nnee as i32, p.nneee as i32);
+            let (_nnwww, nwww, nnww, _nnnww, nnnw, nnn, nnne) =
+                (p.nnwww as i32, p.nwww as i32, p.nnww as i32,
+                 p.nnnww as i32, p.nnnw as i32, p.nnn as i32, p.nnne as i32);
+            let (nnnee, nnnn, nnnne, nnnnn, nnnnnn) =
+                (p.nnnee as i32, p.nnnn as i32, p.nnnne as i32,
+                 p.nnnnn as i32, p.nnnnnn as i32);
+            let (p1, p2) = (p.p1 as i32, p.p2 as i32);
+            let (wwp1, wp1, nwp1, np1, nep1, nnp1) =
+                (p.wwp1 as i32, p.wp1 as i32, p.nwp1 as i32,
+                 p.np1 as i32, p.nep1 as i32, p.nnp1 as i32);
+            let (wwp2, wp2, nwp2, np2, nep2, nnp2) =
+                (p.wwp2 as i32, p.wp2 as i32, p.nwp2 as i32,
+                 p.np2 as i32, p.nep2 as i32, p.nnp2 as i32);
+            // Cross-pixel buf offsets used in MapCtxs.
+            let buf_w3m1   = s.buf.at((w * 3).wrapping_sub(st)) as i32;
+            let buf_w2ms2p1 = s.buf.at((w * 2).wrapping_sub(2 * st) + 1) as i32;
+            let buf_w2ms2p2 = s.buf.at((w * 2).wrapping_sub(2 * st) + 2) as i32;
+            let buf_wms2p1 = s.buf.at(w.wrapping_sub(2 * st) + 1) as i32;
+            let buf_wms2p2 = s.buf.at(w.wrapping_sub(2 * st) + 2) as i32;
+            let buf_w2msp1 = s.buf.at((w * 2).wrapping_sub(st) + 1) as i32;
+            let buf_w2msp2 = s.buf.at((w * 2).wrapping_sub(st) + 2) as i32;
+            let buf_w2psp1 = s.buf.at(w * 2 + st + 1) as i32;
+            let buf_w2psp2 = s.buf.at(w * 2 + st + 2) as i32;
+            let buf_w3sp1  = s.buf.at(w * 3 + 1) as i32;
+            let buf_w3sp2  = s.buf.at(w * 3 + 2) as i32;
+            let buf_st3p1  = s.buf.at(st * 3 + 1) as i32;
+            let buf_st3p2  = s.buf.at(st * 3 + 2) as i32;
+            let buf_w3psp1 = s.buf.at(w * 3 + st + 1) as i32;
+            let buf_w3psp2 = s.buf.at(w * 3 + st + 2) as i32;
+            let buf_w3msp1 = s.buf.at((w * 3).wrapping_sub(st) + 1) as i32;
+            let buf_w3msp2 = s.buf.at((w * 3).wrapping_sub(st) + 2) as i32;
+            let buf_w4p1   = s.buf.at(w * 4 + 1) as i32;
+            let buf_w4p2   = s.buf.at(w * 4 + 2) as i32;
+            let buf_w6p1   = s.buf.at(w * 6 + 1) as i32;
+            let buf_w6p2   = s.buf.at(w * 6 + 2) as i32;
+            let buf_st4p1  = s.buf.at(st * 4 + 1) as i32;
+            let buf_st4p2  = s.buf.at(st * 4 + 2) as i32;
+            let buf_st6p1  = s.buf.at(st * 6 + 1) as i32;
+            let buf_st6p2  = s.buf.at(st * 6 + 2) as i32;
+            let buf_w2pst2p1 = s.buf.at(w * 2 + 2 * st + 1) as i32;
+            let buf_w2pst2p2 = s.buf.at(w * 2 + 2 * st + 2) as i32;
+            let buf_w2ms2 = s.buf.at((w * 2).wrapping_sub(2 * st)) as i32;
+            let buf_wps2p1 = s.buf.at(w + st * 2 + 1) as i32;
+            let buf_wps2p2 = s.buf.at(w + st * 2 + 2) as i32;
+            let buf_w3m3 = s.buf.at((w * 3).wrapping_sub(3 * st)) as i32;
+            let buf_w3st3 = s.buf.at(w * 3 + 3 * st) as i32;
+            let buf_w6 = s.buf.at(w * 6) as i32;
+            let buf_w9 = s.buf.at(w * 9) as i32;
+            let buf_wm6 = s.buf.at(w.wrapping_sub(6 * st)) as i32;
+
+            // ---- MapCtxs[0..76] — paq8.cpp:5093-5168 ----
+            let mctx = &mut self.map_ctxs;
+            let mut j = 0;
+            mctx[j] = clamp4(n + p1 - np1, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = clamp4(n + p2 - np2, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = ((w_ + clamp4(ne * 3 - nne * 3 + nnne, p.w, p.n, p.ne, p.nee) as i32) / 2) as u8; j += 1;
+            mctx[j] = clamp4((w_ + clip(ne * 2 - nne) as i32) / 2, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = ((w_ + nee) / 2) as u8; j += 1;
+            mctx[j] = clip((www - 4 * ww + 6 * w_
+                + clip(ne * 4 - nne * 6 + nnne * 4 - nnnne) as i32) / 4); j += 1;
+            mctx[j] = clip((-wwww + 5 * www - 10 * ww + 10 * w_
+                + clamp4(ne * 4 - nne * 6 + nnne * 4 - nnnne, p.n, p.ne, p.nee, p.neee) as i32) / 5); j += 1;
+            mctx[j] = clip((-4 * ww + 15 * w_
+                + 10 * clip(ne * 3 - nne * 3 + nnne) as i32
+                - clip(neee * 3 - nneee * 3 + buf_w3m3) as i32) / 20); j += 1;
+            mctx[j] = clip((-3 * ww + 8 * w_
+                + clamp4(nee * 3 - nnee * 3 + nnnee, p.ne, p.nee, p.neee, p.neeee) as i32) / 6); j += 1;
+            mctx[j] = clip((w_ + clip(ne * 2 - nne) as i32) / 2 + p1
+                - (wp1 + clip(nep1 * 2 - buf_w2msp1) as i32) / 2); j += 1;
+            mctx[j] = clip((w_ + clip(ne * 2 - nne) as i32) / 2 + p2
+                - (wp2 + clip(nep2 * 2 - buf_w2msp2) as i32) / 2); j += 1;
+            mctx[j] = clip((-3 * ww + 8 * w_ + clip(nee * 2 - nnee) as i32) / 6 + p1
+                - (-3 * wwp1 + 8 * wp1 + clip(buf_wms2p1 * 2 - buf_w2ms2p1) as i32) / 6); j += 1;
+            mctx[j] = clip((-3 * ww + 8 * w_ + clip(nee * 2 - nnee) as i32) / 6 + p2
+                - (-3 * wwp2 + 8 * wp2 + clip(buf_wms2p2 * 2 - buf_w2ms2p2) as i32) / 6); j += 1;
+            mctx[j] = clip((w_ + nee) / 2 + p1 - (wp1 + buf_wms2p1) / 2); j += 1;
+            mctx[j] = clip((w_ + nee) / 2 + p2 - (wp2 + buf_wms2p2) / 2); j += 1;
+            mctx[j] = clip((ww + clip(nee * 2 - nnee) as i32) / 2 + p1
+                - (wwp1 + clip(buf_wms2p1 * 2 - buf_w2ms2p1) as i32) / 2); j += 1;
+            mctx[j] = clip((ww + clip(nee * 2 - nnee) as i32) / 2 + p2
+                - (wwp2 + clip(buf_wms2p2 * 2 - buf_w2ms2p2) as i32) / 2); j += 1;
+            mctx[j] = clip(ww + nee - n + p1 - clip(wwp1 + buf_wms2p1 - np1) as i32); j += 1;
+            mctx[j] = clip(ww + nee - n + p2 - clip(wwp2 + buf_wms2p2 - np2) as i32); j += 1;
+            mctx[j] = clip(w_ + n - nw); j += 1;
+            mctx[j] = clip(w_ + n - nw + p1 - clip(wp1 + np1 - nwp1) as i32); j += 1;
+            mctx[j] = clip(w_ + n - nw + p2 - clip(wp2 + np2 - nwp2) as i32); j += 1;
+            mctx[j] = clip(w_ + ne - n); j += 1;
+            mctx[j] = clip(n + nw - nnw); j += 1;
+            mctx[j] = clip(n + nw - nnw + p1 - clip(np1 + nwp1 - buf_w2psp1) as i32); j += 1;
+            mctx[j] = clip(n + nw - nnw + p2 - clip(np2 + nwp2 - buf_w2psp2) as i32); j += 1;
+            mctx[j] = clip(n + ne - nne); j += 1;
+            mctx[j] = clip(n + ne - nne + p1 - clip(np1 + nep1 - buf_w2msp1) as i32); j += 1;
+            mctx[j] = clip(n + ne - nne + p2 - clip(np2 + nep2 - buf_w2msp2) as i32); j += 1;
+            mctx[j] = clip(n + nn - nnn); j += 1;
+            mctx[j] = clip(n + nn - nnn + p1 - clip(np1 + nnp1 - buf_w3sp1) as i32); j += 1;
+            mctx[j] = clip(n + nn - nnn + p2 - clip(np2 + nnp2 - buf_w3sp2) as i32); j += 1;
+            mctx[j] = clip(w_ + ww - www); j += 1;
+            mctx[j] = clip(w_ + ww - www + p1 - clip(wp1 + wwp1 - buf_st3p1) as i32); j += 1;
+            mctx[j] = clip(w_ + ww - www + p2 - clip(wp2 + wwp2 - buf_st3p2) as i32); j += 1;
+            mctx[j] = clip(w_ + nee - ne); j += 1;
+            mctx[j] = clip(w_ + nee - ne + p1 - clip(wp1 + buf_wms2p1 - nep1) as i32); j += 1;
+            mctx[j] = clip(w_ + nee - ne + p2 - clip(wp2 + buf_wms2p2 - nep2) as i32); j += 1;
+            mctx[j] = clip(nn + p1 - nnp1); j += 1;
+            mctx[j] = clip(nn + p2 - nnp2); j += 1;
+            mctx[j] = clip(nn + w_ - nnw); j += 1;
+            mctx[j] = clip(nn + w_ - nnw + p1 - clip(nnp1 + wp1 - buf_w2psp1) as i32); j += 1;
+            mctx[j] = clip(nn + w_ - nnw + p2 - clip(nnp2 + wp2 - buf_w2psp2) as i32); j += 1;
+            mctx[j] = clip(nn + nw - s.buf.at(w * 3 + st) as i32); j += 1;
+            mctx[j] = clip(nn + nw - s.buf.at(w * 3 + st) as i32 + p1
+                - clip(nnp1 + nwp1 - buf_w3psp1) as i32); j += 1;
+            mctx[j] = clip(nn + nw - s.buf.at(w * 3 + st) as i32 + p2
+                - clip(nnp2 + nwp2 - buf_w3psp2) as i32); j += 1;
+            mctx[j] = clip(nn + ne - s.buf.at((w * 3).wrapping_sub(st)) as i32); j += 1;
+            mctx[j] = clip(nn + ne - s.buf.at((w * 3).wrapping_sub(st)) as i32 + p1
+                - clip(nnp1 + nep1 - buf_w3msp1) as i32); j += 1;
+            mctx[j] = clip(nn + ne - s.buf.at((w * 3).wrapping_sub(st)) as i32 + p2
+                - clip(nnp2 + nep2 - buf_w3msp2) as i32); j += 1;
+            mctx[j] = clip(nn + nnnn - nnnnnn); j += 1;
+            mctx[j] = clip(nn + nnnn - nnnnnn + p1 - clip(nnp1 + buf_w4p1 - buf_w6p1) as i32); j += 1;
+            mctx[j] = clip(nn + nnnn - nnnnnn + p2 - clip(nnp2 + buf_w4p2 - buf_w6p2) as i32); j += 1;
+            mctx[j] = clip(ww + p1 - wwp1); j += 1;
+            mctx[j] = clip(ww + p2 - wwp2); j += 1;
+            mctx[j] = clip(ww + wwww - wwwwww); j += 1;
+            mctx[j] = clip(ww + wwww - wwwwww + p1 - clip(wwp1 + buf_st4p1 - buf_st6p1) as i32); j += 1;
+            mctx[j] = clip(ww + wwww - wwwwww + p2 - clip(wwp2 + buf_st4p2 - buf_st6p2) as i32); j += 1;
+            mctx[j] = clip(n * 2 - nn + p1 - clip(np1 * 2 - nnp1) as i32); j += 1;
+            mctx[j] = clip(n * 2 - nn + p2 - clip(np2 * 2 - nnp2) as i32); j += 1;
+            mctx[j] = clip(w_ * 2 - ww + p1 - clip(wp1 * 2 - wwp1) as i32); j += 1;
+            mctx[j] = clip(w_ * 2 - ww + p2 - clip(wp2 * 2 - wwp2) as i32); j += 1;
+            mctx[j] = clip(n * 3 - nn * 3 + nnn); j += 1;
+            mctx[j] = clamp4(n * 3 - nn * 3 + nnn, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = clamp4(w_ * 3 - ww * 3 + www, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = clamp4(n * 2 - nn, p.w, p.nw, p.n, p.ne); j += 1;
+            mctx[j] = clip((nnnnn - 6 * nnnn + 15 * nnn - 20 * nn + 15 * n
+                + clamp4(w_ * 4 - nww * 6 + s.buf.at(w * 2 + 3 * st) as i32 * 4
+                    - s.buf.at(w * 3 + 4 * st) as i32,
+                    p.w, p.nw, p.n, p.nn) as i32) / 6); j += 1;
+            mctx[j] = clip((buf_w3m3 - 4 * nnee + 6 * ne
+                + clip(w_ * 4 - nw * 6 + nnw * 4 - s.buf.at(w * 3 + st) as i32) as i32) / 4); j += 1;
+            mctx[j] = clip(((n + 3 * nw) / 4) * 3 - ((nnw + nnww) / 2) * 3
+                + (s.buf.at(w * 3 + 2 * st) as i32 * 3 + buf_w3st3) / 4); j += 1;
+            mctx[j] = clip((w_ * 2 + nw) - (ww + 2 * nww) + nwww); j += 1;
+            mctx[j] = ((clip(w_ * 2 - nw) as i32 + clip(w_ * 2 - nww) as i32 + n + ne) / 4) as u8; j += 1;
+            mctx[j] = nnnnnn as u8; j += 1;
+            mctx[j] = ((neeee as i32 + buf_wm6) / 2) as u8; j += 1;
+            mctx[j] = ((wwwwww + wwww) / 2) as u8; j += 1;
+            mctx[j] = (((w_ + n) * 3 - nw * 2) / 4) as u8; j += 1;
+            mctx[j] = n as u8; j += 1;
+            mctx[j] = nn as u8;
+            debug_assert!(j == IM24_N_MAPS1 - 1);
+            // ---- SCMapCtxs[0..58] — paq8.cpp:5170-5227 ----
+            let scctx = &mut self.sc_map_ctxs;
+            let mut j = 0;
+            scctx[j] = n + p1 - np1; j += 1;
+            scctx[j] = n + p2 - np2; j += 1;
+            scctx[j] = w_ + p1 - wp1; j += 1;
+            scctx[j] = w_ + p2 - wp2; j += 1;
+            scctx[j] = nw + p1 - nwp1; j += 1;
+            scctx[j] = nw + p2 - nwp2; j += 1;
+            scctx[j] = ne + p1 - nep1; j += 1;
+            scctx[j] = ne + p2 - nep2; j += 1;
+            scctx[j] = nn + p1 - nnp1; j += 1;
+            scctx[j] = nn + p2 - nnp2; j += 1;
+            scctx[j] = ww + p1 - wwp1; j += 1;
+            scctx[j] = ww + p2 - wwp2; j += 1;
+            scctx[j] = w_ + n - nw; j += 1;
+            scctx[j] = w_ + n - nw + p1 - wp1 - np1 + nwp1; j += 1;
+            scctx[j] = w_ + n - nw + p2 - wp2 - np2 + nwp2; j += 1;
+            scctx[j] = w_ + ne - n; j += 1;
+            scctx[j] = w_ + ne - n + p1 - wp1 - nep1 + np1; j += 1;
+            scctx[j] = w_ + ne - n + p2 - wp2 - nep2 + np2; j += 1;
+            scctx[j] = w_ + nee - ne; j += 1;
+            scctx[j] = w_ + nee - ne + p1 - wp1 - buf_wms2p1 + nep1; j += 1;
+            scctx[j] = w_ + nee - ne + p2 - wp2 - buf_wms2p2 + nep2; j += 1;
+            scctx[j] = n + nn - nnn; j += 1;
+            scctx[j] = n + nn - nnn + p1 - np1 - nnp1 + buf_w3sp1; j += 1;
+            scctx[j] = n + nn - nnn + p2 - np2 - nnp2 + buf_w3sp2; j += 1;
+            scctx[j] = n + ne - nne; j += 1;
+            scctx[j] = n + ne - nne + p1 - np1 - nep1 + buf_w2msp1; j += 1;
+            scctx[j] = n + ne - nne + p2 - np2 - nep2 + buf_w2msp2; j += 1;
+            scctx[j] = n + nw - nnw; j += 1;
+            scctx[j] = n + nw - nnw + p1 - np1 - nwp1 + buf_w2psp1; j += 1;
+            scctx[j] = n + nw - nnw + p2 - np2 - nwp2 + buf_w2psp2; j += 1;
+            scctx[j] = ne + nw - nn; j += 1;
+            scctx[j] = ne + nw - nn + p1 - nep1 - nwp1 + nnp1; j += 1;
+            scctx[j] = ne + nw - nn + p2 - nep2 - nwp2 + nnp2; j += 1;
+            scctx[j] = nw + w_ - s.buf.at(w + 2 * st) as i32; j += 1;
+            scctx[j] = nw + w_ - s.buf.at(w + 2 * st) as i32 + p1 - nwp1 - wp1 + buf_wps2p1; j += 1;
+            scctx[j] = nw + w_ - s.buf.at(w + 2 * st) as i32 + p2 - nwp2 - wp2 + buf_wps2p2; j += 1;
+            scctx[j] = w_ * 2 - ww; j += 1;
+            scctx[j] = w_ * 2 - ww + p1 - wp1 * 2 + wwp1; j += 1;
+            scctx[j] = w_ * 2 - ww + p2 - wp2 * 2 + wwp2; j += 1;
+            scctx[j] = n * 2 - nn; j += 1;
+            scctx[j] = n * 2 - nn + p1 - np1 * 2 + nnp1; j += 1;
+            scctx[j] = n * 2 - nn + p2 - np2 * 2 + nnp2; j += 1;
+            scctx[j] = nw * 2 - nnww; j += 1;
+            scctx[j] = nw * 2 - nnww + p1 - nwp1 * 2 + buf_w2pst2p1; j += 1;
+            scctx[j] = nw * 2 - nnww + p2 - nwp2 * 2 + buf_w2pst2p2; j += 1;
+            scctx[j] = ne * 2 - nnee; j += 1;
+            scctx[j] = ne * 2 - nnee + p1 - nep1 * 2 + buf_w2ms2p1; j += 1;
+            scctx[j] = ne * 2 - nnee + p2 - nep2 * 2 + buf_w2ms2p2; j += 1;
+            scctx[j] = n * 3 - nn * 3 + nnn + p1 - np1 * 3 + nnp1 * 3 - buf_w3sp1; j += 1;
+            scctx[j] = n * 3 - nn * 3 + nnn + p2 - np2 * 3 + nnp2 * 3 - buf_w3sp2; j += 1;
+            scctx[j] = n * 3 - nn * 3 + nnn; j += 1;
+            scctx[j] = (w_ + ne * 2 - nne) / 2; j += 1;
+            scctx[j] = (w_ + ne * 3 - nne * 3 + nnne) / 2; j += 1;
+            scctx[j] = (w_ + ne * 2 - nne) / 2 + p1
+                - (wp1 + nep1 * 2 - buf_w2msp1) / 2; j += 1;
+            scctx[j] = (w_ + ne * 2 - nne) / 2 + p2
+                - (wp2 + nep2 * 2 - buf_w2msp2) / 2; j += 1;
+            scctx[j] = nne + ne - nnne; j += 1;
+            scctx[j] = nne + w_ - nn; j += 1;
+            scctx[j] = nnw + w_ - nnww;
+            debug_assert!(j == IM24_N_SC_MAPS - 2);
+
+            // OLS — paq8.cpp:5229-5232. For each regressor, predict
+            // from the current color's regressor, then update the
+            // *previous* color's regressor with p1.
+            let _ = p;
+            let prev_color = if self.color > 0 { (self.color - 1) as usize }
+                             else { (self.stride - 1) as usize };
+            for kk in 0..IM24_N_OLS {
+                let ctx_vec = self.ols_ctx_bytes(kk);
+                let cur = (self.color.max(0)) as usize;
+                self.p_ols[kk] = clip(self.ols[kk][cur]
+                    .predict_from(&ctx_vec).floor() as i32);
+                self.ols[kk][prev_color].update(p1 as f64);
+            }
+
+            // Local stats — paq8.cpp:5233-5239.
+            let mean_i = w_ + nw + n + ne;
+            let var = (w_ * w_ + nw * nw + n * n + ne * ne - mean_i * mean_i / 4) >> 2;
+            let mean = mean_i >> 2;
+            let logvar = s.ilog.get((var & 0xffff) as u16) as i32;
+
+            let color_clamped = (self.color.min(self.stride - 1)) as u32;
+            let p1u = p1 as u32; let p2u = p2 as u32;
+            self.ctx[0] = (color_clamped << 9)
+                | (((w_ - n).abs() > 3) as u32) << 8
+                | ((w_ > n) as u32) << 7
+                | ((w_ > nw) as u32) << 6
+                | (((n - nw).abs() > 3) as u32) << 5
+                | ((n > nw) as u32) << 4
+                | (((n - ne).abs() > 3) as u32) << 3
+                | ((n > ne) as u32) << 2
+                | ((w_ > ww) as u32) << 1
+                | (n > nn) as u32;
+            let buf1 = s.buf.at(1) as i32;
+            self.ctx[1] = ((log_mean_diff_qt(buf1 as u8,
+                    clip(s.buf.at(w + 1) as i32 + s.buf.at(w.wrapping_sub(st) + 1) as i32
+                         - buf_w2msp1), 7) as u32) >> 1) << 5
+                | ((log_mean_diff_qt(clip(n + ne - nne), clip(n + nw - nnw), 7) as u32) >> 1) << 2
+                | color_clamped;
+
+            // ---- ContextMap — 47 contexts, paq8.cpp:5241-5289 ----
+            let mut i = 0u64;
+            let mut bump = || { i += 1; i };
+            let color_u = self.color.max(0) as u64;
+            self.cm.set(hash3(bump(), ((n + 1) >> 1) as u64, log_mean_diff(p.n, clip(nn * 2 - nnn)) as u64));
+            self.cm.set(hash3(bump(), ((w_ + 1) >> 1) as u64, log_mean_diff(p.w, clip(ww * 2 - www)) as u64));
+            self.cm.set(hash3(bump(), clamp4(w_ + n - nw, p.w, p.nw, p.n, p.ne) as u64,
+                log_mean_diff(clip(n + ne - nne), clip(n + nw - nnw)) as u64));
+            self.cm.set(hash3(bump(), ((nnn + n + 4) / 8) as u64, (clip(n * 3 - nn * 3 + nnn) >> 1) as u64));
+            self.cm.set(hash3(bump(), ((www + w_ + 4) / 8) as u64, (clip(w_ * 3 - ww * 3 + www) >> 1) as u64));
+            self.cm.set(hash4(bump(), color_u,
+                ((w_ + clip(ne * 3 - nne * 3 + nnne) as i32) / 4) as u64,
+                log_mean_diff(p.n, ((p.nw as u32 + p.ne as u32) / 2) as u8) as u64));
+            self.cm.set(hash3(bump(), color_u,
+                (clip((-wwww + 5 * www - 10 * ww + 10 * w_
+                    + clamp4(ne * 4 - nne * 6 + nnne * 4 - nnnne, p.n, p.ne, p.nee, p.neee) as i32) / 5) / 4) as u64));
+            self.cm.set(hash3(bump(), clip(nee + n - nnee) as u64,
+                log_mean_diff(p.w, clip(nw + ne - nne)) as u64));
+            self.cm.set(hash3(bump(), clip(nn + w_ - nnw) as u64,
+                log_mean_diff(p.w, clip(nnw + ww - s.buf.at(w * 2 + 2 * st) as i32)) as u64));
+            self.cm.set(hash3(bump(), color_u, p1 as u64));
+            self.cm.set(hash3(bump(), color_u, p2 as u64));
+            self.cm.set(hash4(bump(), color_u, (clip(w_ + n - nw) / 2) as u64,
+                (clip(w_ + p1 - wp1) / 2) as u64));
+            self.cm.set(hash3(bump(), (clip(n * 2 - nn) / 2) as u64,
+                log_mean_diff(p.n, clip(nn * 2 - nnn)) as u64));
+            self.cm.set(hash3(bump(), (clip(w_ * 2 - ww) / 2) as u64,
+                log_mean_diff(p.w, clip(ww * 2 - www)) as u64));
+            self.cm.set(hash3(bump(), (clamp4(n * 3 - nn * 3 + nnn, p.w, p.nw, p.n, p.ne) / 2) as u64, 0));
+            self.cm.set(hash3(bump(), (clamp4(w_ * 3 - ww * 3 + www, p.w, p.n, p.ne, p.nee) / 2) as u64, 0));
+            let wp1_clamp = if wp1 < 1 { 1 } else { wp1 };
+            self.cm.set(hash4(bump(), color_u, log_mean_diff(p.w, p.wp1) as u64,
+                clamp4((p1 * w_) / wp1_clamp, p.w, p.n, p.ne, p.nee) as u64));
+            self.cm.set(hash3(bump(), color_u, clamp4(n + p2 - np2, p.w, p.nw, p.n, p.ne) as u64));
+            self.cm.set(hash4(bump(), color_u, clip(w_ + n - nw) as u64, self.column[0] as u64));
+            self.cm.set(hash4(bump(), color_u, clip(n * 2 - nn) as u64,
+                log_mean_diff(p.w, clip(nw * 2 - nnw)) as u64));
+            self.cm.set(hash4(bump(), color_u, clip(w_ * 2 - ww) as u64,
+                log_mean_diff(p.n, clip(nw * 2 - nww)) as u64));
+            self.cm.set(hash3(bump(), ((w_ + nee) / 2) as u64,
+                log_mean_diff(p.w, ((p.ww as u32 + p.ne as u32) / 2) as u8) as u64));
+            self.cm.set(hash3(bump(), clamp4(clip(w_ * 2 - ww) as i32 + clip(n * 2 - nn) as i32
+                - clip(nw * 2 - nnww) as i32, p.w, p.nw, p.n, p.ne) as u64, 0));
+            self.cm.set(hash4(bump(), color_u, p.w as u64, p2u as u64));
+            self.cm.set(hash4(bump(), p.n as u64, (nn & 0x1F) as u64, (nnn & 0x1F) as u64));
+            self.cm.set(hash4(bump(), p.w as u64, (ww & 0x1F) as u64, (www & 0x1F) as u64));
+            self.cm.set(hash4(bump(), color_u, p.n as u64, self.column[0] as u64));
+            self.cm.set(hash4(bump(), color_u, clip(w_ + nee - ne) as u64,
+                log_mean_diff(p.w, clip(ww + ne - n)) as u64));
+            self.cm.set(hash5(bump(), p.nn as u64, (nnnn & 0x1F) as u64,
+                (nnnnnn & 0x1F) as u64, self.column[1] as u64));
+            self.cm.set(hash5(bump(), p.ww as u64, (wwww & 0x1F) as u64,
+                (wwwwww & 0x1F) as u64, self.column[1] as u64));
+            self.cm.set(hash5(bump(), p.nnn as u64, (nnnnnn & 0x1F) as u64,
+                (buf_w9 & 0x1F) as u64, self.column[1] as u64));
+            self.cm.set(hash3(bump(), color_u, self.column[1] as u64));
+            self.cm.set(hash4(bump(), color_u, p.w as u64, log_mean_diff(p.w, p.ww) as u64));
+            self.cm.set(hash4(bump(), color_u, p.w as u64, p1u as u64));
+            self.cm.set(hash5(bump(), color_u, (p.w / 4) as u64,
+                log_mean_diff(p.w, p.p1) as u64, log_mean_diff(p.w, p.p2) as u64));
+            self.cm.set(hash4(bump(), color_u, p.n as u64, log_mean_diff(p.n, p.nn) as u64));
+            self.cm.set(hash4(bump(), color_u, p.n as u64, p1u as u64));
+            self.cm.set(hash5(bump(), color_u, (p.n / 4) as u64,
+                log_mean_diff(p.n, p.p1) as u64, log_mean_diff(p.n, p.p2) as u64));
+            self.cm.set(hash5(bump(), color_u, ((w_ + n) >> 3) as u64,
+                (p1u >> 4) as u64, (p2u >> 4) as u64));
+            self.cm.set(hash4(bump(), color_u, (p1 / 2) as u64, (p2 / 2) as u64));
+            self.cm.set(hash4(bump(), color_u, p.w as u64, (p1 - wp1) as u64));
+            self.cm.set(hash3(bump(), color_u, (w_ + p1 - wp1) as u64));
+            self.cm.set(hash4(bump(), color_u, p.n as u64, (p1 - np1) as u64));
+            self.cm.set(hash3(bump(), color_u, (n + p1 - np1) as u64));
+            self.cm.set(hash3(bump(),
+                s.buf.at((w * 3).wrapping_sub(st)) as u64,
+                s.buf.at((w * 3).wrapping_sub(2 * st)) as u64));
+            self.cm.set(hash3(bump(), s.buf.at(w * 3 + st) as u64,
+                s.buf.at(w * 3 + 2 * st) as u64));
+            self.cm.set(hash4(bump(), color_u, mean as u64, (logvar >> 4) as u64));
+
+            // Map[0..4] direct contexts — paq8.cpp:5292-5295.
+            self.maps[0].set_direct(((w_ as u32 & 0xC0) | ((n as u32 & 0xC0) >> 2)
+                | ((ww as u32 & 0xC0) >> 4) | ((nn as u32) >> 6)) as u32);
+            self.maps[1].set_direct(((n as u32 & 0xC0) | ((nn as u32 & 0xC0) >> 2)
+                | ((ne as u32 & 0xC0) >> 4) | ((nee as u32) >> 6)) as u32);
+            self.maps[2].set_direct(s.buf.at(1) as u32);
+            self.maps[3].set_direct(self.color.min(self.stride - 1) as u32);
+        }
+
+        // ---- Per-bit Map[5..18] setters + cm/maps/scmap.mix ----
+        let b = ((s.c0 << (8 - bpos)) & 0xff) as u8;
+        let p = &self.pix;
+        let mut i = 5usize;
+        let nclip1 = clip(p.w as i32 + p.n as i32 - p.nw as i32);
+        let nclip_nne = clip(p.n as i32 + p.ne as i32 - p.nne as i32);
+        let nclip_nnw = clip(p.n as i32 + p.nw as i32 - p.nnw as i32);
+        self.maps[i].set_direct(((nclip1.wrapping_sub(b)) as u32 * 8 + bpos)
+            | ((log_mean_diff_qt(nclip_nne, nclip_nnw, 7) as u32) << 11));
+        i += 1;
+        let v2 = clip(p.n as i32 * 2 - p.nn as i32);
+        self.maps[i].set_direct((v2.wrapping_sub(b) as u32 * 8 + bpos)
+            | ((log_mean_diff(p.w, clip(p.nw as i32 * 2 - p.nnw as i32)) as u32) << 11));
+        i += 1;
+        let v3 = clip(p.w as i32 * 2 - p.ww as i32);
+        self.maps[i].set_direct((v3.wrapping_sub(b) as u32 * 8 + bpos)
+            | ((log_mean_diff(p.n, clip(p.nw as i32 * 2 - p.nww as i32)) as u32) << 11));
+        i += 1;
+        let v4 = nclip1;
+        self.maps[i].set_direct((v4.wrapping_sub(b) as u32 * 8 + bpos)
+            | ((log_mean_diff(p.p1, clip(p.wp1 as i32 + p.np1 as i32 - p.nwp1 as i32)) as u32) << 11));
+        i += 1;
+        self.maps[i].set_direct((v4.wrapping_sub(b) as u32 * 8 + bpos)
+            | ((log_mean_diff(p.p2, clip(p.wp2 as i32 + p.np2 as i32 - p.nwp2 as i32)) as u32) << 11));
+        i += 1;
+        // Hash-context Map[10..14] — paq8.cpp:5315-5318. Upstream
+        // multiplies hash by 8 and OR-adds bpos; use wrapping to
+        // match the C++ U64 overflow semantics.
+        self.maps[i].set(hash3(p.w.wrapping_sub(b) as u64, p.n.wrapping_sub(b) as u64, 0)
+            .wrapping_mul(8).wrapping_add(bpos as u64));
+        i += 1;
+        self.maps[i].set(hash3(p.w.wrapping_sub(b) as u64, p.ww.wrapping_sub(b) as u64, 0)
+            .wrapping_mul(8).wrapping_add(bpos as u64));
+        i += 1;
+        self.maps[i].set(hash3(p.n.wrapping_sub(b) as u64, p.nn.wrapping_sub(b) as u64, 0)
+            .wrapping_mul(8).wrapping_add(bpos as u64));
+        i += 1;
+        self.maps[i].set(hash3(
+            (clip(p.n as i32 + p.ne as i32 - p.nne as i32)).wrapping_sub(b) as u64,
+            (clip(p.n as i32 + p.nw as i32 - p.nnw as i32)).wrapping_sub(b) as u64,
+            0).wrapping_mul(8).wrapping_add(bpos as u64));
+        i += 1;
+        let color_shifted = (self.color.min(self.stride - 1) as u32) << 11;
+        self.maps[i].set_direct(color_shifted
+            | (clip(p.n as i32 + p.p1 as i32 - p.np1 as i32).wrapping_sub(b) as u32 * 8 + bpos));
+        i += 1;
+        self.maps[i].set_direct(color_shifted
+            | (clip(p.n as i32 + p.p2 as i32 - p.np2 as i32).wrapping_sub(b) as u32 * 8 + bpos));
+        i += 1;
+        self.maps[i].set_direct(color_shifted
+            | (clip(p.w as i32 + p.p1 as i32 - p.wp1 as i32).wrapping_sub(b) as u32 * 8 + bpos));
+        i += 1;
+        self.maps[i].set_direct(color_shifted
+            | (clip(p.w as i32 + p.p2 as i32 - p.wp2 as i32).wrapping_sub(b) as u32 * 8 + bpos));
+        i += 1;
+        for j in 0..IM24_N_MAPS1 {
+            self.maps[i].set_direct(((self.map_ctxs[j] as i32 - b as i32) & 0xff) as u32 * 8 + bpos);
+            i += 1;
+        }
+        for j in 0..IM24_N_OLS {
+            self.maps[i].set_direct(((self.p_ols[j] as i32 - b as i32) & 0xff) as u32 * 8 + bpos);
+            i += 1;
+        }
+        for k in 0..(IM24_N_SC_MAPS - 1) {
+            self.sc_map[k].set(((self.sc_map_ctxs[k] - b as i32) & 0xff) as u32 * 8 + bpos);
+        }
+
+        // Predict — paq8.cpp:5334-5353
+        let dt = self.dt;
+        let y = s.y;
+        let c0 = s.c0;
+        let c1 = s.buf.at(1);
+        self.cm.mix1(m, c0, bpos as i32, c1, y, &s.ilog, &s.squash, &s.stretch);
+        for k in 0..IM24_N_MAPS {
+            self.maps[k].mix(m, y, 1, 3, 1023, &dt, &s.squash, &s.stretch);
+        }
+        for k in 0..IM24_N_SC_MAPS {
+            self.sc_map[k].mix(m, y, 9, 1, 3, &s.squash, &s.stretch);
+        }
+        self.col += 1;
+        if self.col >= self.stride * 8 { self.col = 0; }
+        m.set(0, 1);
+        let ctx0 = self.ctx[0];
+        let ctx1 = self.ctx[1];
+        m.set((self.column[0] as u32).min(63) + ((ctx0 >> 3) & 0xC0), 256);
+        m.set((self.column[1] as u32).min(127) + ((ctx0 >> 2) & 0x180), 512);
+        m.set((ctx0 & 0x7FC) | ((bpos >> 1) & 0xFF), 2048);
+        m.set(self.col as u32, (self.stride * 8) as u32);
+        m.set((self.x as u32) % stride_u, stride_u);
+        m.set(c0, 256);
+        m.set((ctx1 << 2) | ((bpos >> 1) & 0xFF), 1024);
+        let h1 = hash5(
+            log_mean_diff_qt(p.w, p.ww, 5) as u64,
+            log_mean_diff_qt(p.n, p.nn, 5) as u64,
+            log_mean_diff_qt(p.w, p.n, 5) as u64,
+            ilog2_fn(p.w as u32) as u64,
+            self.color.max(0) as u64,
+        );
+        m.set(finalize64(h1, 13) as u32, 8192);
+        let h2 = hash3(ctx0 as u64, (self.column[0] / 8) as u64, 0);
+        m.set(finalize64(h2, 13) as u32, 8192);
+        m.set((((self.x + self.line) / 32) as u32).min(255), 256);
+    }
+}
+
+impl Default for Im24BitModel {
+    fn default() -> Self {
+        Self::new(64 * 1024, super::substrate::build_dt())
+    }
+}
 
 pub struct JpegModel;
 impl JpegModel {
@@ -729,12 +1386,242 @@ impl JpegModel {
 }
 impl Default for JpegModel { fn default() -> Self { Self::new() } }
 
-pub struct ImgModel;
-impl ImgModel {
-    pub fn new() -> Self { Self }
-    pub fn mix(&mut self, _s: &mut Paq8State, _m: &mut Mixer) -> bool { false }
+// =============================================================
+// ImgModel — paq8.cpp:5387-5504. BMP/TGA detector.
+// =============================================================
+//
+// Parses raw bytes for BMP and TGA image headers. On detection,
+// populates `bpp` (1/4/8/24/32), `width`, `eoi` (end-of-image
+// position), `alpha`, `gray`. The orchestrator reads these via
+// the accessor methods and dispatches to the right Im{1,4,8,24}
+// BitModel.
+
+#[derive(Default, Clone, Copy)]
+struct BmpImage {
+    header: u32, offset: u32, bpp: u32, size: u32,
+    palette: u32, hdr_less: u32,
+    width: u32, height: u32, bit_mask: u32,
 }
-impl Default for ImgModel { fn default() -> Self { Self::new() } }
+
+#[derive(Default, Clone, Copy)]
+struct TgaImage {
+    header: u32, id_length: u32, bpp: u32, img_type: u32,
+    map_size: u32, width: u32, height: u32,
+}
+
+#[derive(Default)]
+pub struct ImgModel {
+    bmp: BmpImage,
+    tga: TgaImage,
+    w: u32,
+    bpp: u32,
+    eoi: u32,
+    alpha: u32,
+    gray: u32,
+    plt_order: i32,
+}
+
+impl ImgModel {
+    pub fn new() -> Self { Self::default() }
+
+    /// `true` while inside a detected image stream.
+    pub fn is_active(&self) -> bool { self.w > 0 }
+    /// `bpp` of the active image (1, 4, 8, 24, 32).
+    pub fn bpp(&self) -> u32 { self.bpp }
+    /// Width in bytes — matches upstream's `w = (Width * bpp) >> 3`
+    /// (or the BMP row-padded equivalent for the bit-packed formats).
+    pub fn width(&self) -> u32 { self.w }
+    pub fn has_alpha(&self) -> bool { self.alpha != 0 }
+    pub fn is_gray(&self) -> bool { self.gray != 0 }
+
+    /// Returns `true` when a BMP or TGA header was just detected
+    /// (or we're currently mid-image). Doesn't drive prediction —
+    /// the caller invokes the right Im{1,4,8,24}BitModel based on
+    /// `bpp()` / `width()` / `has_alpha()` / `is_gray()`.
+    pub fn mix(&mut self, s: &mut Paq8State, _m: &mut Mixer) -> bool {
+        let bpos = s.bpos as u32;
+        let pos  = s.buf.pos;
+
+        if bpos == 0 {
+            // ---- BMP detection ----
+            if pos >= self.eoi + 40 && self.bmp.header == 0 {
+                let mut detected = false;
+                let bmp_offset = i4(s, 44);
+                if s.buf.at(54) == b'B' && s.buf.at(53) == b'M'
+                    && (bmp_offset & 0xFFFFFBF7) == 0x36
+                    && i4(s, 40) == 0x28
+                {
+                    self.bmp.offset = bmp_offset;
+                    detected = true;
+                } else if i4(s, 40) == 0x28 {
+                    self.bmp.hdr_less = 1;
+                    detected = true;
+                }
+                if detected {
+                    self.bmp.width  = i4(s, 36);
+                    self.bmp.height = (i4(s, 32) as i32).abs() as u32;
+                    self.bmp.bpp    = i2(s, 26);
+                    self.bmp.size   = i4(s, 20);
+                    self.bmp.palette = i4(s, 4);
+                    let bpp_ok = matches!(self.bmp.bpp, 1 | 4 | 8 | 24 | 32);
+                    if i4(s, 24) == 0 && i2(s, 28) == 1 && bpp_ok
+                        && self.bmp.width < 30000 && self.bmp.height < 10000
+                        && (self.bmp.palette == 0
+                            || (1u32 << self.bmp.bpp) >= self.bmp.palette)
+                    {
+                        self.bmp.header = 1;
+                        if self.bmp.hdr_less != 0 {
+                            self.bmp.offset = if self.bmp.bpp < 24 {
+                                if self.bmp.palette != 0 { self.bmp.palette * 4 }
+                                else { 4u32 << self.bmp.bpp }
+                            } else { 0 };
+                        } else {
+                            self.bmp.offset = self.bmp.offset.saturating_sub(54);
+                        }
+                        self.gray = if self.bmp.bpp == 8 { 0x300 } else { 0 };
+                        // Cursor/icon heuristic — bit-mask AND mask handling.
+                        if self.bmp.hdr_less != 0
+                            && self.bmp.width * 2 == self.bmp.height
+                            && self.bmp.bpp > 1
+                        {
+                            let p = self.bmp.width * self.bmp.height * (self.bmp.bpp + 1);
+                            let q = self.bmp.width * self.bmp.height * self.bmp.bpp;
+                            let mask_widths: &[u32] = &[
+                                8, 10, 14, 16, 20, 22, 24, 32, 40, 48,
+                                60, 64, 72, 80, 96, 128, 256,
+                            ];
+                            let cond1 = self.bmp.size > 0
+                                && self.bmp.size == (p >> 4);
+                            let cond2 = (self.bmp.size == 0
+                                || self.bmp.size < (q >> 3))
+                                && mask_widths.contains(&self.bmp.width);
+                            if cond1 || cond2 {
+                                self.bmp.height = self.bmp.width;
+                                self.bmp.bit_mask = self.bmp.width;
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.bmp.offset = self.bmp.offset.saturating_sub((self.bmp.offset > 0) as u32);
+                // CheckIfGrayscale macro (paq8.cpp:5356-5378) —
+                // detects 24bpp palette grayscale. Skipped in this
+                // port; predictions still work without it.
+            }
+
+            if self.bmp.offset == 0
+                && (self.bmp.header > 0 || self.bmp.bit_mask > 0)
+                && pos >= self.eoi
+            {
+                if self.bmp.header == 0 && self.bmp.bit_mask != 0 {
+                    self.bmp.header = 1; self.bmp.bpp = 1;
+                    self.bmp.width = self.bmp.bit_mask;
+                    self.bmp.bit_mask = 0;
+                }
+                self.bpp = self.bmp.bpp;
+                self.w = if self.bpp > 4 {
+                    (self.bmp.width * (self.bpp >> 3) + 3) & (!3)
+                } else if self.bpp == 1 {
+                    (((self.bmp.width - 1) >> 5) + 1) * 4
+                } else {
+                    ((self.bmp.width * 4 + 31) >> 5) * 4
+                };
+                self.alpha = (self.bpp == 32) as u32;
+                let eoi_new = self.w * self.bmp.height;
+                if eoi_new > 64 {
+                    self.eoi = eoi_new + pos;
+                } else {
+                    self.bmp.header = 0;
+                    self.w = 0;
+                }
+            }
+
+            // ---- TGA detection ----
+            if pos >= self.eoi + 8 && self.tga.header == 0 {
+                if (m4(s, 8) & 0xFFFFFF) == 0x010100
+                    && (m4(s, 4) & 0xFFFFFFC7) == 0x00000100
+                    && matches!(s.buf.at(1), 16 | 24 | 32)
+                {
+                    self.tga.header = pos;
+                    self.tga.id_length = s.buf.at(8) as u32;
+                    self.tga.map_size = (s.buf.at(1) / 8) as u32;
+                    self.tga.bpp = 8;
+                    self.tga.img_type = 1;
+                } else if (m4(s, 8) & 0xFFFEFF) == 0x000200 && m4(s, 4) == 0 {
+                    self.tga.header = pos;
+                    self.tga.id_length = s.buf.at(8) as u32;
+                    self.tga.img_type = s.buf.at(6) as u32;
+                    self.tga.bpp = if self.tga.img_type == 2 { 24 } else { 8 };
+                }
+            } else if self.w == 0 && self.tga.header > 0 {
+                let p = pos - self.tga.header;
+                if p == 8 {
+                    self.tga.width  = i2(s, 4);
+                    self.tga.height = i2(s, 2);
+                    if !(i4(s, 8) == 0 && self.tga.width > 0
+                        && self.tga.width < 0x3FFF
+                        && self.tga.height > 0 && self.tga.height < 0x3FFF)
+                    {
+                        self.tga.header = 0;
+                    }
+                } else if p == 10 {
+                    let i = m2(s, 2);
+                    if i & 0xFFF7 == (32 << 8) { self.tga.bpp = 32; }
+                    if i & 0xFFD7 != (self.tga.bpp << 8) {
+                        self.tga = TgaImage::default();
+                    }
+                }
+                if self.tga.header > 0
+                    && p == 10 + self.tga.id_length + self.tga.map_size * 256
+                {
+                    self.w = (self.tga.width * self.tga.bpp) >> 3;
+                    self.gray = (self.tga.img_type == 3) as u32;
+                    self.bpp = self.tga.bpp;
+                    self.alpha = (self.bpp == 32) as u32;
+                    let eoi_new = self.w * self.tga.height;
+                    if eoi_new > 64 {
+                        self.eoi = eoi_new + pos;
+                    } else {
+                        self.tga.header = 0; self.w = 0;
+                    }
+                }
+            }
+        }
+        if pos > self.eoi {
+            self.w = 0;
+        }
+        // End of stream — reset detector state.
+        if bpos == 7 && pos + 1 == self.eoi {
+            self.tga = TgaImage::default();
+            self.bmp.header = 0;
+            self.gray = 0; self.alpha = 0;
+        }
+        self.w > 0
+    }
+}
+
+#[inline]
+fn i4(s: &Paq8State, i: u32) -> u32 {
+    (s.buf.at(i) as u32)
+        + 256 * (s.buf.at(i - 1) as u32)
+        + 65536 * (s.buf.at(i - 2) as u32)
+        + 16777216 * (s.buf.at(i - 3) as u32)
+}
+#[inline]
+fn i2(s: &Paq8State, i: u32) -> u32 {
+    (s.buf.at(i) as u32) + 256 * (s.buf.at(i - 1) as u32)
+}
+#[inline]
+fn m4(s: &Paq8State, i: u32) -> u32 {
+    (s.buf.at(i - 3) as u32)
+        + 256 * (s.buf.at(i - 2) as u32)
+        + 65536 * (s.buf.at(i - 1) as u32)
+        + 16777216 * (s.buf.at(i) as u32)
+}
+#[inline]
+fn m2(s: &Paq8State, i: u32) -> u32 {
+    (s.buf.at(i) as u32) * 256 + (s.buf.at(i - 1) as u32)
+}
 
 pub struct AudioModel;
 impl AudioModel {
@@ -795,5 +1682,17 @@ mod tests {
     fn im8bit_model_palette_mode_runs_without_panic() {
         let mut model = Im8BitModel::new(64 * 1024, build_dt());
         drive(|s, m| model.mix(s, m, 16, /*gray=*/false));
+    }
+
+    #[test]
+    fn im24bit_model_rgb_runs_without_panic() {
+        let mut model = Im24BitModel::new(64 * 1024, build_dt());
+        drive(|s, m| model.mix(s, m, 48, /*alpha=*/false));
+    }
+
+    #[test]
+    fn im24bit_model_rgba_runs_without_panic() {
+        let mut model = Im24BitModel::new(64 * 1024, build_dt());
+        drive(|s, m| model.mix(s, m, 64, /*alpha=*/true));
     }
 }
