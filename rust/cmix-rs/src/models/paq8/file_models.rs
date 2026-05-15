@@ -1623,12 +1623,682 @@ fn m2(s: &Paq8State, i: u32) -> u32 {
     (s.buf.at(i) as u32) * 256 + (s.buf.at(i - 1) as u32)
 }
 
-pub struct AudioModel;
-impl AudioModel {
-    pub fn new() -> Self { Self }
-    pub fn mix(&mut self, _s: &mut Paq8State, _m: &mut Mixer) -> bool { false }
+// =============================================================
+// AudioModel — paq8.cpp:5505-5870. WAV detector + 8-bit / 16-bit
+// PCM sample-level prediction.
+// =============================================================
+//
+// `AudioModel.mix(...)` parses the raw byte stream for a `RIFF
+// WAVE fmt ... data` chunk. On detection, dispatches to either
+// `audio8b_model` (8-bit, OLS-stack-based) or `wav_model` (16-bit,
+// Cholesky-LS-based). The text path is unaffected — `mix` returns
+// `false` until a real WAV header is seen.
+
+#[derive(Default, Clone, Copy)]
+struct WavAudio {
+    header: u32, size: u32, channels: u32,
+    bits_per_sample: u32, chunk: u32, data: u32,
 }
+
+pub struct AudioModel {
+    wav: WavAudio,
+    eoi: u32,
+    length: u32,
+    info: u32,
+    audio8: Audio8bModel,
+    wav16:  Wav16Model,
+}
+
+impl AudioModel {
+    pub fn new() -> Self {
+        Self {
+            wav: WavAudio::default(),
+            eoi: 0, length: 0, info: 0,
+            audio8: Audio8bModel::new(),
+            wav16:  Wav16Model::new(),
+        }
+    }
+
+    pub fn mix(&mut self, s: &mut Paq8State, m: &mut Mixer) -> bool {
+        let bpos = s.bpos as u32;
+        let pos  = s.buf.pos;
+
+        if bpos == 0 {
+            // Detect "RIFF" magic at the start of a potential WAV.
+            if pos >= self.eoi + 4 && self.wav.header == 0 && m4(s, 4) == 0x52494646 {
+                self.wav.header = pos;
+                self.wav.chunk  = 0;
+                self.length = 0;
+            } else if self.wav.header > 0 {
+                let p = pos - self.wav.header;
+                if p == 4 {
+                    self.wav.size = i4(s, 4);
+                    if self.wav.size > 0x3FFFFFFF { self.wav.header = 0; }
+                } else if p == 8 {
+                    if m4(s, 4) != 0x57415645 { self.wav.header = 0; }
+                } else if p == 16 + self.length
+                    && (m4(s, 8) != 0x666d7420
+                        || (i4(s, 4).wrapping_sub(16) & 0xFFFFFFFD) != 0)
+                {
+                    self.length = (i4(s, 4) + 1) & !1;
+                    self.length += 8;
+                    if m4(s, 8) == 0x666d7420
+                        && (i4(s, 4) & 0xFFFFFFFD) != 16
+                    {
+                        self.wav.header = 0;
+                    }
+                } else if p == 20 + self.length {
+                    self.wav.channels = s.buf.at(2) as u32;
+                    let ch_ok = self.wav.channels == 1 || self.wav.channels == 2;
+                    if !(ch_ok && (m4(s, 4) & 0xFFFFFCFF) == 0x01000000) {
+                        self.wav.header = 0;
+                    }
+                } else if p == 32 + self.length {
+                    self.wav.bits_per_sample = s.buf.at(2) as u32;
+                    let bps_ok = self.wav.bits_per_sample == 8
+                        || self.wav.bits_per_sample == 16;
+                    if !(bps_ok && (m2(s, 2) & 0xE7FF) == 0) {
+                        self.wav.header = 0;
+                    }
+                } else if p == 40 + self.length + self.wav.chunk
+                    && m4(s, 8) != 0x64617461
+                {
+                    self.wav.chunk += ((i4(s, 4) + 1) & !1) + 8;
+                    if self.wav.chunk > 0xFFFFF { self.wav.header = 0; }
+                } else if p == 40 + self.length + self.wav.chunk {
+                    self.wav.data = (i4(s, 4) + 1) & !1;
+                    let stride = self.wav.channels * (self.wav.bits_per_sample / 8);
+                    if self.wav.data != 0 && stride != 0 && self.wav.data % stride == 0 {
+                        self.info = self.wav.channels
+                            + self.wav.bits_per_sample / 4 - 3 + 1;
+                        self.eoi = pos + self.wav.data;
+                    }
+                }
+            }
+        }
+        if pos > self.eoi { self.info = 0; return false; }
+
+        if self.info > 0 {
+            // info-1 in [0..3]: bit 0 = stereo, bit 1 = 16-bit.
+            if (self.info - 1) & 2 == 0 {
+                self.audio8.mix(s, m, self.info - 1);
+            } else {
+                self.wav16.mix(s, m, self.info - 1);
+            }
+        }
+        if bpos == 7 && pos + 1 == self.eoi {
+            self.wav = WavAudio::default();
+            self.info = 0; self.eoi = 0;
+        }
+        self.info > 0
+    }
+}
+
 impl Default for AudioModel { fn default() -> Self { Self::new() } }
+
+// =============================================================
+// Audio8bModel — paq8.cpp:5553-5658. 8-bit PCM model with 8 OLS
+// stacks per channel + 3 linear-extrapolation predictors.
+// =============================================================
+
+const A8_N_OLS: usize = 8;
+const A8_N_LNR_PRD: usize = A8_N_OLS + 3;
+
+pub struct Audio8bModel {
+    s_map: Vec<Vec<super::context_map::SmallStationaryContextMap>>, // [nLnrPrd][3]
+    /// `[regressor][channel]` — 8 × 2.
+    ols: Vec<Vec<super::util::Ols>>,
+    prd: [[[i32; 2]; 2]; A8_N_LNR_PRD],
+    residuals: [[i32; 2]; A8_N_LNR_PRD],
+    stereo: i32, ch: i32, rpos: u32, last_pos: u32,
+    mask: u32, err_log: u32, mx_ctx: u32,
+    wmode: i32,
+}
+
+impl Audio8bModel {
+    pub fn new() -> Self {
+        use super::context_map::SmallStationaryContextMap;
+        use super::util::Ols;
+        let s_map: Vec<Vec<SmallStationaryContextMap>> = (0..A8_N_LNR_PRD)
+            .map(|_| (0..3).map(|_| SmallStationaryContextMap::new(11, 1)).collect())
+            .collect();
+        // OLS params per upstream:
+        let ols_params: &[(usize, i32, f64)] = &[
+            (128, 24, 0.9975),
+            (90, 30, 0.9965),
+            (90, 31, 0.996),
+            (90, 32, 0.995),
+            (90, 33, 0.995),
+            (90, 34, 0.9985),
+            (28, 4, 0.98),
+            (28, 3, 0.992),
+        ];
+        let ols: Vec<Vec<Ols>> = ols_params.iter().map(|&(n, kmax, lambda)| {
+            (0..2).map(|_| Ols::new(n, kmax, lambda, 0.001, 0.0)).collect()
+        }).collect();
+        Self {
+            s_map, ols,
+            prd: [[[0; 2]; 2]; A8_N_LNR_PRD],
+            residuals: [[0; 2]; A8_N_LNR_PRD],
+            stereo: 0, ch: 0, rpos: 0, last_pos: 0,
+            mask: 0, err_log: 0, mx_ctx: 0,
+            wmode: 0,
+        }
+    }
+
+    pub fn mix(&mut self, s: &mut Paq8State, m: &mut Mixer, info: u32) {
+        let bpos = s.bpos as u32;
+        let pos  = s.buf.pos;
+        let c0   = s.c0;
+        let b = ((c0 << (8 - bpos)) & 0xff) as i8;
+
+        if bpos == 0 {
+            self.rpos = if pos == self.last_pos + 1 { self.rpos + 1 } else { 0 };
+            self.last_pos = pos;
+            if self.rpos == 0 {
+                self.stereo = (info & 1) as i32;
+                self.mask = 0;
+                self.wmode = info as i32;
+            }
+            self.ch = if self.stereo != 0 { (s.blpos & 1) as i32 } else { 0 };
+            let raw = if info & 4 != 0 { s.buf.at(1) ^ 128 } else { s.buf.at(1) };
+            let sample = (raw as i32) - 128;
+            let p_ch = (self.ch ^ self.stereo) as usize;
+            self.err_log = 0;
+            let mut i = 0;
+            while i < A8_N_OLS {
+                self.ols[i][p_ch].update(sample as f64);
+                self.residuals[i][p_ch] = sample - self.prd[i][p_ch][0];
+                let abs_res = self.residuals[i][p_ch].abs() as u32;
+                self.mask = self.mask * 2 + ((abs_res > 4) as u32);
+                self.err_log = self.err_log.wrapping_add(abs_res.wrapping_mul(abs_res));
+                i += 1;
+            }
+            for j in i..A8_N_LNR_PRD {
+                self.residuals[j][p_ch] = sample - self.prd[j][p_ch][0];
+            }
+            self.err_log = ((self.err_log).max(1) as u32).min(0xFFFF);
+            self.err_log = super::substrate::ilog2(self.err_log).min(0xF);
+            let bit_count = (self.mask.count_ones() as u32).min(0x1F);
+            self.mx_ctx = super::substrate::ilog2(bit_count.max(1)) * 2 + self.ch as u32;
+
+            // Feed OLS regressors with channel-specific sample stream.
+            let ch_u = self.ch as usize;
+            let k1_a = 90; let k2_a = k1_a - 12 * self.stereo;
+            let wmode = self.wmode;
+            // ols[1] — k1 stride pattern.
+            { let mut j = 1; let mut i = 1; while j <= k1_a {
+                let v = Self::x1_static(s, i, wmode) as f64;
+                self.ols[1][ch_u].add(v);
+                let step = 1 << ((j > 8) as u32 + (j > 16) as u32 + (j > 64) as u32);
+                i += step; j += 1; } }
+            // ols[2]
+            { let mut j = 1; let mut i = 1; while j <= k2_a {
+                let v = Self::x1_static(s, i, wmode) as f64;
+                self.ols[2][ch_u].add(v);
+                let step = 1 << ((j > 5) as u32 + (j > 10) as u32 + (j > 17) as u32
+                    + (j > 26) as u32 + (j > 37) as u32);
+                i += step; j += 1; } }
+            // ols[3]
+            { let mut j = 1; let mut i = 1; while j <= k2_a {
+                let v = Self::x1_static(s, i, wmode) as f64;
+                self.ols[3][ch_u].add(v);
+                let step = 1 << ((j > 3) as u32 + (j > 7) as u32 + (j > 14) as u32
+                    + (j > 20) as u32 + (j > 33) as u32 + (j > 49) as u32);
+                i += step; j += 1; } }
+            // ols[4]
+            { let mut j = 1; let mut i = 1; while j <= k2_a {
+                let v = Self::x1_static(s, i, wmode) as f64;
+                self.ols[4][ch_u].add(v);
+                i += 1 + ((j > 4) as i32) + ((j > 8) as i32); j += 1; } }
+            // ols[5]
+            { let mut j = 1; let mut i = 1; while j <= k1_a {
+                let v = Self::x1_static(s, i, wmode) as f64;
+                self.ols[5][ch_u].add(v);
+                i += 2 + ((j > 3) as i32 + (j > 9) as i32 + (j > 19) as i32
+                    + (j > 36) as i32 + (j > 61) as i32);
+                j += 1; } }
+            if self.stereo != 0 {
+                for i in 1..=(k1_a - k2_a) {
+                    let xx = Self::x2_static(s, i, wmode, 36) as f64;
+                    self.ols[2][ch_u].add(xx);
+                    self.ols[3][ch_u].add(xx);
+                    self.ols[4][ch_u].add(xx);
+                }
+            }
+            // 28-sample ols[0/6/7] block.
+            let k1_b = 28; let k2_b = k1_b - 6 * self.stereo;
+            for i in 1..=k2_b {
+                let xx = Self::x1_static(s, i, wmode) as f64;
+                self.ols[0][ch_u].add(xx);
+                self.ols[6][ch_u].add(xx);
+                self.ols[7][ch_u].add(xx);
+            }
+            let mut i = k2_b + 1;
+            while i <= 96 {
+                let v = Self::x1_static(s, i, wmode) as f64;
+                self.ols[0][ch_u].add(v);
+                i += 1;
+            }
+            if self.stereo != 0 {
+                for i in 1..=(k1_b - k2_b) {
+                    let xx = Self::x2_static(s, i, wmode, 36) as f64;
+                    self.ols[0][ch_u].add(xx);
+                    self.ols[6][ch_u].add(xx);
+                    self.ols[7][ch_u].add(xx);
+                }
+                let mut i = (k1_b - k2_b) + 1;
+                while i <= 32 {
+                    let v = Self::x2_static(s, i, wmode, 36) as f64;
+                    self.ols[0][ch_u].add(v);
+                    i += 1;
+                }
+            } else {
+                let mut i = k2_b + 1;
+                while i <= 128 {
+                    let v = Self::x1_static(s, i, wmode) as f64;
+                    self.ols[0][ch_u].add(v);
+                    i += 1;
+                }
+            }
+
+            for i in 0..A8_N_OLS {
+                let pred = self.ols[i][ch_u].predict().floor() as i32;
+                self.prd[i][ch_u][0] = pred.clamp(-128, 127);
+                self.prd[i][ch_u][1] = (self.prd[i][ch_u][0]
+                    + self.residuals[i][p_ch]).clamp(-128, 127);
+            }
+            // 3 extrapolation predictors.
+            let x1_1 = Self::x1_static(s, 1, wmode);
+            let x1_2 = Self::x1_static(s, 2, wmode);
+            let x1_3 = Self::x1_static(s, 3, wmode);
+            let x1_4 = Self::x1_static(s, 4, wmode);
+            self.prd[A8_N_OLS][ch_u][0]     = (x1_1 * 2 - x1_2).clamp(-128, 127);
+            self.prd[A8_N_OLS + 1][ch_u][0] = (x1_1 * 3 - x1_2 * 3 + x1_3).clamp(-128, 127);
+            self.prd[A8_N_OLS + 2][ch_u][0] = (x1_1 * 4 - x1_2 * 6 + x1_3 * 4 - x1_4).clamp(-128, 127);
+            for i in A8_N_OLS..A8_N_LNR_PRD {
+                self.prd[i][ch_u][1] = (self.prd[i][ch_u][0]
+                    + self.residuals[i][p_ch]).clamp(-128, 127);
+            }
+        }
+
+        // Per-bit predictions via 3 SmallStationaryContextMaps per
+        // linear predictor.
+        let ch_u = self.ch as usize;
+        for i in 0..A8_N_LNR_PRD {
+            let ctx = (((self.prd[i][ch_u][0] - b as i32) & 0xff) as u32 * 8) + bpos;
+            self.s_map[i][0].set(ctx);
+            self.s_map[i][1].set(ctx);
+            let ctx2 = (((self.prd[i][ch_u][1] - b as i32) & 0xff) as u32 * 8) + bpos;
+            self.s_map[i][2].set(ctx2);
+            self.s_map[i][0].mix(m, s.y, 6, 1, 2 + ((i >= A8_N_OLS) as i32),
+                &s.squash, &s.stretch);
+            self.s_map[i][1].mix(m, s.y, 9, 1, 2 + ((i >= A8_N_OLS) as i32),
+                &s.squash, &s.stretch);
+            self.s_map[i][2].mix(m, s.y, 7, 1, 3, &s.squash, &s.stretch);
+        }
+        let c0 = s.c0;
+        m.set((self.err_log << 8) | (c0 & 0xff), 4096);
+        m.set(((self.mask & 0xff) << 3) | ((self.ch as u32) << 2) | (bpos >> 1), 2048);
+        m.set((self.mx_ctx << 7) | ((s.buf.at(1) as u32) >> 1), 1280);
+        m.set((self.err_log << 4) | ((self.ch as u32) << 3) | bpos, 256);
+        m.set(self.mx_ctx, 10);
+    }
+
+    /// X1 — paq8.cpp:5517-5529. Sample reader, wmode-dependent.
+    /// Static so callers can hold `&mut self.ols[..]` and read at
+    /// the same time.
+    fn x1_static(s: &Paq8State, i: i32, wmode: i32) -> i32 {
+        let buf = &s.buf;
+        match wmode {
+            0 => buf.at(i as u32) as i32 - 128,
+            1 => buf.at((i << 1) as u32) as i32 - 128,
+            2 => s2(buf, (i << 1) as u32),
+            3 => s2(buf, (i << 2) as u32),
+            4 => (buf.at(i as u32) ^ 128) as i32 - 128,
+            5 => (buf.at((i << 1) as u32) ^ 128) as i32 - 128,
+            6 => t2(buf, (i << 1) as u32),
+            7 => t2(buf, (i << 2) as u32),
+            _ => 0,
+        }
+    }
+
+    /// X2 — stereo-paired sample reader (paq8.cpp:5531-5543).
+    fn x2_static(s: &Paq8State, i: i32, wmode: i32, big_s: i32) -> i32 {
+        let buf = &s.buf;
+        match wmode {
+            0 => buf.at((i + big_s) as u32) as i32 - 128,
+            1 => buf.at(((i << 1) - 1) as u32) as i32 - 128,
+            2 => s2(buf, ((i + big_s) << 1) as u32),
+            3 => s2(buf, ((i << 2) - 2) as u32),
+            4 => (buf.at((i + big_s) as u32) ^ 128) as i32 - 128,
+            5 => (buf.at(((i << 1) - 1) as u32) ^ 128) as i32 - 128,
+            6 => t2(buf, ((i + big_s) << 1) as u32),
+            7 => t2(buf, ((i << 2) - 2) as u32),
+            _ => 0,
+        }
+    }
+    fn x1(&self, s: &Paq8State, i: i32, wmode: i32) -> i32 { Self::x1_static(s, i, wmode) }
+    fn x2(&self, s: &Paq8State, i: i32, wmode: i32, big_s: i32) -> i32 { Self::x2_static(s, i, wmode, big_s) }
+}
+
+#[inline]
+fn s2(buf: &super::substrate::Buf, i: u32) -> i32 {
+    let v = (buf.at(i) as u32) + 256 * (buf.at(i - 1) as u32);
+    (v as i16) as i32
+}
+#[inline]
+fn t2(buf: &super::substrate::Buf, i: u32) -> i32 {
+    let v = (buf.at(i - 1) as u32) + 256 * (buf.at(i) as u32);
+    (v as i16) as i32
+}
+
+// =============================================================
+// Wav16Model — paq8.cpp:5660-5805. 16-bit PCM with Cholesky-LS fit.
+// =============================================================
+
+const WAV_SD_MAX: usize = 49; // S + D dimensions
+
+pub struct Wav16Model {
+    pr: [[i32; 2]; 3],
+    n:  [i32; 2],
+    counter: [i32; 2],
+    f: Vec<Vec<Vec<f64>>>, // [49][49][2]
+    l: Vec<Vec<f64>>,      // [49][49]
+    rpos: u32, last_pos: u32,
+    bits: i32, channels: i32, w: i32, ch: i32, col: i32,
+    z1: i32, z2: i32, z3: i32, z4: i32, z5: i32, z6: i32, z7: i32,
+    wmode: i32,
+    big_s: i32, big_d: i32,
+    scms: [super::context_map::SmallStationaryContextMap; 7],
+    cm: super::context_map::ContextMap,
+    dt: [i32; 1024],
+}
+
+impl Wav16Model {
+    pub fn new() -> Self {
+        use super::context_map::{ContextMap, SmallStationaryContextMap};
+        Self {
+            pr: [[0; 2]; 3],
+            n: [0; 2], counter: [0; 2],
+            f: vec![vec![vec![0.0; 2]; WAV_SD_MAX]; WAV_SD_MAX],
+            l: vec![vec![0.0; WAV_SD_MAX]; WAV_SD_MAX],
+            rpos: 0, last_pos: 0,
+            bits: 0, channels: 0, w: 0, ch: 0, col: 0,
+            z1: 0, z2: 0, z3: 0, z4: 0, z5: 0, z6: 0, z7: 0,
+            wmode: 0, big_s: 0, big_d: 0,
+            scms: [
+                SmallStationaryContextMap::new(8, 8),
+                SmallStationaryContextMap::new(8, 8),
+                SmallStationaryContextMap::new(8, 8),
+                SmallStationaryContextMap::new(8, 8),
+                SmallStationaryContextMap::new(8, 8),
+                SmallStationaryContextMap::new(8, 8),
+                SmallStationaryContextMap::new(8, 8),
+            ],
+            cm: ContextMap::new(super::substrate::mem(0) * 2, 11, super::substrate::build_dt()),
+            dt: super::substrate::build_dt(),
+        }
+    }
+
+    fn x1_buf(&self, s: &Paq8State, i: i32) -> i32 {
+        let buf = &s.buf;
+        match self.wmode {
+            0 => buf.at(i as u32) as i32 - 128,
+            1 => buf.at((i << 1) as u32) as i32 - 128,
+            2 => s2(buf, (i << 1) as u32),
+            3 => s2(buf, (i << 2) as u32),
+            4 => (buf.at(i as u32) ^ 128) as i32 - 128,
+            5 => (buf.at((i << 1) as u32) ^ 128) as i32 - 128,
+            6 => t2(buf, (i << 1) as u32),
+            7 => t2(buf, (i << 2) as u32),
+            _ => 0,
+        }
+    }
+
+    fn x2_buf(&self, s: &Paq8State, i: i32) -> i32 {
+        let buf = &s.buf;
+        match self.wmode {
+            0 => buf.at((i + self.big_s) as u32) as i32 - 128,
+            1 => buf.at(((i << 1) - 1) as u32) as i32 - 128,
+            2 => s2(buf, ((i + self.big_s) << 1) as u32),
+            3 => s2(buf, ((i << 2) - 2) as u32),
+            4 => (buf.at((i + self.big_s) as u32) ^ 128) as i32 - 128,
+            5 => (buf.at(((i << 1) - 1) as u32) ^ 128) as i32 - 128,
+            6 => t2(buf, ((i + self.big_s) << 1) as u32),
+            7 => t2(buf, ((i << 2) - 2) as u32),
+            _ => 0,
+        }
+    }
+
+    pub fn mix(&mut self, s: &mut Paq8State, m: &mut Mixer, info: u32) {
+        let bpos = s.bpos as u32;
+        let pos  = s.buf.pos;
+        let a    = 0.996f64;
+        let a2   = 1.0 / a;
+
+        if bpos == 0 {
+            self.rpos = if pos == self.last_pos + 1 { self.rpos + 1 } else { 0 };
+            self.last_pos = pos;
+        }
+        if bpos == 0 && self.rpos == 0 {
+            self.bits = ((info as i32 % 4) / 2) * 8 + 8;
+            self.channels = (info as i32 % 2) + 1;
+            self.col = 0;
+            self.w = self.channels * (self.bits >> 3);
+            self.wmode = info as i32;
+            if self.channels == 1 { self.big_s = 48; self.big_d = 0; }
+            else { self.big_s = 36; self.big_d = 12; }
+            for j in 0..(self.channels as usize) {
+                for k in 0..=(self.big_s + self.big_d) as usize {
+                    for l in 0..=(self.big_s + self.big_d) as usize {
+                        self.f[k][l][j] = 0.0;
+                        self.l[k][l] = 0.0;
+                    }
+                }
+                self.f[1][0][j] = 1.0;
+                self.n[j] = 0; self.counter[j] = 0;
+                self.pr[2][j] = 0; self.pr[1][j] = 0; self.pr[0][j] = 0;
+                self.z1 = 0; self.z2 = 0; self.z3 = 0;
+                self.z4 = 0; self.z5 = 0; self.z6 = 0; self.z7 = 0;
+            }
+        }
+
+        if bpos == 0 && self.rpos >= self.w as u32 {
+            self.ch = (self.rpos % self.w as u32) as i32;
+            let msb = self.ch % (self.bits >> 3);
+            let chn = (self.ch / (self.bits >> 3)) as usize;
+            if msb == 0 {
+                self.z1 = self.x1_buf(s, 1);
+                self.z2 = self.x1_buf(s, 2);
+                self.z3 = self.x1_buf(s, 3);
+                self.z4 = self.x1_buf(s, 4);
+                self.z5 = self.x1_buf(s, 5);
+                let k = self.x1_buf(s, 1) as f64;
+                let s_max = self.big_s.min(self.counter[chn] - 1);
+                for l in 0..=s_max as usize {
+                    self.f[0][l][chn] *= a;
+                    self.f[0][l][chn] += self.x1_buf(s, l as i32 + 1) as f64 * k;
+                }
+                let d_max = self.big_d.min(self.counter[chn]);
+                for l in 1..=d_max as usize {
+                    self.f[0][l + self.big_s as usize][chn] *= a;
+                    self.f[0][l + self.big_s as usize][chn] +=
+                        self.x2_buf(s, l as i32 + 1) as f64 * k;
+                }
+                if self.channels == 2 {
+                    let k = self.x2_buf(s, 2) as f64;
+                    for l in 1..=self.big_d.min(self.counter[chn]) as usize {
+                        let idx = l + self.big_s as usize;
+                        self.f[self.big_s as usize + 1][idx][chn] *= a;
+                        self.f[self.big_s as usize + 1][idx][chn] +=
+                            self.x2_buf(s, l as i32 + 1) as f64 * k;
+                    }
+                    for l in 1..=self.big_s.min(self.counter[chn] - 1) as usize {
+                        self.f[l][self.big_s as usize + 1][chn] *= a;
+                        self.f[l][self.big_s as usize + 1][chn] +=
+                            self.x1_buf(s, l as i32 + 1) as f64 * k;
+                    }
+                    self.z6 = self.x2_buf(s, 1) + self.x1_buf(s, 1) - self.x2_buf(s, 2);
+                    self.z7 = self.x2_buf(s, 1);
+                } else {
+                    self.z6 = 2 * self.x1_buf(s, 1) - self.x1_buf(s, 2);
+                    self.z7 = self.x1_buf(s, 1);
+                }
+                self.n[chn] += 1;
+                if self.n[chn] == 1 {
+                    // Re-estimate covariance + Cholesky factor.
+                    let sd = (self.big_s + self.big_d) as usize;
+                    if self.channels == 1 {
+                        for k in 1..=sd { for l in k..=sd {
+                            self.f[k][l][chn] = (self.f[k - 1][l - 1][chn]
+                                - self.x1_buf(s, k as i32) as f64
+                                    * self.x1_buf(s, l as i32) as f64) * a2;
+                        } }
+                    } else {
+                        for k in 1..=sd { if k as i32 != self.big_s + 1 {
+                            for l in k..=sd { if l as i32 != self.big_s + 1 {
+                                let xk = if (k - 1) as i32 <= self.big_s
+                                    { self.x1_buf(s, k as i32) as f64 }
+                                    else { self.x2_buf(s, k as i32 - self.big_s) as f64 };
+                                let xl = if (l - 1) as i32 <= self.big_s
+                                    { self.x1_buf(s, l as i32) as f64 }
+                                    else { self.x2_buf(s, l as i32 - self.big_s) as f64 };
+                                self.f[k][l][chn] = (self.f[k - 1][l - 1][chn]
+                                    - xk * xl) * a2;
+                            } }
+                        } }
+                    }
+                    let mut broke_at = 0usize;
+                    let mut ok = true;
+                    for i in 1..=sd {
+                        let mut sum = self.f[i][i][chn];
+                        for kk in 1..i {
+                            sum -= self.l[i][kk] * self.l[i][kk];
+                        }
+                        sum = (sum + 0.5).floor();
+                        sum = 1.0 / sum;
+                        if sum > 0.0 {
+                            self.l[i][i] = sum.sqrt();
+                            for jj in (i + 1)..=sd {
+                                let mut s2 = self.f[i][jj][chn];
+                                for kk in 1..i {
+                                    s2 -= self.l[jj][kk] * self.l[i][kk];
+                                }
+                                s2 = (s2 + 0.5).floor();
+                                self.l[jj][i] = s2 * self.l[i][i];
+                            }
+                        } else { ok = false; broke_at = i; break; }
+                    }
+                    let _ = broke_at;
+                    if ok && self.counter[chn] > self.big_s + 1 {
+                        for k in 1..=sd {
+                            self.f[k][0][chn] = self.f[0][k][chn];
+                            for jj in 1..k {
+                                self.f[k][0][chn] -= self.l[k][jj] * self.f[jj][0][chn];
+                            }
+                            self.f[k][0][chn] *= self.l[k][k];
+                        }
+                        for k in (1..=sd).rev() {
+                            for jj in (k + 1)..=sd {
+                                self.f[k][0][chn] -= self.l[jj][k] * self.f[jj][0][chn];
+                            }
+                            self.f[k][0][chn] *= self.l[k][k];
+                        }
+                    }
+                    self.n[chn] = 0;
+                }
+                let mut sum = 0.0f64;
+                for l in 1..=(self.big_s + self.big_d) as usize {
+                    let xl = if (l as i32) <= self.big_s
+                        { self.x1_buf(s, l as i32) as f64 }
+                        else { self.x2_buf(s, l as i32 - self.big_s) as f64 };
+                    sum += self.f[l][0][chn] * xl;
+                }
+                self.pr[2][chn] = self.pr[1][chn];
+                self.pr[1][chn] = self.pr[0][chn];
+                self.pr[0][chn] = sum.floor() as i32;
+                self.counter[chn] += 1;
+            }
+            let y1 = self.pr[0][chn];
+            let y2 = self.pr[1][chn];
+            let y3 = self.pr[2][chn];
+            let mut x1 = s.buf.at(1) as i32;
+            let mut x2 = s.buf.at(2) as i32;
+            let x3 = s.buf.at(3) as i32;
+            if self.wmode == 4 || self.wmode == 5 { x1 ^= 128; x2 ^= 128; }
+            if self.bits == 8 { x1 -= 128; x2 -= 128; }
+            let t = (self.bits == 8) || ((msb == 0) ^ (self.wmode < 6));
+            let mut i = (self.ch << 4) as u64;
+            let mut bump = || { i = i.wrapping_add(1); i };
+            use super::substrate::{hash2, hash3, hash4};
+            if (msb != 0) ^ (self.wmode < 6) {
+                self.cm.set(hash2(bump(), (y1 & 0xff) as u64));
+                self.cm.set(hash3(bump(), (y1 & 0xff) as u64,
+                    (((self.z1 - y2 + self.z2 - y3) >> 1) & 0xff) as u64));
+                self.cm.set(hash3(bump(), x1 as u64, (y1 & 0xff) as u64));
+                self.cm.set(hash4(bump(), x1 as u64, (x2 >> 3) as u64, x3 as u64));
+                if self.bits == 8 {
+                    let diff = (self.z1 - y2).abs() as u32;
+                    let llog = super::substrate::ilog2(diff.max(1)) * 2
+                        + (self.z1 > y2) as u32;
+                    self.cm.set(hash3(bump(), (y1 & 0xFE) as u64, llog as u64));
+                } else {
+                    self.cm.set(hash2(bump(), ((y1 + self.z1 - y2) & 0xff) as u64));
+                }
+                self.cm.set(hash2(bump(), x1 as u64));
+                self.cm.set(hash3(bump(), x1 as u64, x2 as u64));
+                self.cm.set(hash2(bump(), (self.z1 & 0xff) as u64));
+                self.cm.set(hash2(bump(), ((self.z1 * 2 - self.z2) & 0xff) as u64));
+                self.cm.set(hash2(bump(), (self.z6 & 0xff) as u64));
+                self.cm.set(hash3(bump(), (y1 & 0xFF) as u64,
+                    (((self.z1 - y2 + self.z2 - y3) / (self.bits >> 3) as i32) & 0xFF) as u64));
+            } else {
+                self.cm.set(hash2(bump(), ((y1 - x1 + self.z1 - y2) >> 8) as u64));
+                self.cm.set(hash2(bump(), ((y1 - x1) >> 8) as u64));
+                self.cm.set(hash2(bump(),
+                    ((y1 - x1 + self.z1 * 2 - y2 * 2 - self.z2 + y3) >> 8) as u64));
+                self.cm.set(hash3(bump(), ((y1 - x1) >> 8) as u64,
+                    ((self.z1 - y2 + self.z2 - y3) >> 9) as u64));
+                self.cm.set(hash2(bump(), (self.z1 >> 12) as u64));
+                self.cm.set(hash2(bump(), x1 as u64));
+                self.cm.set(hash4(bump(), (x1 >> 7) as u64, x2 as u64, (x3 >> 7) as u64));
+                self.cm.set(hash2(bump(), (self.z1 >> 8) as u64));
+                self.cm.set(hash2(bump(), ((self.z1 * 2 - self.z2) >> 8) as u64));
+                self.cm.set(hash2(bump(), (y1 >> 8) as u64));
+                self.cm.set(hash2(bump(), ((y1 - x1) >> 6) as u64));
+            }
+            let tmul = if t { 1 } else { 0 };
+            self.scms[0].set((tmul * self.ch) as u32);
+            self.scms[1].set((tmul * (((self.z1 - x1 + y1) >> 9) & 0xff)) as u32);
+            self.scms[2].set((tmul * (((self.z1 * 2 - self.z2 - x1 + y1) >> 8) & 0xff)) as u32);
+            self.scms[3].set((tmul * (((self.z1 * 3 - self.z2 * 3 + self.z3 - x1) >> 7) & 0xff)) as u32);
+            self.scms[4].set((tmul * (((self.z1 + self.z7 - x1 + y1 * 2) >> 10) & 0xff)) as u32);
+            self.scms[5].set((tmul * (((self.z1 * 4 - self.z2 * 6 + self.z3 * 4 - self.z4 - x1) >> 7) & 0xff)) as u32);
+            self.scms[6].set((tmul * (((self.z1 * 5 - self.z2 * 10 + self.z3 * 10 - self.z4 * 5 + self.z5 - x1 + y1) >> 9) & 0xff)) as u32);
+        }
+        // Predict.
+        let y = s.y;
+        for scm in self.scms.iter_mut() {
+            scm.mix(m, y, 7, 1, 4, &s.squash, &s.stretch);
+        }
+        let c0 = s.c0;
+        let c1 = s.buf.at(1);
+        self.cm.mix1(m, c0, bpos as i32, c1, y,
+            &s.ilog, &s.squash, &s.stretch);
+        self.col += 1;
+        if self.col >= self.w * 8 { self.col = 0; }
+        let bits_minus_1 = (self.bits - 1).max(1);
+        let cb = self.col & bits_minus_1;
+        m.set((self.ch as u32) + 4 * super::substrate::ilog2(cb.max(1) as u32), 4 * 8);
+        m.set(((self.col % self.bits) < 8) as u32, 2);
+        m.set((self.col % self.bits) as u32, self.bits as u32);
+        m.set(self.col as u32, (self.w * 8) as u32);
+        m.set(c0, 256);
+    }
+}
+
+impl Default for Wav16Model { fn default() -> Self { Self::new() } }
 
 #[cfg(test)]
 mod tests {
@@ -1694,5 +2364,24 @@ mod tests {
     fn im24bit_model_rgba_runs_without_panic() {
         let mut model = Im24BitModel::new(64 * 1024, build_dt());
         drive(|s, m| model.mix(s, m, 64, /*alpha=*/true));
+    }
+
+    #[test]
+    fn audio_model_text_path_does_not_fire() {
+        // For random text-ish bytes, no WAV header should be detected.
+        let mut s = Paq8State::new(0);
+        let mut m = Mixer::new(64, 4, 0);
+        let mut model = AudioModel::new();
+        // Push some non-WAV bytes; model.mix should never fire.
+        for byte in 0u32..32 {
+            for bp in 0..8 {
+                s.bpos = bp;
+                s.c0 = if bp == 0 { 1 } else { (1u32 << bp) | (byte >> (8 - bp)) };
+                s.y = ((byte >> (7 - bp)) & 1) as i32;
+                assert!(!model.mix(&mut s, &mut m));
+            }
+            s.c4 = (s.c4 << 8) | byte;
+            s.buf.push(byte as u8);
+        }
     }
 }
