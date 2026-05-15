@@ -25,7 +25,6 @@
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 
-use std::f32::consts::E;
 
 // ====================================================================
 // Integer typedefs (mirror the C source for porting fidelity)
@@ -672,7 +671,7 @@ impl RunContextMap {
             return (base + 1) as u32;
         }
         // Move the matched bucket to the front.
-        let mut j = found_j as usize;
+        let j = found_j as usize;
         let base = (i as usize) * 4;
         let mut buf = [0u8; 4];
         buf.copy_from_slice(&self.t[base + j * 4..base + j * 4 + 4]);
@@ -1190,7 +1189,7 @@ impl ApmDyn {
     pub fn new(s: usize, sqt: &[i16]) -> Self {
         let mut t = vec![0u16; s * 33];
         for j in 0..33 {
-            let v = squash(sqt, ((j as i32 - 16) * 128)) * 16;
+            let v = squash(sqt, (j as i32 - 16) * 128) * 16;
             t[j] = v as u16;
         }
         for i in 33..s * 33 { t[i] = t[i - 33]; }
@@ -2026,6 +2025,27 @@ pub fn fxcm_hash3(a: u32, b: u32, c: u32) -> u32 {
         .wrapping_add(b.wrapping_mul(30_005_491))
         .wrapping_add(c.wrapping_mul(50_004_239));
     h ^ (h >> 9) ^ (a >> 3) ^ (b >> 3) ^ (c >> 4)
+}
+
+/// Word-type collapse used by `setbufstem` to feed `lastWT` —
+/// upstream's `getWT` (fxcmv1.cpp:3709-3725).
+#[inline]
+pub fn get_wt(t: u32) -> u32 {
+    if      (t & eng::VERB)               != 0 { 1 }
+    else if (t & eng::NOUN)               != 0 { 2 }
+    else if (t & eng::ADJECTIVE)          != 0 { 3 }
+    else if (t & eng::MALE)               != 0 { 4 }
+    else if (t & eng::FEMALE)             != 0 { 5 }
+    else if (t & eng::ARTICLE)            != 0 { 6 }
+    else if (t & eng::CONJUNCTION)        != 0 { 7 }
+    else if (t & eng::ADPOSITION)         != 0 { 8 }
+    else if (t & eng::CONJUNCTIVE_ADVERB) != 0 { 9 }
+    else if (t & eng::ADVERB_OF_MANNER)   != 0 { 11 }
+    else if (t & eng::SUFFIX)             != 0 { 12 }
+    else if (t & eng::PREFIX)             != 0 { 13 }
+    else if (t & eng::PLURAL)             != 0 { 10 }
+    else if t != 0                              { 14 }
+    else                                        { 15 }
 }
 
 #[inline]
@@ -3765,6 +3785,105 @@ pub fn build_pre1_from_sta7(sta7: &[u8], strt: &[i16]) -> [i16; 256] {
 }
 
 // ====================================================================
+// `Dictionary` — runtime WRT-style word table loaded from a sidecar
+// file. Mirrors upstream's `dictW[]` + `codeword2sym[]` + `dosym()` +
+// `decodeCodeWord()` (fxcmv1.cpp:365-439). Optional: when no
+// dictionary is supplied the model degrades gracefully (`so` stays at
+// the empty word and all codeword-decode paths no-op).
+// ====================================================================
+
+pub struct Dictionary {
+    /// Lowercase ASCII words in load-order. `words[j]` corresponds to
+    /// upstream's `dictW[j]`.
+    pub words: Vec<Vec<u8>>,
+    /// 256-entry table mapping a codeword byte to its 0-based symbol
+    /// index. Entries c<128 are 0; entries c>=128 are `c-128`.
+    pub codeword2sym: [i32; 256],
+    pub dict1size: i32,
+    pub dict2size: i32,
+    pub dict12size: i32,
+    pub size_dict: i32,
+}
+
+impl Default for Dictionary { fn default() -> Self { Self::empty() } }
+
+impl Dictionary {
+    /// Empty dictionary — `decode_codeword` will return 0 for any
+    /// input. Use this when no dictionary path is supplied.
+    pub fn empty() -> Self {
+        let mut codeword2sym = [0i32; 256];
+        let mut chars_used = 0;
+        for c in 128..256 {
+            codeword2sym[c] = chars_used;
+            chars_used += 1;
+        }
+        Self {
+            words: Vec::new(),
+            codeword2sym,
+            dict1size: 80,
+            dict2size: 32,
+            dict12size: 80 * 32,
+            size_dict: 0,
+        }
+    }
+
+    /// Parse a dictionary file: each run of [a-z] bytes is one word,
+    /// non-letter bytes are word separators. Mirrors upstream's
+    /// `loaddict()` which calls `wfgets` and stores per-line strings.
+    pub fn load_from_bytes(data: &[u8]) -> Self {
+        let mut d = Self::empty();
+        let mut line: Vec<u8> = Vec::with_capacity(32);
+        for &c in data {
+            if c >= b'a' && c <= b'z' {
+                line.push(c);
+            } else if !line.is_empty() {
+                d.words.push(std::mem::take(&mut line));
+            }
+        }
+        if !line.is_empty() { d.words.push(line); }
+        d.size_dict = d.words.len() as i32;
+        d
+    }
+
+    pub fn load_from_file(path: &std::path::Path) -> std::io::Result<Self> {
+        let data = std::fs::read(path)?;
+        Ok(Self::load_from_bytes(&data))
+    }
+
+    /// Decode a 1/2/3-byte packed codeword into a word index, inverse
+    /// of preprocessor::Dictionary::EncodeBytes. Returns 0 if the
+    /// dictionary is empty.
+    pub fn decode_codeword(&self, cw: u32) -> i32 {
+        if self.size_dict == 0 { return 0; }
+        let c0 = (cw & 0xff) as usize;
+        let s0 = self.codeword2sym[c0];
+        if s0 < self.dict1size { return s0; }
+        let mut i = self.dict1size * (s0 - self.dict1size);
+        let c1 = ((cw >> 8) & 0xff) as usize;
+        let s1 = self.codeword2sym[c1];
+        if s1 < self.dict1size {
+            i += s1;
+            return i + self.dict1size;
+        }
+        i = (i - self.dict12size) * self.dict2size;
+        i += self.dict1size * (s1 - self.dict1size);
+        let c2 = ((cw >> 16) & 0xff) as usize;
+        let s2 = self.codeword2sym[c2];
+        i += s2;
+        i + 80 * 49
+    }
+
+    /// Word bytes at index `j`, or None if out of range.
+    pub fn word(&self, j: i32) -> Option<&[u8]> {
+        if j > 0 && (j as usize) < self.words.len() {
+            Some(&self.words[j as usize])
+        } else {
+            None
+        }
+    }
+}
+
+// ====================================================================
 // `FxcmState` — captures the file-scope mutable globals that
 // upstream's `fxcmv1.cpp` shares between modelPrediction, update1
 // and PredictorInit. Carving them into a struct lets the per-bit
@@ -3885,8 +4004,31 @@ pub struct FxcmState {
     pub s_verb:           u32,
     pub dec_code:         i32,
 
+    // Dictionary-decoder state (fxcmv1.cpp:3262 + 3766-3796).
+    /// In-progress codeword bytes (1..3 packed bytes), 0 when idle.
+    pub dcw:  u32,
+    /// Length of the codeword currently in `dcw` (0..=3).
+    pub dcwl: i32,
+    /// Last successfully decoded word index, fed into `dec_code` and
+    /// later consumed by mixer 8.
+    pub last_cw: i32,
+    /// 4 KiB circular buffer of charSwap-decoded text bytes —
+    /// upstream's `cwbuf` consumed by tag detection (buffer1) and
+    /// the stemmer driver.
+    pub cwbuf: Vec<u8>,
+    pub cwpos: u32,
+
     // Final prediction value (the `pr` upstream global).
     pub pr: i32,
+
+    /// LSTM byte-mixer's discretized bit-1 probability (`lstmpr`
+    /// upstream — the only external signal fxcmv1's per-bit chain
+    /// reads). 0..=4095; 2048 means "neutral / no signal". Wired by
+    /// the orchestrator each bit via [`Predictor::set_lstm_signals`].
+    pub lstmpr: i32,
+    /// LSTM byte-mixer's most-probable byte (`lstmex` upstream —
+    /// folded into mixer 9's context).
+    pub lstmex: i32,
 
     // 4-Word stemmer ring (`StemWords[4]` upstream).
     pub stem_words: [Word; 4],
@@ -3931,7 +4073,12 @@ impl FxcmState {
             indirect_word0_pos: 0, indirect_word: 0, u8w: 0,
             context1_ind3: 0, cxt_ind3: 0,
             stem_index: 0, s_verb: 0, dec_code: 0,
+            dcw: 0, dcwl: 0, last_cw: 0,
+            cwbuf: vec![0u8; 0x1000], cwpos: 0,
             pr: 2048,
+            // 2048 = stretch's pivot (Sigmoid::logistic(0) = 0.5 →
+            // stretch(2048) = 0). lstmex = 0 = "no most-probable byte yet".
+            lstmpr: 2048, lstmex: 0,
             stem_words: [Word::new(), Word::new(), Word::new(), Word::new()],
             c_word: 0, p_word: 3,
         }
@@ -4498,6 +4645,17 @@ pub struct Predictor {
     pub cm_c2_sta: Vec<u8>,
     pub cm_c1_sta: Vec<u8>,
     pub cm_c_sta:  Vec<u8>,
+
+    /// Optional WRT-style word dictionary. `None` ⇒ codeword-decode
+    /// paths no-op and tag detection (which depends on `so`) is
+    /// permanently disabled.
+    pub dictionary: Option<Dictionary>,
+    /// Snapshot of `so`'s word index at the last COLON byte (mirrors
+    /// upstream's `colonstr = so`). 0 = unset / empty.
+    pub colonstr_idx: i32,
+    /// Current decoded-word index (`so` pointer in upstream). 0 ⇒
+    /// `so` points at the empty string `sonull`.
+    pub so_idx: i32,
 }
 
 impl Predictor {
@@ -4657,7 +4815,18 @@ impl Predictor {
             cm_c2_sta: vec![4, 4, 4, 4, 4, 4, 0, 3, 2, 4, 3, 3, 4, 4, 4, 0, 4, 4],
             cm_c1_sta: vec![4, 5, 1, 0, 5, 5, 4, 1],
             cm_c_sta:  vec![1, 3, 1, 1, 0, 0],
+            dictionary: None,
+            colonstr_idx: 0,
+            so_idx: 0,
         }
+    }
+
+    /// Attach a dictionary loaded from raw bytes (same format as
+    /// upstream's sidecar file: a stream of lines, each line being a
+    /// lowercase ASCII word).
+    pub fn with_dictionary_bytes(mut self, data: &[u8]) -> Self {
+        self.dictionary = Some(Dictionary::load_from_bytes(data));
+        self
     }
 
     pub fn add_prediction(&mut self, x: i32) {
@@ -4665,6 +4834,170 @@ impl Predictor {
         debug_assert!(i < NUM_MODELS);
         self.model_predictions[i] = x as f32 * CONVERSION_FACTOR;
         self.prediction_index += 1;
+    }
+
+    /// Bytes of the current decoded word (`so` in upstream). Empty
+    /// when no dictionary is loaded or no codeword has been decoded.
+    pub fn so_bytes(&self) -> &[u8] {
+        self.dictionary
+            .as_ref()
+            .and_then(|d| d.word(self.so_idx))
+            .unwrap_or(b"")
+    }
+
+    /// Bytes of the word captured at the last `:` (`colonstr`).
+    pub fn colonstr_bytes(&self) -> &[u8] {
+        self.dictionary
+            .as_ref()
+            .and_then(|d| d.word(self.colonstr_idx))
+            .unwrap_or(b"")
+    }
+
+    /// Upstream's `decodeWord(c)`: decode the codeword via the
+    /// dictionary's symbol table; if successful, advance `so_idx` and
+    /// remember the index as `last_cw`.
+    fn decode_word(&mut self, cw: u32) {
+        if let Some(dict) = self.dictionary.as_ref() {
+            let j = dict.decode_codeword(cw);
+            if j > 0 && j < dict.size_dict {
+                self.state.last_cw = j;
+                self.so_idx = j;
+            }
+        }
+    }
+
+    /// Upstream's `procWord()`: finalize the codeword in `state.dcw`
+    /// of length `state.dcwl`, decode it, and emit each decoded byte
+    /// via `set_buf` so it lands in `cwbuf` + drives the stemmer.
+    /// No-op when `dcwl == 0` or `> 3` (illegal codeword length).
+    fn proc_word(&mut self) {
+        let dcwl = self.state.dcwl;
+        if dcwl <= 0 || dcwl > 3 { return; }
+        let mut dcw = self.state.dcw;
+        if dcwl == 2 {
+            dcw = (dcw / 256) + (dcw & 255) * 256;
+        } else if dcwl == 3 {
+            dcw = ((dcw / 256) / 256) + (dcw & 0xff00) + (dcw & 255) * 256 * 256;
+        }
+        self.decode_word(dcw);
+        self.state.dcw  = 0;
+        self.state.dcwl = 0;
+        // Emit the decoded word into the stemmer / decoded-text
+        // buffer. Borrow-safe via a one-shot copy of the bytes.
+        let word: Vec<u8> = self.so_bytes().to_vec();
+        for ch in word { self.set_buf(ch); }
+    }
+
+    /// Upstream's `setbuf(c)`: write a charSwap-decoded byte into the
+    /// `cwbuf` ring + drive the stemmer.
+    fn set_buf(&mut self, c: u8) {
+        let pos = (self.state.cwpos & 0xfff) as usize;
+        self.state.cwbuf[pos] = c;
+        self.state.cwpos = self.state.cwpos.wrapping_add(1);
+        self.set_buf_stem(c);
+    }
+
+    /// Upstream's `setbufstem(c)`: append the char to the active
+    /// stemmer word OR (when the char terminates the word) stem it,
+    /// rotate the 4-word ring, and update worcxt/worcxt1/worcxt2.
+    fn set_buf_stem(&mut self, c: u8) {
+        let ci = self.state.c_word;
+        let cw_len = self.state.stem_words[ci].len();
+        let in_word_char =
+            (c >= b'a' && c <= b'z')
+            || (c == APOSTROPHE_CHR && self.state.c2 != APOSTROPHE_CHR)
+            || (c == b'-' && cw_len > 0);
+        if in_word_char {
+            self.state.stem_words[ci].append(c);
+            return;
+        }
+        // Wiki-link tolerance: skip ']' inside a paragraph (outside
+        // an HTLINK), keep the word intact.
+        if cw_len > 0
+            && c == SQUARECLOSE_CHR
+            && self.fccxt.cxt as u8 != HTLINK_CHR
+            && self.state.is_paragraph != 0
+        {
+            return;
+        }
+        if cw_len == 0 { return; }
+
+        // Word boundary: stem the current word and rotate.
+        EnglishStemmer::stem(&mut self.state.stem_words[ci],
+                             self.block.blpos as u32);
+        // pWord = cWord (the just-stemmed slot); advance StemIndex
+        // and pick a fresh slot as cWord, then clear it.
+        let pi = ci;
+        self.state.p_word    = pi;
+        self.state.stem_index = (self.state.stem_index + 1) & 3;
+        let new_ci = self.state.stem_index as usize;
+        self.state.c_word    = new_ci;
+        self.state.stem_words[new_ci] = Word::new();
+
+        // Snapshot fields read from pWord.
+        let p_type = self.state.stem_words[pi].r#type;
+        let p_hash = self.state.stem_words[pi].hash;
+
+        if (p_type & eng::VERB) != 0 {
+            self.state.s_verb = p_hash;
+        }
+        // Inject Noun bit if the previous word was "the".
+        if self.state.last_art {
+            self.state.stem_words[pi].r#type |= eng::NOUN;
+        }
+        // Detect the "the " article pattern in the decoded-text buffer.
+        let buf1 = |i: u32| -> u8 {
+            let pos = self.state.cwpos.wrapping_sub(i);
+            self.state.cwbuf[(pos & 0xfff) as usize]
+        };
+        self.state.last_art = self.state.stem_words[pi].r#type == eng::ARTICLE
+            && buf1(5) == SPACE_CHR
+            && buf1(4) == b't'
+            && buf1(3) == b'h'
+            && buf1(2) == b'e';
+
+        // Use word0 when in math mode, else pWord hash.
+        let mut whash = if self.state.is_math {
+            self.state.word0
+        } else {
+            self.state.stem_words[pi].hash
+        };
+        self.state.last_wt = self.state.last_wt
+            .wrapping_mul(16)
+            .wrapping_add(get_wt(self.state.stem_words[pi].r#type));
+
+        // Number-following-Number: fold prior number sBytes/word.
+        if self.state.stem_words[pi].r#type == eng::NUMBER
+            && self.worcxt.types(1) == eng::NUMBER
+        {
+            let sb = self.worcxt.s_bytes(1);
+            whash = whash.wrapping_add(self.worcxt.word(1));
+            self.worcxt.remove();
+            self.worcxt.set((sb >> 8) as u8, 0);
+        }
+
+        // Main word context (every word).
+        self.worcxt.update(self.state.word0, self.state.c1,
+                            self.state.stem_words[pi].r#type, whash);
+        // Paragraph context — skip glue/grammatical words.
+        let glue_para = eng::CONJUNCTION | eng::ARTICLE | eng::MALE
+            | eng::FEMALE | eng::NUMBER | eng::CONJUNCTIVE_ADVERB;
+        if (self.state.stem_words[pi].r#type & glue_para) == 0
+            && self.brcxt.cxt as u8 != LESSTHAN_CHR
+        {
+            self.worcxt1.update(self.state.word0, self.state.c1,
+                                 self.state.stem_words[pi].r#type, whash);
+        }
+        // Stream context — typed words minus adposition/manner glue.
+        let glue_stream = glue_para
+            | eng::ADPOSITION | eng::ADVERB_OF_MANNER;
+        if (self.state.stem_words[pi].r#type & glue_stream) == 0
+            && self.brcxt.cxt as u8 != LESSTHAN_CHR
+            && self.state.stem_words[pi].r#type != 0
+        {
+            self.worcxt2.update(self.state.word0, self.state.c1,
+                                 self.state.stem_words[pi].r#type, whash);
+        }
     }
 
     pub fn reset_predictions(&mut self) { self.prediction_index = 0; }
@@ -4675,6 +5008,17 @@ impl Predictor {
     pub fn predict(&self) -> f32 {
         // Convert the integer pr (0..=4095) to a [0..1] probability.
         (self.state.pr as f32 + 0.5) / 4096.0
+    }
+
+    /// Inject the upstream `lstmpr` / `lstmex` cross-feed from the
+    /// LSTM byte mixer. `lstmpr` is the byte_mixer's discretised
+    /// bit-1 probability in `[1, 4095]` (1 + 4094 × p); `lstmex` is
+    /// the most-probable byte in the current binary-search range
+    /// (`[0, 255]`). Call between the orchestrator's byte_update
+    /// batch and the next `perceive`.
+    pub fn set_lstm_signals(&mut self, lstmpr: i32, lstmex: i32) {
+        self.state.lstmpr = lstmpr.clamp(1, 4095);
+        self.state.lstmex = lstmex.clamp(0, 255);
     }
 
     /// Per-bit training + prediction. Mirrors upstream's update1():
@@ -4688,7 +5032,8 @@ impl Predictor {
         self.block.c0 = self.block.c0 * 2 + bit;
 
         // Byte boundary?
-        if self.block.c0 >= 256 {
+        let crossed_byte = self.block.c0 >= 256;
+        if crossed_byte {
             self.block.c4 = (self.block.c4 << 8) + ((self.block.c0 & 0xff) as u32);
             self.block.c0 = 1;
             self.block.blpos += 1;
@@ -4726,12 +5071,633 @@ impl Predictor {
         }
         if self.state.pr >= 848 { self.state.failz = self.state.failz.wrapping_add(1); }
 
+        // Run all byte-boundary-only state advance + CM context feeds
+        // before the per-bit chain consumes them. Upstream gates this
+        // on `bpos == 0` inside `modelPrediction`; in our port the
+        // perceive flow is laid out in upstream-equivalent order.
+        if crossed_byte {
+            self.byte_boundary();
+        }
+
         // Per-bit prediction chain.
         let is_match = self.mix_byte_context_maps();
         let c0_b = ((self.block.c0 << (8 - self.block.bpos)) & 0xff) as u32;
         self.set_mixer_contexts(c0_b, is_match);
         let raw_pr = self.final_mixer_prediction();
         self.state.pr = self.apm_cascade(raw_pr, self.block.c0, bit);
+    }
+
+    /// Run all byte-boundary (`bpos == 0`) state advance + CM context
+    /// feeding. Mirrors the `if (bpos == 0)` branch of upstream's
+    /// `modelPrediction` (fxcmv1.cpp:3803-4644).
+    ///
+    /// SKELETON — wires the helpers we have. Several upstream
+    /// sub-blocks are still TODO and clearly marked below; their
+    /// absence biases predictions but does not break structural
+    /// correctness of the pipeline:
+    ///
+    /// * 3817-3827: text-tag end detection (isText flag)
+    /// * 3875-3924: letter-byte word/dictionary path (worcxt.Set,
+    ///              word0 update, codeword decode)
+    /// * 3925-3938: non-letter-byte word-end (procWord, deccode)
+    /// * 3954-3961, 3998-4013, 4018-4027: worcxt.Type-driven branches
+    /// * 4029-4044: text/nowiki/math/pre tag detection on buffer1
+    /// * 4119-4123, 4138-4141: list-to-paragraph rules
+    /// * 4131-4136: '&' + '!' → SPACE shortcut (nbsp)
+    /// * 4180-4194: NL-driven context resets + fc/paragraph flag
+    /// * 4197-4244: fccxt update logic
+    pub fn byte_boundary(&mut self) {
+        let c4 = self.block.c4;
+
+        // c1/c2/c3 advance + n2/3/4bState + stream2b/4b + buffer push
+        // + x4/t[] order-X (3803-3859, less the interleaved context
+        // updates which we run immediately after).
+        self.state.byte_boundary_step(c4, &mut self.buffer);
+
+        // [TODO 3817-3827] text-tag end detection (isText).
+
+        // colcxt.update — upstream passes `c4 & 0xffffff`.
+        self.colcxt.update(
+            self.state.c1,
+            c4 & 0x00ff_ffff,
+            self.block.blpos as u32,
+            self.state.is_pre,
+        );
+
+        // brcxt: only on non-letter (c1 < 'a'), plus the SPACE-after-
+        // LESSTHAN "math operator" special case.
+        if self.state.c1 < b'a' {
+            self.brcxt.update(self.state.c1 as u32);
+        }
+        if self.state.c1 == SPACE_CHR && self.state.c2 == LESSTHAN_CHR {
+            self.brcxt.update(GREATERTHAN_CHR as u32);
+        }
+
+        // qocxt update.
+        self.qocxt.update(self.state.c1 as u32);
+
+        // htcxt: cancel-tag fast-path + main 16-bit (c4 & 0xffff) feed.
+        if self.htcxt.cxt != 0 && self.state.c2 == LESSTHAN_CHR
+            && (self.state.c1 == SPACE_CHR
+                || self.state.c1 == b'!'
+                || self.state.c1 < 128)
+        {
+            self.htcxt.update((b'&' as u32) * 256 + (b'N' as u32));
+        }
+        self.htcxt.update(c4 & 0xffff);
+
+        // words/spaces/numbers shift (3871-3873).
+        self.state.shift_letter_classes();
+
+        // Letter / non-letter branch (3875-4196).
+        if self.state.is_word_letter() {
+            // Word start: configure worcxt with the "reChar" derived
+            // from c2/c3 and a few back-buffer bytes (3875-3890).
+            if self.state.word0 == 0 {
+                if self.state.is_math
+                    && self.state.c2 == b'/' && self.state.c3 == LESSTHAN_CHR
+                {
+                    self.state.is_math = false;
+                }
+                let mut re_char = self.state.c2;
+                if self.state.c2 == FIRSTUPPER_CHR
+                    || self.state.c2 == UPPER_CHR
+                {
+                    re_char = if self.state.c3 != APOSTROPHE_CHR {
+                        self.state.c3
+                    } else if self.buffer.buf(4) != APOSTROPHE_CHR {
+                        self.buffer.buf(4)
+                    } else if self.buffer.buf(5) != APOSTROPHE_CHR {
+                        self.buffer.buf(5)
+                    } else if self.buffer.buf(6) != APOSTROPHE_CHR {
+                        self.buffer.buf(6)
+                    } else {
+                        self.state.c3
+                    };
+                } else if self.state.c2 == b'/'
+                    && self.state.c3 == LESSTHAN_CHR
+                {
+                    re_char = self.state.c3;
+                }
+                let upper = if self.state.c2 == FIRSTUPPER_CHR { 1 } else { 0 };
+                self.worcxt.set(re_char, upper);
+                self.worcxt1.set(re_char, 0);
+            }
+
+            // words |= 1 + word0 hash advance (3892-3895).
+            self.state.words |= 1;
+            self.state.word0 = self.state.word0
+                .wrapping_mul(2104)
+                .wrapping_add(self.state.c1 as u32);
+            self.state.word00 = self.state.word0;
+            self.state.u8w = 0;
+
+            // linkword / senword (3896-3897).
+            if self.brcxt.cxt as u8 == SQUAREOPEN_CHR
+                && self.fccxt.cxt as u8 != HTLINK_CHR
+                && self.state.fc as u8 != HTML_CHR
+            {
+                self.state.link_word = self.state.link_word
+                    .wrapping_mul(2104)
+                    .wrapping_add(self.state.c1 as u32);
+            }
+            if self.state.is_paragraph != 0
+                && self.fccxt.cxt as u8 != HTLINK_CHR
+                && !self.colcxt.is_temp
+            {
+                self.state.sen_word = self.state.sen_word
+                    .wrapping_mul(2104)
+                    .wrapping_add(self.state.c1 as u32);
+            }
+
+            // qocxt cancellation rules (3900-3904).
+            let word3bit = self.state.words & 7;
+            let c2_apos = self.state.c2 == APOSTROPHE_CHR;
+            if (word3bit == 5 && c2_apos)
+                || (word3bit == 1 && self.state.c3 == SQUARECLOSE_CHR && c2_apos)
+                || (word3bit == 1 && (self.state.numbers & 4) != 0 && c2_apos)
+            {
+                self.qocxt.update(self.qocxt.cxt);
+            }
+
+            // Dictionary codeword decode (3906-3920).
+            if self.state.c1 > 127 {
+                self.state.dcw = self.state.dcw
+                    .wrapping_mul(256)
+                    .wrapping_add(self.state.c1 as u32);
+                self.state.dcwl += 1;
+                if self.block.blpos > 6 {
+                    let dcw2 = match self.state.dcwl {
+                        2 => (self.state.dcw / 256)
+                                + (self.state.dcw & 255) * 256,
+                        3 => ((self.state.dcw / 256) / 256)
+                                + (self.state.dcw & 0xff00)
+                                + (self.state.dcw & 255) * 256 * 256,
+                        _ => 0,
+                    };
+                    if let Some(dict) = self.dictionary.as_ref() {
+                        let i = dict.decode_codeword(dcw2);
+                        if i > 0 && i < dict.size_dict {
+                            self.state.dec_code = i;
+                        }
+                    }
+                }
+            } else if self.state.dcw != 0 {
+                self.proc_word();
+                if self.block.blpos < 448_131_719 {
+                    self.state.dec_code = self.state.last_cw;
+                }
+            }
+            // Decoded-text buffer write (3922-3924).
+            if self.state.c1 == 10 || self.state.c1 == 9
+                || (self.state.c1 > 31 && self.state.c1 < 128)
+            {
+                let swapped = char_swap(self.state.c1 as i32) as u8;
+                self.set_buf(swapped);
+            }
+        } else {
+            // Non-letter step (3925-3938): finalize pending codeword
+            // OR set the no-codeword fallback flag, then write the
+            // byte through to the decoded-text buffer.
+            if self.state.word0 != 0 {
+                self.proc_word();
+                if self.block.blpos < 448_131_719 {
+                    self.state.dec_code = self.state.last_cw;
+                }
+            } else {
+                self.state.dec_code = 0x10000
+                    | ((self.state.stream2b & 0xffff) as i32);
+            }
+            if self.state.c1 == 10 || self.state.c1 == 9
+                || (self.state.c1 > 31 && self.state.c1 < 128)
+            {
+                let swapped = char_swap(self.state.c1 as i32) as u8;
+                self.set_buf(swapped);
+            }
+
+            self.state.track_numbers();
+
+            // qocxt cancellation at non-letter step (3954-3961).
+            let word3bit = self.state.words & 7;
+            let c2_apos = self.state.c2 == APOSTROPHE_CHR;
+            if (word3bit == 4 && self.state.c1 == SPACE_CHR && c2_apos)
+                || (self.state.c1 == FIRSTUPPER_CHR
+                    && (self.state.numbers & 4) != 0 && c2_apos)
+                || (word3bit == 4 && self.state.c1 == FIRSTUPPER_CHR && c2_apos)
+                || (word3bit == 4 && (self.state.numbers & 1) != 0 && c2_apos)
+            {
+                self.qocxt.update(self.qocxt.cxt);
+            }
+
+            // word00 reset rule (3963).
+            if self.state.word00 != 0
+                && self.fccxt.cxt as u8 != SQUAREOPEN_CHR
+            {
+                self.state.word00 = 0;
+            }
+
+            if self.state.word0 != 0 {
+                self.state.cycle_word_pipeline(self.block.blpos as u32);
+                self.state.update_streams_for_word_type(
+                    &self.worcxt,
+                    self.state.is_paragraph != 0,
+                );
+                self.state.maybe_seed_first_word(self.fccxt.cxt as u8);
+
+                // Noun-after-Article carry-over (4001-4013).
+                if (self.worcxt.types(0) & eng::NOUN) != 0
+                    && (self.worcxt.types(2) & eng::ARTICLE) != 0
+                {
+                    self.state.stream3b_r = (self.state.stream3b_r << 6)
+                        .wrapping_add(1);
+                    self.state.stream3b   = (self.state.stream3b   << 6)
+                        .wrapping_add(1);
+                    let sb = self.worcxt.s_bytes(1);
+                    let w  = self.worcxt.word(1);
+                    let t  = self.worcxt.types(1);
+                    let ca = self.worcxt.capital_at(1);
+                    self.worcxt.remove();
+                    self.worcxt.remove();
+                    self.worcxt.set((sb >> 8) as u8, ca as i32);
+                    self.worcxt.update(w, self.state.c1, t, w);
+                }
+
+                self.state.rotate_stream_masks();
+            } else if self.state.c1 == VERTICALBAR_CHR && self.colcxt.is_temp {
+                // Template-mode VERTICALBAR (4018-4027).
+                let sb = self.worcxt.s_bytes(1);
+                let w  = self.worcxt.word(1);
+                let t  = self.worcxt.types(1);
+                let ca = self.worcxt.capital_at(1);
+                self.worcxt.remove();
+                self.worcxt.set((sb >> 8) as u8, ca as i32);
+                self.worcxt.update(w, self.state.c1, t, w);
+            }
+
+            // Tag detection on decoded-text buffer (4029-4044).
+            // Snapshot buffer1 reads + `so` so we can freely mutate
+            // state in the rule bodies below.
+            let cs_less = char_swap(LESSTHAN_CHR as i32) as u8;
+            let b2 = {
+                let pos = self.state.cwpos.wrapping_sub(2);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let b3 = {
+                let pos = self.state.cwpos.wrapping_sub(3);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let b4 = {
+                let pos = self.state.cwpos.wrapping_sub(4);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let b5 = {
+                let pos = self.state.cwpos.wrapping_sub(5);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let b6 = {
+                let pos = self.state.cwpos.wrapping_sub(6);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let b7 = {
+                let pos = self.state.cwpos.wrapping_sub(7);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let b8 = {
+                let pos = self.state.cwpos.wrapping_sub(8);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let b9 = {
+                let pos = self.state.cwpos.wrapping_sub(9);
+                self.state.cwbuf[(pos & 0xfff) as usize]
+            };
+            let _ = (b2, b3); // currently unused, kept for future
+            let so_text   = self.so_bytes() == b"text";
+            let so_nowiki = self.so_bytes() == b"nowiki";
+            let so_math   = self.so_bytes() == b"math";
+            let so_pre    = self.so_bytes() == b"pre";
+            let so_page   = self.so_bytes() == b"page";
+            let c1u = self.state.c1;
+            let c2u = self.state.c2;
+            let c3u = self.state.c3;
+
+            if b6 == cs_less && b5 == b't'
+                && !self.state.is_text && c1u == SPACE_CHR && so_text
+            {
+                self.state.is_text = true;
+                self.so_idx = 0;
+            }
+            if b8 == cs_less && !self.state.is_now_iki && so_nowiki {
+                self.state.is_now_iki = true;
+            } else if b9 == b'/' && c1u == GREATERTHAN_CHR
+                && self.state.is_now_iki && so_nowiki
+            {
+                self.state.is_now_iki = false;
+                self.state.is_pre     = false;
+                self.so_idx = 0;
+            }
+            if self.state.is_math
+                && ((c1u == SPACE_CHR
+                     && self.colcxt.lastfc(0) != COLON_CHR)
+                    || c1u == b',')
+                && c2u == GREATERTHAN_CHR && so_math
+            {
+                self.state.is_math = false;
+                self.so_idx = 0;
+            }
+            if self.state.is_math && c1u == b'/'
+                && c2u == LESSTHAN_CHR && c3u == GREATERTHAN_CHR
+                && b4 == b'h'
+            {
+                self.state.is_math = false;
+                self.so_idx = 0;
+            }
+            if !self.state.is_now_iki
+                && b6 == cs_less && b5 == b'm'
+                && !self.state.is_math
+                && c1u != b'.'
+                && b7 != b'&' && b8 != b'&' && so_math
+            {
+                self.state.is_math = true;
+            } else if b6 == b'/'
+                && (c1u == GREATERTHAN_CHR || c1u == b'&')
+                && self.state.is_math && so_math
+            {
+                self.state.is_math = false;
+                self.so_idx = 0;
+            }
+            if b5 == cs_less && c1u == GREATERTHAN_CHR
+                && b4 == b'p' && !self.state.is_pre && so_pre
+            {
+                self.state.is_pre = true;
+                self.so_idx = 0;
+            } else if b5 == b'/' && c1u == GREATERTHAN_CHR
+                && b4 == b'p' && so_pre
+            {
+                self.state.is_pre = false;
+                self.so_idx = 0;
+            }
+            if b6 == b'/' && c1u == GREATERTHAN_CHR
+                && b5 == b'p' && so_page
+            {
+                self.state.is_pre     = false;
+                self.state.is_math    = false;
+                self.state.is_now_iki = false;
+            }
+
+            self.state.stamp_word0_position();
+            self.state.word0 = 0;
+
+            // Paragraph / sentence-ending punctuation (4049-4141).
+            if self.state.link_word != 0 && self.state.c1 == COLON_CHR {
+                self.state.link_word = 0;
+            }
+            if self.state.c1 == b'-' && self.state.c2 == SPACE_CHR {
+                self.worcxt1.reset();
+                self.state.s_verb = 0;
+            }
+            match self.state.c1 {
+                SPACE_CHR => {
+                    self.state.spaces = self.state.spaces.wrapping_add(1);
+                }
+                LF_CHR => {
+                    let was_lf = self.state.line_break_lf();
+                    self.worcxt.reset();
+                    self.worcxt1.reset();
+                    if was_lf { self.state.is_now_iki = false; }
+                }
+                b'.' | b')' | QUESTION_CHR => {
+                    let is_dot = self.state.sentence_end_punct(c4);
+                    if is_dot {
+                        let fc_cxt  = self.fccxt.cxt as u8;
+                        let last_fc = self.colcxt.lastfc(0);
+                        let nl_char = self.colcxt.nl_char;
+                        if !(fc_cxt == SQUAREOPEN_CHR
+                             || fc_cxt == b'('
+                             || nl_char == WIKITABLE_CHR
+                             || last_fc == b'*')
+                        {
+                            self.worcxt.reset();
+                        }
+                        self.state.sen_word = 0;
+                    }
+                }
+                b',' => self.state.punct_comma(),
+                b'(' => self.state.punct_open_paren(),
+                SEMICOLON_CHR => self.worcxt.reset(),
+                COLON_CHR => self.state.punct_colon(c4),
+                CURLYCLOSE_CHR | CURLYOPENING_CHR => {
+                    self.state.punct_curly(c4);
+                }
+                SQUARECLOSE_CHR => self.state.punct_close_square(),
+                LESSTHAN_CHR => self.state.punct_less_than(),
+                EQUALS_CHR => self.state.punct_equals(),
+                _ => {
+                    if self.state.c2 == b'&' {
+                        // [TODO 4131-4136] nbsp shortcut: if c1=='!'
+                        // and c2=='&', also substitute c1 -> SPACE.
+                        self.state.punct_less_than();
+                    }
+                }
+            }
+
+            // [TODO 4119-4123] list-to-paragraph: c1=='-' &&
+            //   colcxt.lastfc()=='*' && brcxt.cxt!=SQUAREOPEN &&
+            //   !is_paragraph → set is_paragraph=1, fc=FIRSTUPPER.
+            // [TODO 4138-4141] list-to-paragraph variant 2:
+            //   colcxt.lastfc()=='*' && (c1==',' || c1==SPACE) &&
+            //   c2==SQUARECLOSE && !is_paragraph.
+        }
+
+        // x5 fold + serial/non-repeating stream rotation (4144-4163).
+        self.state.x5 = (self.state.x5 << 8).wrapping_add(c4 & 0xff);
+        self.state.update_streams_after_byte();
+
+        let brcontext = self.brcxt.cxt as u8;
+
+        // Column / first-char (4171-4179).
+        self.state.col = self.colcxt.collen(0, 0);
+        let col = self.state.col as u32;
+        let nl1 = self.state.nl1 as u32;
+        let mut above  = self.buffer.bufr(nl1.wrapping_add(col) as usize) as u32;
+        let mut above1 = self.buffer.bufr(
+            nl1.wrapping_add(col).wrapping_sub(1) as usize) as u32;
+        if self.colcxt.nl_char == WIKIHEADER_CHR {
+            above  = self.colcxt.colb(1, 0, 0) as u32;
+            above1 = self.colcxt.colb(1, 1, 0) as u32;
+        }
+
+        // NL-driven context resets + first-char init (4180-4194).
+        if self.colcxt.is_new_line() {
+            // Two empty lines → reset all sticky contexts.
+            let nl0 = self.colcxt.nlpos(0);
+            let nl1p = self.colcxt.nlpos(1);
+            if nl0.wrapping_add(2).wrapping_sub(nl1p) < 4 {
+                self.fccxt.reset();
+                self.brcxt.reset();
+                self.qocxt.reset();
+                self.htcxt.reset();
+            }
+            let last_fc = self.colcxt.lastfc(0);
+            self.state.fc = last_fc as i32;
+            // Filtered wiki: '>' first char → fccxt reset.
+            if last_fc == WIKIHEADER_CHR { self.fccxt.reset(); }
+            self.state.is_paragraph = if last_fc == FIRSTUPPER_CHR { 1 } else { 0 };
+            self.fccxt.update(last_fc as u32);
+        }
+
+        // fccxt update for the current char (4197-4244).
+        let c1u = self.state.c1;
+        let c2u = self.state.c2;
+        let c3u = self.state.c3;
+        if col > 2 && c1u > FIRSTUPPER_CHR && !self.state.is_math {
+            // Drain any pending VERTICALBAR before close-bracket / curly.
+            if self.fccxt.cxt as u8 == VERTICALBAR_CHR
+                && (c1u == SQUARECLOSE_CHR || c1u == CURLYCLOSE_CHR)
+            {
+                while self.fccxt.cxt as u8 == VERTICALBAR_CHR {
+                    self.fccxt.update(LF_CHR as u32);
+                }
+            }
+            // Drain colon / html-link on close-square.
+            if (self.fccxt.cxt as u8 == COLON_CHR
+                || self.fccxt.cxt as u8 == HTLINK_CHR)
+                && c1u == SQUARECLOSE_CHR
+            {
+                while self.fccxt.cxt as u8 == COLON_CHR
+                    || self.fccxt.cxt as u8 == HTLINK_CHR
+                {
+                    self.fccxt.update(LF_CHR as u32);
+                }
+            }
+            if c1u < 128 { self.fccxt.update(c1u as u32); }
+        }
+
+        // colonstr capture + category/wikipedia/image rules
+        // (4211-4219).
+        if c1u == COLON_CHR && (self.state.words & 2) == 2 {
+            self.colonstr_idx = self.so_idx;
+        }
+        if c1u == SPACE_CHR
+            && self.fccxt.cxt as u8 == COLON_CHR
+            && self.colcxt.lastfc(0) != COLON_CHR
+            && self.colcxt.nl_char != WIKITABLE_CHR
+        {
+            if self.colonstr_bytes() != b"image" {
+                while self.fccxt.cxt as u8 == COLON_CHR {
+                    self.fccxt.update(LF_CHR as u32);
+                }
+            }
+        }
+        if c1u == COLON_CHR {
+            let cs = self.colonstr_bytes();
+            if cs == b"category" || cs == b"wikipedia" {
+                self.fccxt.update(LF_CHR as u32);
+                self.worcxt.remove();
+            }
+        }
+
+        // SPACE-after-LESSTHAN math operator (4221).
+        if c1u == SPACE_CHR && c2u == LESSTHAN_CHR {
+            self.fccxt.update(GREATERTHAN_CHR as u32);
+        }
+        // COLON + // → http link (4223).
+        if self.fccxt.cxt as u8 == COLON_CHR && c2u == b'/' && c1u == b'/' {
+            self.fccxt.update(LF_CHR as u32);
+            self.fccxt.update(HTLINK_CHR as u32);
+        }
+        // Wiki link at start of line (4225-4235).
+        if self.colcxt.lastfc(0) == SQUAREOPEN_CHR
+            && c1u == SPACE_CHR
+            && self.state.is_paragraph == 0
+        {
+            if c2u == SQUARECLOSE_CHR || c3u == SQUARECLOSE_CHR {
+                self.state.fc = FIRSTUPPER_CHR as i32;
+                self.state.is_paragraph = 1;
+                self.fccxt.reset();
+                self.fccxt.update(FIRSTUPPER_CHR as u32);
+            }
+        }
+        // SPACE-as-first-char follow-up (4237-4244).
+        if self.state.fc as u8 == SPACE_CHR && c1u != SPACE_CHR {
+            self.state.fc = c1u.min(TEXTDATA_CHR) as i32;
+            self.state.is_paragraph =
+                if self.state.fc as u8 == FIRSTUPPER_CHR { 1 } else { 0 };
+            self.fccxt.update(self.state.fc as u32);
+        }
+
+        // BrFcIdx + FcIdx (4167-4169 + 4246-4247) — uses POST-update
+        // fccxt context to fold in the first-char fallback.
+        self.state.compute_fc_indices(
+            brcontext, self.brcxt.context != 0,
+            (self.qocxt.context >> 8) as u8, self.qocxt.context != 0,
+            self.fccxt.cxt as u8, self.fccxt.context != 0,
+        );
+
+        // Post-fccxt fc fixups (4253-4272).
+        if self.state.fc as u8 == b'*' && c1u != SPACE_CHR {
+            self.state.fc = c1u.min(TEXTDATA_CHR) as i32;
+        }
+        if self.state.fc as u8 == b'&' && c1u == LESSTHAN_CHR {
+            self.state.fc = HTML_CHR as i32;
+        }
+        if c2u == GREATERTHAN_CHR
+            && self.state.fc as u8 == LESSTHAN_CHR
+            && c1u == APOSTROPHE_CHR
+        {
+            self.state.fc = APOSTROPHE_CHR as i32;
+        }
+        if (self.colcxt.lastfc(0) == APOSTROPHE_CHR
+            || (self.state.fc as u8 == APOSTROPHE_CHR
+                && self.colcxt.lastfc(0) != b'*'))
+            && c1u == SPACE_CHR
+        {
+            if c2u == APOSTROPHE_CHR || c3u == APOSTROPHE_CHR {
+                self.state.fc = FIRSTUPPER_CHR as i32;
+                self.state.is_paragraph = 1;
+                self.fccxt.reset();
+                self.fccxt.update(self.state.fc as u32);
+            }
+        }
+        // http-link 'J//' detection (J = COLON_CHR = 0x4a).
+        if self.state.fc as u8 != FIRSTUPPER_CHR
+            && (c4 & 0xffffff) == 0x4a2f2f
+        {
+            self.state.fc = HTLINK_CHR as i32;
+        }
+
+        // worcxt.removeWordsL bracket / link / template prunes
+        // (4280-4287). These use sBytes pairs to drop words enclosed
+        // in (), [|...], <:..., <>... etc.
+        self.worcxt .remove_words_l(8, b'(', b')', true);
+        self.worcxt1.remove_words_l(8, b'(', b')', true);
+        self.worcxt .remove_words_l(8, SQUAREOPEN_CHR, VERTICALBAR_CHR, true);
+        self.worcxt1.remove_words_l(8, SQUAREOPEN_CHR, VERTICALBAR_CHR, true);
+        self.worcxt .remove_words_l(8, LESSTHAN_CHR, COLON_CHR, true);
+        if self.colcxt.is_temp {
+            self.worcxt.remove_words_r(10, EQUALS_CHR, VERTICALBAR_CHR, true);
+        }
+        self.worcxt .remove_words_l(8, LESSTHAN_CHR, GREATERTHAN_CHR, true);
+        self.worcxt1.remove_words_l(8, LESSTHAN_CHR, GREATERTHAN_CHR, true);
+
+        // Indirect histories (4290-4299).
+        self.state.update_indirect_histories(c4, brcontext);
+        // [TODO 4301-4304] update_word0_position — no-op while word
+        //                  path is stubbed (word0 stays 0).
+
+        // upstream 4306-4308 (`ind3[]` self-loop) intentionally not
+        // ported: a 64 MiB U16 table whose only writers/readers are
+        // the same three lines. `cxtind3` / `context1_ind3` aren't
+        // consumed by any other model in upstream cmix (verified by
+        // grep across plugins/cmix/upstream/), so the table is dead
+        // state. Leaving `state.cxt_ind3` / `state.context1_ind3`
+        // pinned at 0 produces no observable divergence.
+
+        // UTF-8 byte tracking (4310-4321).
+        self.state.track_utf8_byte();
+
+        // Feed all per-byte-boundary CM context inputs.
+        let h = self.state.word0.wrapping_mul(271);
+        self.feed_byte_context_maps(h, above, above1, c4);
     }
 }
 
@@ -5277,13 +6243,12 @@ impl Predictor {
             (s.is_paragraph as u32).wrapping_add(2 * (s.stream3b_r & 0x3f)),
         );
 
-        // Snapshot the few state fields the remaining writes touch,
-        // then drop the immutable borrow so we can mutate `self.state`.
+        // Snapshot the few state fields the remaining writes touch.
+        // The immutable borrow `s` ends naturally after this block, so
+        // `&mut self.state` below is sound.
         let br_fc_idx_snap  = s.br_fc_idx;
         let stream3b_r_snap = s.stream3b_r;
         let x5_snap         = s.x5;
-        // (`s` is dropped here implicitly by going out of scope below.)
-        drop(s);
 
         // wshift handler / sentence-end word-pipeline cycle
         // (fxcmv1.cpp:4564-4568).
@@ -5609,11 +6574,12 @@ impl Predictor {
                 | if is_match != 0 { 128 } else { 0 }) as usize;
         }
 
-        // Mixer 9 — bpos × fails low2 cross. Upstream additionally
-        // folds `lstmex` (LSTM auxiliary signal); without that
-        // available yet, we leave the slot at 0.
+        // Mixer 9 — bpos × fails low2 cross + lstmex (LSTM most-
+        // probable byte). The orchestrator pushes the latest byte_mixer
+        // ex into state.lstmex via `set_lstm_signals` each bit.
         self.mixers[9].cxt = ((bpos << 8) * 4
-            + (s.fails & 3) * 256) as usize;
+            + (s.fails & 3) * 256
+            + (s.lstmex as u32 & 0xff)) as usize;
 
         // Update state.ord_x with the post-mixer-4 adjustment so the
         // upstream "ordX = ordX-1; ... if (isMatch) ordX++;" carries
@@ -5718,11 +6684,16 @@ impl Predictor {
     ///
     /// Wired BEFORE this is called: `mx_inputs1` populated by
     /// `mix_byte_context_maps`, mixer contexts assigned by
-    /// `set_mixer_contexts`. Upstream also pushes the LSTM byte
-    /// model's stretched prediction into `mx_inputs2`; that signal
-    /// isn't ported yet so we substitute zero (a no-op for the
-    /// final logit sum).
+    /// `set_mixer_contexts`. The orchestrator pushes `lstmpr`
+    /// (byte_mixer discretised bit-1 probability, 0..=4095) into
+    /// `state.lstmpr` each bit before this runs; we add its stretch
+    /// to mx_inputs1 (matching upstream fxcmv1.cpp:4743) and a half-
+    /// scaled stretch into mx_inputs2 (line 4754).
     pub fn final_mixer_prediction(&mut self) -> i32 {
+        // Push stretch(lstmpr) — upstream's first LSTM input (line 4743).
+        let stretched = stretch(&self.strt, self.state.lstmpr) as i16;
+        self.block.mx_inputs1.add(stretched.clamp(-2047, 2047));
+
         // Connect the per-mixer input vector. Upstream's setTxWx
         // wires the first 10 mixers to mxInputs1.n; mixers 10, 11
         // wire to mxInputs2.n. Our `set_inputs` copies the slice in.
@@ -5731,8 +6702,6 @@ impl Predictor {
             self.mixers[i].set_inputs(&inputs1);
         }
 
-        // Reset mxInputs2 and push the LSTM-stretched prior (we're
-        // missing that signal, push 0 as the placeholder).
         self.block.mx_inputs2.reset();
         self.block.mx_inputs2.add(0);
         // Push mxA[0..=9].p1() into mxInputs2.
@@ -5740,8 +6709,8 @@ impl Predictor {
             let p = self.mixers[i].p1(&self.sqt) as i16;
             self.block.mx_inputs2.add(p.clamp(-2047, 2047));
         }
-        // Upstream also adds `stretch(lstmpr) / 2`; substitute 0.
-        self.block.mx_inputs2.add(0);
+        // Upstream's stretch(lstmpr) / 2 — line 4754.
+        self.block.mx_inputs2.add((stretched / 2).clamp(-2047, 2047));
 
         // Wire mixers 10 and 11 to mx_inputs2.
         let inputs2 = self.block.mx_inputs2.n[..self.block.mx_inputs2.ncount].to_vec();
@@ -5818,6 +6787,41 @@ mod tests {
         assert_eq!(b.mx_inputs2.capacity, 32);
     }
 
+    #[test]
+    fn dictionary_empty_decode_returns_zero() {
+        let d = Dictionary::empty();
+        assert_eq!(d.size_dict, 0);
+        assert_eq!(d.decode_codeword(0x80), 0);
+        assert_eq!(d.decode_codeword(0xff_ff_ff), 0);
+    }
+
+    #[test]
+    fn dictionary_loads_lowercase_words_separated_by_any_nonletter() {
+        // Upstream's decodeWord rejects j==0, so words[0] is an
+        // unaddressable sentinel — usable codewords start at index 1.
+        let data = b"alpha\nbeta\tgamma\r\ndelta epsilon";
+        let d = Dictionary::load_from_bytes(data);
+        assert_eq!(d.size_dict, 5);
+        assert_eq!(d.word(0), None);
+        assert_eq!(d.word(1), Some(b"beta".as_ref()));
+        assert_eq!(d.word(2), Some(b"gamma".as_ref()));
+        assert_eq!(d.word(4), Some(b"epsilon".as_ref()));
+        assert_eq!(d.word(5), None);
+    }
+
+    #[test]
+    fn dictionary_decode_single_byte_codeword_matches_upstream_formula() {
+        let d = Dictionary::load_from_bytes(b"alpha\nbeta\ngamma\ndelta\n");
+        // codeword2sym[0x80] = 0  → s0 < dict1size (80) → returns 0.
+        // decodeWord then rejects j==0 — represented as `word(0) is None`.
+        assert_eq!(d.decode_codeword(0x80), 0);
+        // codeword2sym[0x81] = 1 → returns 1 → "beta".
+        assert_eq!(d.decode_codeword(0x81), 1);
+        assert_eq!(d.word(d.decode_codeword(0x81)), Some(b"beta".as_ref()));
+        // codeword2sym[0x83] = 3 → returns 3 → "delta".
+        assert_eq!(d.word(d.decode_codeword(0x83)), Some(b"delta".as_ref()));
+    }
+
     /// `Predictor::new()` allocates several GB of bucket arrays per
     /// upstream's PredictorInit. Run only with
     /// `--ignored --test-threads=1` to avoid OOM-killing the host.
@@ -5829,7 +6833,6 @@ mod tests {
         let pr = p.predict();
         assert!((pr - 0.5).abs() < 0.001,
             "expected initial predict ≈ 0.5, got {}", pr);
-        let _ = E; // silence unused
     }
 
     #[test]
@@ -5847,6 +6850,83 @@ mod tests {
         // After 8 bits we should have advanced into a fresh byte.
         // c0 starts at 1 and rolls back to 1 after 8 bits.
         assert_eq!(p.block.c0, 1);
+    }
+
+    /// Feed a multi-byte stream including a newline and a couple of
+    /// punctuation chars; verifies the fccxt update path + worcxt
+    /// prunes don't panic, `state.pos` matches the byte count, and
+    /// state.c1 ends on the last byte.
+    #[test]
+    #[ignore = "allocates several GB; run with --ignored --test-threads=1"]
+    fn perceive_multi_byte_text_runs_through_fccxt_path() {
+        let mut p = Predictor::new();
+        let stream = b"hi.\n[foo|bar]<a:b>";
+        for &byte in stream {
+            for i in (0..8).rev() {
+                let bit = ((byte >> i) & 1) as i32;
+                p.perceive(bit);
+            }
+        }
+        assert_eq!(p.state.pos, stream.len() as u32);
+        assert_eq!(p.state.c1, *stream.last().unwrap());
+        assert_eq!(p.block.blpos as usize, stream.len());
+        let pr = p.predict();
+        assert!(pr >= 0.0 && pr <= 1.0, "predict() out of range: {}", pr);
+    }
+
+    /// Feed `"abc"` through perceive — letter bytes must advance
+    /// word0 via the upstream `word0*2104 + c1` recurrence, write
+    /// charSwap'd text into cwbuf, and grow the active stemmer word.
+    /// Closes the gap where the letter-byte branch was a stub.
+    #[test]
+    #[ignore = "allocates several GB; run with --ignored --test-threads=1"]
+    fn perceive_letter_run_advances_word0_and_stemmer() {
+        let mut p = Predictor::new();
+        for &byte in b"abc" {
+            for i in (0..8).rev() {
+                p.perceive(((byte >> i) & 1) as i32);
+            }
+        }
+        // word0 should equal ((0*2104+'a')*2104+'b')*2104+'c'
+        let expected = (((b'a' as u32).wrapping_mul(2104))
+            .wrapping_add(b'b' as u32))
+            .wrapping_mul(2104)
+            .wrapping_add(b'c' as u32);
+        assert_eq!(p.state.word0, expected,
+            "word0 must follow upstream's 2104-multiplier recurrence");
+        assert_eq!(p.state.pos, 3);
+        // cwbuf last three positions should hold the charSwap'd bytes.
+        let pos = p.state.cwpos;
+        assert_eq!(p.state.cwbuf[(pos.wrapping_sub(1) & 0xfff) as usize],
+                   char_swap(b'c' as i32) as u8);
+        // stem_words[c_word] should have grown — letters a/b/c
+        // accumulated, no terminator yet so no stemming.
+        let active = p.state.c_word;
+        assert!(p.state.stem_words[active].len() >= 3);
+    }
+
+    /// MSB-first bit-encoding of a byte: 8 perceive() calls must
+    /// commit that byte into `state.c1` and push it into the buffer.
+    /// Regression test for the prior gap where perceive() advanced
+    /// `block.c0/c4` but never invoked `byte_boundary`, leaving the
+    /// state advance + CM context feed dead.
+    #[test]
+    #[ignore = "allocates several GB; run with --ignored --test-threads=1"]
+    fn perceive_byte_boundary_advances_state_c1() {
+        let mut p = Predictor::new();
+        let target: u8 = b'A'; // 0x41
+        // Feed bits MSB-first so c0 = 1 + bit pattern after 8 calls.
+        for i in (0..8).rev() {
+            let bit = ((target >> i) & 1) as i32;
+            p.perceive(bit);
+        }
+        assert_eq!(p.block.c0, 1, "c0 must roll back after byte");
+        assert_eq!(p.state.c1, target,
+            "byte_boundary must commit target byte into state.c1");
+        assert_eq!(p.state.pos, 1, "pos must advance by one byte");
+        assert_eq!(p.block.blpos, 1, "blpos must advance by one byte");
+        assert_eq!(p.block.c4 & 0xff, target as u32,
+            "c4 low byte must equal target");
     }
 
     #[test]

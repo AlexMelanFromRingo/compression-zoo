@@ -8,3 +8,7 @@ publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[[bin]]
+name = "cmix-rs"
+path = "src/bin/cmix.rs"

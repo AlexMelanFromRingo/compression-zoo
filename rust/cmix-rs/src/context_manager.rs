@@ -19,6 +19,74 @@
 
 #![allow(dead_code)]
 
+use crate::contexts::{
+    BitContext, BracketContext, CombinedContext, Context, ContextHash,
+    IndirectHash, Interval, IntervalHash, Sparse,
+};
+
+/// Where a `u64` context value comes from when driving a sub-model
+/// or a mixer's context-key. Mirrors the `const u64&` references each
+/// upstream model holds to its manager binding.
+#[derive(Clone, Copy, Debug)]
+pub enum Src {
+    BitContext,
+    LongBitContext,
+    Zero,
+    Wrt,
+    LongestMatch,
+    LineBreak,
+    Auxiliary,
+    RecentByte(usize),
+    Word(usize),
+    Ctx(usize),
+    BitCtx(usize),
+}
+
+/// A byte-level Context node owned by the manager. Each variant
+/// records the manager source whose value feeds its `update(...)`
+/// at byte boundary.
+pub enum CtxNode {
+    ContextHash { c: ContextHash, byte_src: Src },
+    Interval { c: Interval, byte_src: Src },
+    IntervalHash { c: IntervalHash, byte_src: Src },
+    IndirectHash { c: IndirectHash, byte_src: Src },
+    Sparse { c: Sparse },
+    Bracket { c: BracketContext, byte_src: Src },
+    Combined { c: CombinedContext, a: Src, b: Src },
+}
+
+impl CtxNode {
+    pub fn context(&self) -> u64 {
+        match self {
+            CtxNode::ContextHash { c, .. } => c.context(),
+            CtxNode::Interval { c, .. } => c.context(),
+            CtxNode::IntervalHash { c, .. } => c.context(),
+            CtxNode::IndirectHash { c, .. } => c.context(),
+            CtxNode::Sparse { c } => c.context(),
+            CtxNode::Bracket { c, .. } => c.context(),
+            CtxNode::Combined { c, .. } => c.context(),
+        }
+    }
+    pub fn size(&self) -> u64 {
+        match self {
+            CtxNode::ContextHash { c, .. } => c.size(),
+            CtxNode::Interval { c, .. } => c.size(),
+            CtxNode::IntervalHash { c, .. } => c.size(),
+            CtxNode::IndirectHash { c, .. } => c.size(),
+            CtxNode::Sparse { c } => c.size(),
+            CtxNode::Bracket { c, .. } => c.size(),
+            CtxNode::Combined { c, .. } => c.size(),
+        }
+    }
+}
+
+/// A `BitContext` + the source for its `byte_context` argument.
+/// `update` fires every bit.
+pub struct BitCtxNode {
+    pub c: BitContext,
+    pub byte_src: Src,
+}
+
 pub struct ContextManager {
     /// Bit-shift register for the byte being decoded (1..=255 mid-
     /// byte, drops to its low 8 bits at byte boundaries).
@@ -47,6 +115,12 @@ pub struct ContextManager {
     pub words: [u64; 8],
     /// Recent-byte ring buffer (8 entries, newest first).
     pub recent_bytes: [u64; 8],
+
+    /// Byte-level Context collection, populated by `add_context`.
+    /// Each entry's `update` is called once at every byte boundary.
+    pub contexts: Vec<CtxNode>,
+    /// Bit-level `BitContext` collection. `update` fires every bit.
+    pub bit_contexts: Vec<BitCtxNode>,
 }
 
 impl ContextManager {
@@ -69,8 +143,139 @@ impl ContextManager {
             shared_map: vec![0u8; shared_map_size],
             words: [0u64; 8],
             recent_bytes: [0u64; 8],
+            contexts: Vec::new(),
+            bit_contexts: Vec::new(),
         }
     }
+
+    /// Register a byte-level Context. Returns its index for later
+    /// `Src::Ctx` references.
+    pub fn add_context(&mut self, node: CtxNode) -> usize {
+        let idx = self.contexts.len();
+        self.contexts.push(node);
+        idx
+    }
+
+    /// Register a bit-level `BitContext`. Returns its index for
+    /// `Src::BitCtx` references.
+    pub fn add_bit_context(&mut self, node: BitCtxNode) -> usize {
+        let idx = self.bit_contexts.len();
+        self.bit_contexts.push(node);
+        idx
+    }
+
+    /// Resolve a [`Src`] to its current `u64` value.
+    pub fn resolve(&self, src: Src) -> u64 {
+        match src {
+            Src::BitContext => self.bit_context as u64,
+            Src::LongBitContext => self.long_bit_context,
+            Src::Zero => 0,
+            Src::Wrt => self.wrt_context,
+            Src::LongestMatch => self.longest_match,
+            Src::LineBreak => self.line_break,
+            Src::Auxiliary => self.auxiliary_context,
+            Src::RecentByte(i) => self.recent_bytes[i],
+            Src::Word(i) => self.words[i],
+            Src::Ctx(i) => self.contexts[i].context(),
+            Src::BitCtx(i) => self.bit_contexts[i].c.context(),
+        }
+    }
+
+    /// Resolve the `Size` of a context source (used by Direct/Match/
+    /// Indirect/Bracket model constructors that take a context size).
+    pub fn ctx_size(&self, src: Src) -> u64 {
+        match src {
+            Src::Ctx(i) => self.contexts[i].size(),
+            Src::BitCtx(i) => self.bit_contexts[i].c.size(),
+            _ => 0,
+        }
+    }
+
+    /// Drive every registered Context for the current bit (byte-level
+    /// contexts at boundary, bit-level every bit). Call this AFTER
+    /// `update_bit`, since the byte-level contexts read the just-
+    /// completed byte from `bit_context`.
+    pub fn update_contexts_owned(&mut self, at_byte_boundary: bool) {
+        if at_byte_boundary {
+            let byte = self.bit_context as u64;
+            // Snapshot what each ContextNode needs, then update.
+            // We can't take a &CtxNode and then mutate self.contexts,
+            // so we drain via index loop.
+            for i in 0..self.contexts.len() {
+                // Resolve `Src` against the *current* state.
+                // (Each context reads only `Src`-based inputs that
+                // are independent of self.contexts mutation.)
+                let (kind_input, sparse_words) = self.context_inputs(i);
+                let node = &mut self.contexts[i];
+                match node {
+                    CtxNode::ContextHash { c, .. } =>
+                        c.update(kind_input),
+                    CtxNode::Interval { c, .. } =>
+                        c.update((kind_input & 0xff) as usize),
+                    CtxNode::IntervalHash { c, .. } =>
+                        c.update((kind_input & 0xff) as usize),
+                    CtxNode::IndirectHash { c, .. } =>
+                        c.update(kind_input),
+                    CtxNode::Bracket { c, .. } =>
+                        c.update((kind_input & 0xffff_ffff) as u32),
+                    CtxNode::Combined { c, a, b } => {
+                        // `kind_input` already resolves to `a`; we
+                        // need `b` separately.
+                        let av = match a { _ => kind_input };
+                        let _ = av; // silence
+                        // Re-resolve both cleanly here.
+                        let av = resolve_src_static(*a, byte,
+                            &self.recent_bytes, &self.words);
+                        let bv = resolve_src_static(*b, byte,
+                            &self.recent_bytes, &self.words);
+                        c.update(av, bv);
+                    }
+                    CtxNode::Sparse { c } => c.update(&sparse_words),
+                }
+            }
+        }
+        // Bit-level contexts every bit.
+        let long_bc = self.long_bit_context;
+        for i in 0..self.bit_contexts.len() {
+            let byte_ctx = self.resolve(self.bit_contexts[i].byte_src);
+            self.bit_contexts[i].c.update(long_bc, byte_ctx);
+        }
+    }
+
+    fn context_inputs(&self, i: usize) -> (u64, [u64; 8]) {
+        let node = &self.contexts[i];
+        let byte_src = match node {
+            CtxNode::ContextHash { byte_src, .. } => *byte_src,
+            CtxNode::Interval { byte_src, .. } => *byte_src,
+            CtxNode::IntervalHash { byte_src, .. } => *byte_src,
+            CtxNode::IndirectHash { byte_src, .. } => *byte_src,
+            CtxNode::Bracket { byte_src, .. } => *byte_src,
+            CtxNode::Combined { a, .. } => *a,
+            CtxNode::Sparse { .. } => Src::Zero,
+        };
+        (self.resolve(byte_src), self.words)
+    }
+}
+
+/// Standalone resolver used inside the borrow-restricted update
+/// loop (we can't call `self.resolve` while `self.contexts` is
+/// mutably borrowed).
+fn resolve_src_static(
+    src: Src,
+    byte_context: u64,
+    recent_bytes: &[u64; 8],
+    words: &[u64; 8],
+) -> u64 {
+    match src {
+        Src::BitContext | Src::LongBitContext => byte_context,
+        Src::Zero | Src::Wrt | Src::LongestMatch | Src::LineBreak
+        | Src::Auxiliary | Src::Ctx(_) | Src::BitCtx(_) => 0,
+        Src::RecentByte(i) => recent_bytes[i],
+        Src::Word(i) => words[i],
+    }
+}
+
+impl ContextManager {
 
     /// Append the just-completed byte to the history ring buffer.
     pub fn update_history(&mut self) {

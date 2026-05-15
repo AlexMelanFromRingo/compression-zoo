@@ -6,11 +6,14 @@
 //! Submodules:
 //!   * [`ppmd`]    — `models/ppmd.{h,cpp}` (mod_ppmd_v2).
 //!   * [`fxcmv1`]  — `models/fxcmv1.{h,cpp}` (Kaido Orav's PAQ8-style mixer).
+//!   * [`paq8`]    — `models/paq8.{h,cpp}` (Mahoney's PAQ8 sub-models;
+//!                    currently a stub).
 
 #![allow(dead_code)]
 
 pub mod ppmd;
 pub mod fxcmv1;
+pub mod paq8;
 
 use crate::state::State;
 
@@ -58,6 +61,9 @@ impl Direct {
         self.output[0] = p;
         p
     }
+    /// Number of allocated rows. Indexed by `byte_context % capacity()`.
+    pub fn capacity(&self) -> usize { self.predictions.len() }
+
     /// SGD-style update of the cell at `(byte_context, bit_context)`.
     pub fn perceive(&mut self, bit: i32, byte_context: usize, bit_context: usize) {
         let mut divisor = self.divisor;
@@ -202,8 +208,15 @@ impl<S: State> Indirect<S> {
 
     pub fn byte_update(&mut self, byte_context: u64, map_len: usize) {
         let modulus = map_len.saturating_sub(257).max(1);
-        self.map_index = ((257 * byte_context as usize) + self.map_offset) % modulus;
+        // Upstream uses C++ unsigned overflow semantics (wrap-around);
+        // mirror that to keep debug builds from panicking.
+        self.map_index = (257usize.wrapping_mul(byte_context as usize)
+            .wrapping_add(self.map_offset)) % modulus;
     }
+}
+
+impl<S: State> Model for Indirect<S> {
+    fn outputs(&self) -> &[f32] { &self.output }
 }
 
 // ---------------- Bracket ---------------------------------------------
@@ -502,6 +515,10 @@ impl Match {
         let match_context = (self.match_length / 32) as u64;
         if match_context > self.longest_match { self.longest_match = match_context; }
     }
+}
+
+impl Model for Match {
+    fn outputs(&self) -> &[f32] { &self.output }
 }
 
 #[cfg(test)]

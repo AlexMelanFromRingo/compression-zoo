@@ -26,7 +26,6 @@
 
 #![allow(dead_code)]
 
-use crate::models::ByteModel;
 
 // ====================================================================
 // Constants — match upstream `models/ppmd.cpp`.
@@ -413,7 +412,7 @@ impl Ppmd {
             - self.tables.indx2units[new_indx as usize] as u32;
         let mut p = pv + u2b(self.tables.indx2units[new_indx as usize] as u32);
         let mut diff = u_diff;
-        let mut i = self.tables.units2indx[(diff - 1) as usize] as u32;
+        let i = self.tables.units2indx[(diff - 1) as usize] as u32;
         if self.tables.indx2units[i as usize] as u32 != diff {
             let k = self.tables.indx2units[(i - 1) as usize] as u32;
             self.insert_into_blist(p, (i - 1) as usize, k);

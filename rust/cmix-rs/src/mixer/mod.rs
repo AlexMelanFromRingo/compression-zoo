@@ -51,25 +51,27 @@ impl ContextData {
 }
 
 /// Stretched-logit inputs for the mixer.
-pub struct MixerInput<'s> {
+pub struct MixerInput {
     inputs: Vec<f32>,
     extra_inputs: Vec<f32>,
-    sigmoid: &'s Sigmoid,
+    sigmoid: Sigmoid,
     min: f32,
     max: f32,
     stretched_min: f32,
     stretched_max: f32,
 }
 
-impl<'s> MixerInput<'s> {
-    pub fn new(sigmoid: &'s Sigmoid, eps: f32) -> Self {
+impl MixerInput {
+    pub fn new(sigmoid: Sigmoid, eps: f32) -> Self {
+        let stretched_min = sigmoid.logit(0.0);
+        let stretched_max = sigmoid.logit(1.0);
         Self {
             inputs: vec![0.5],
             extra_inputs: Vec::new(),
             min: eps,
             max: 1.0 - eps,
-            stretched_min: sigmoid.logit(0.0),
-            stretched_max: sigmoid.logit(1.0),
+            stretched_min,
+            stretched_max,
             sigmoid,
         }
     }
@@ -211,7 +213,7 @@ mod tests {
     #[test]
     fn mixer_input_clamping() {
         let s = Sigmoid::new(4096);
-        let mut mi = MixerInput::new(&s, 0.001);
+        let mut mi = MixerInput::new(s, 0.001);
         mi.set_num_models(3);
         mi.set_input(0, 0.5);
         // Below `min_` clamps to `min_` then logit; just verify no panic.
