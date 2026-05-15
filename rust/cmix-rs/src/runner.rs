@@ -177,6 +177,17 @@ const VOCAB_HEADER_LEN: usize = 32;
 pub fn encode_bytes_full<W: Write>(
     bytes: &[u8], output: &mut W, config: Config,
 ) -> IoResult<u64> {
+    encode_bytes_full_pretrained(bytes, output, config, &[])
+}
+
+/// Like [`encode_bytes_full`] but pretrains the predictor's bit-level
+/// model bank on `pretrain` before encoding (mirrors upstream
+/// `preprocessor::Pretrain` which warms the predictor on a dictionary
+/// file). The decoder must call [`decode_full_pretrained`] with the
+/// same pretrain buffer to reach an identical predictor state.
+pub fn encode_bytes_full_pretrained<W: Write>(
+    bytes: &[u8], output: &mut W, config: Config, pretrain: &[u8],
+) -> IoResult<u64> {
     let length = bytes.len() as u64;
     let mut hdr = [0u8; HEADER_LEN];
     for i in 0..HEADER_LEN {
@@ -188,8 +199,15 @@ pub fn encode_bytes_full<W: Write>(
     let bitmask = vocab_to_bitmask(&vocab256);
     output.write_all(&bitmask)?;
 
+    let mut predictor = CmixPredictor::new(vocab256.to_vec(), config);
+    for &b in pretrain {
+        for i in (0..8).rev() {
+            predictor.pretrain(((b >> i) & 1) as i32);
+        }
+    }
+
     let sink = WriteSink { w: &mut *output };
-    let mut enc = Encoder::new(sink, CmixPredictor::new(vocab256.to_vec(), config));
+    let mut enc = Encoder::new(sink, predictor);
     for &byte in bytes {
         for i in (0..8).rev() {
             enc.encode(((byte >> i) & 1) as i32);
@@ -205,7 +223,15 @@ pub fn encode_bytes_full<W: Write>(
 /// bitmask after the 8-byte length) so the predictor is reconstructed
 /// identically.
 pub fn decode_full<R: Read, W: Write>(
-    mut input: R, mut output: W, config: Config,
+    input: R, output: W, config: Config,
+) -> IoResult<u64> {
+    decode_full_pretrained(input, output, config, &[])
+}
+
+/// Like [`decode_full`] but pretrains the predictor on `pretrain`
+/// before decoding — must match the encoder's pretrain bytes exactly.
+pub fn decode_full_pretrained<R: Read, W: Write>(
+    mut input: R, mut output: W, config: Config, pretrain: &[u8],
 ) -> IoResult<u64> {
     let mut hdr = [0u8; HEADER_LEN];
     input.read_exact(&mut hdr)?;
@@ -221,8 +247,15 @@ pub fn decode_full<R: Read, W: Write>(
     input.read_exact(&mut vbm)?;
     let vocab256 = vocab_from_bitmask(&vbm);
 
+    let mut predictor = CmixPredictor::new(vocab256.to_vec(), config);
+    for &b in pretrain {
+        for i in (0..8).rev() {
+            predictor.pretrain(((b >> i) & 1) as i32);
+        }
+    }
+
     let src = ReadSource { r: input };
-    let mut dec = Decoder::new(src, CmixPredictor::new(vocab256.to_vec(), config));
+    let mut dec = Decoder::new(src, predictor);
     let mut byte_buf = [0u8; 1];
     for _ in 0..length {
         let mut byte: u8 = 0;
@@ -292,6 +325,41 @@ mod tests {
         decode_full(&encoded[..], &mut decoded, Config::tiny()).unwrap();
         assert_eq!(decoded, plain,
             "orchestrator round-trip must be exact");
+    }
+
+    /// Pretrained round-trip — encoder + decoder both warm their
+    /// predictors on the same English sentence before the payload.
+    /// Round-trip must still be bit-exact.
+    #[test]
+    fn round_trip_orchestrator_tiny_pretrained() {
+        let pretrain = b"the quick brown fox jumps over the lazy dog";
+        let plain    = b"the quick brown fox";
+        let mut encoded = Vec::new();
+        encode_bytes_full_pretrained(plain, &mut encoded,
+            Config::tiny(), pretrain).unwrap();
+        let mut decoded = Vec::new();
+        decode_full_pretrained(&encoded[..], &mut decoded,
+            Config::tiny(), pretrain).unwrap();
+        assert_eq!(decoded, plain);
+    }
+
+    /// Mismatched pretrain corrupts the decode — guards against
+    /// callers silently producing wrong output when one side
+    /// pretrains and the other doesn't.
+    #[test]
+    fn round_trip_pretrained_mismatch_corrupts_decode() {
+        let plain = b"the quick brown fox";
+        let mut encoded = Vec::new();
+        encode_bytes_full_pretrained(plain, &mut encoded,
+            Config::tiny(), b"some pretrain bytes").unwrap();
+        let mut decoded = Vec::new();
+        // Decoder uses empty pretrain → predictor diverges → output
+        // is garbage. We just verify it's not equal (no panic, no
+        // crash; the decoder still produces *length* bytes).
+        decode_full_pretrained(&encoded[..], &mut decoded,
+            Config::tiny(), b"").unwrap();
+        assert_ne!(decoded, plain);
+        assert_eq!(decoded.len(), plain.len());
     }
 
     /// Round-trip with PAQ8 + LSTM ByteMixer enabled (`Config::medium`).

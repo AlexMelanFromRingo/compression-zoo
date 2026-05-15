@@ -434,6 +434,12 @@ pub struct Match {
     cur_byte: u8,
     bit_pos: u8,
     match_length: u8,
+    /// Current `match_length / 32`, refreshed every `byte_update`.
+    /// **Not** a cumulative max — upstream's Match writes this value
+    /// straight into its `*longest_match_` pointer each byte; the
+    /// ContextManager-level max is tracked by the orchestrator (and
+    /// reset to 0 at every byte boundary, per
+    /// `context-manager.cpp:75`).
     pub longest_match: u64,
     limit: i32,
     delta: f32,
@@ -512,8 +518,14 @@ impl Match {
             self.cur_byte = history[self.cur_match as usize];
         }
         self.bit_pos = 128;
-        let match_context = (self.match_length / 32) as u64;
-        if match_context > self.longest_match { self.longest_match = match_context; }
+        // Upstream: `if (match_context > *longest_match_)
+        // *longest_match_ = match_context;` — the pointer aliases
+        // `manager.longest_match_` which is reset to 0 at every byte
+        // boundary, so the effective semantics are "write the
+        // current match_context, max with anything other Match
+        // instances wrote this byte". Here we just store the current
+        // value; the orchestrator does the per-byte max into mgr.
+        self.longest_match = (self.match_length / 32) as u64;
     }
 }
 
