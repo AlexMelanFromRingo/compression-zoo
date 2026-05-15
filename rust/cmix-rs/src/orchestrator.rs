@@ -224,6 +224,16 @@ struct MixerBinding {
     mixer: Mixer,
     /// Context source for the per-mixer key.
     ctx_src: Src,
+    /// Maximum number of extra inputs this mixer reads from the
+    /// per-layer growing `extra_inputs` array — equal to its index
+    /// in `mixers[layer]` at construction time, matching upstream's
+    /// `Mixer(..., mixers_[layer].size())`.
+    extras_cap: usize,
+    /// Snapshot of inputs as seen by the most recent `mix()` —
+    /// replayed at `perceive()` time so `extra_inputs.Clear()` between
+    /// predict and perceive doesn't strip the training signal.
+    last_inputs: Vec<f32>,
+    last_extras: Vec<f32>,
 }
 
 // ============================================================
@@ -316,11 +326,15 @@ impl CmixPredictor {
 
     fn add_mixer(&mut self, layer: usize, ctx_src: Src, learning_rate: f32) {
         let inputs = self.layers[layer].inputs().len();
-        let extras = self.layers[layer].extra_inputs().len();
-        // The MixerInput's per-layer `inputs` size is set later by
-        // `SetNumModels`; we cache the current counts as a hint.
-        let mixer = Mixer::new(inputs.max(1), extras, learning_rate);
-        self.mixers[layer].push(MixerBinding { mixer, ctx_src });
+        // Upstream's `AddMixer` passes `mixers_[layer].size()` as the
+        // extra-input cap — so mixer i in layer L reads exactly the
+        // outputs of the i mixers before it at that layer.
+        let extras_cap = self.mixers[layer].len();
+        let mixer = Mixer::new(inputs.max(1), extras_cap, learning_rate);
+        self.mixers[layer].push(MixerBinding {
+            mixer, ctx_src, extras_cap,
+            last_inputs: Vec::new(), last_extras: Vec::new(),
+        });
     }
 
     // ----------------- AddBracket -----------------
@@ -757,14 +771,21 @@ impl CmixPredictor {
             self.manager.auxiliary_context = (acc * 15.0) as u64;
         }
 
-        // 5) Layer-0 mixer pass.
+        // 5) Layer-0 mixer pass. Each mixer reads layer-0 inputs +
+        // the running `extra_inputs` slice — at mixer index `i`,
+        // exactly `i` prior mixer outputs are visible. Snapshot per
+        // mixer so perceive() can replay the same training signal.
         let l0_inputs: Vec<f32> = self.layers[0].inputs().to_vec();
-        let l0_extras: Vec<f32> = self.layers[0].extra_inputs().to_vec();
-        let mut l0_out: Vec<f32> = Vec::with_capacity(self.mixers[0].len());
         for i in 0..self.mixers[0].len() {
+            let cap = self.mixers[0][i].extras_cap;
+            let extras_now = self.layers[0].extra_inputs();
+            let take = cap.min(extras_now.len());
+            let l0_extras: Vec<f32> = extras_now[..take].to_vec();
             let ctx = self.manager.resolve(self.mixers[0][i].ctx_src);
             let p = self.mixers[0][i].mixer.mix(&l0_inputs, &l0_extras, ctx);
-            l0_out.push(p);
+            // Cache for perceive replay.
+            self.mixers[0][i].last_inputs = l0_inputs.clone();
+            self.mixers[0][i].last_extras = l0_extras;
             self.layers[0].set_extra_input(p);
             self.layers[1].set_stretched_input(i, p);
             self.layers[2].set_stretched_input(i, p);
@@ -781,12 +802,17 @@ impl CmixPredictor {
             self.layers[2].set_stretched_input(aux_offset_2 + i, p);
         }
 
-        // 7) Layer-1 mixer pass.
+        // 7) Layer-1 mixer pass — same per-mixer extras pattern.
         let l1_inputs: Vec<f32> = self.layers[1].inputs().to_vec();
-        let l1_extras: Vec<f32> = self.layers[1].extra_inputs().to_vec();
         for i in 0..self.mixers[1].len() {
+            let cap = self.mixers[1][i].extras_cap;
+            let extras_now = self.layers[1].extra_inputs();
+            let take = cap.min(extras_now.len());
+            let l1_extras: Vec<f32> = extras_now[..take].to_vec();
             let ctx = self.manager.resolve(self.mixers[1][i].ctx_src);
             let p = self.mixers[1][i].mixer.mix(&l1_inputs, &l1_extras, ctx);
+            self.mixers[1][i].last_inputs = l1_inputs.clone();
+            self.mixers[1][i].last_extras = l1_extras;
             self.layers[1].set_extra_input(p);
             self.layers[2].set_stretched_input(self.mixers[0].len() + i, p);
         }
@@ -794,9 +820,14 @@ impl CmixPredictor {
 
         // 8) Layer-2 mixer (only one).
         let l2_inputs: Vec<f32> = self.layers[2].inputs().to_vec();
-        let l2_extras: Vec<f32> = self.layers[2].extra_inputs().to_vec();
+        let cap = self.mixers[2][0].extras_cap;
+        let extras_now = self.layers[2].extra_inputs();
+        let take = cap.min(extras_now.len());
+        let l2_extras: Vec<f32> = extras_now[..take].to_vec();
         let ctx = self.manager.resolve(self.mixers[2][0].ctx_src);
         let raw = self.mixers[2][0].mixer.mix(&l2_inputs, &l2_extras, ctx);
+        self.mixers[2][0].last_inputs = l2_inputs.clone();
+        self.mixers[2][0].last_extras = l2_extras;
         let mut p = Sigmoid::logistic(raw);
 
         // 9) SSE smoothing.
@@ -806,6 +837,33 @@ impl CmixPredictor {
 
         // 10) Byte-mixer override short-circuit.
         if let Some(ov) = self.byte_mixer_override { ov } else { p }
+    }
+
+    // ----------------- Pretrain -----------------
+
+    /// Train only the bit-level model bank on `bit` without writing
+    /// to the arithmetic coder — mirrors upstream `Predictor::Pretrain`
+    /// (predictor.cpp:471-487). Used to warm sub-models on a prefix
+    /// of the input before the encoding pass starts.
+    pub fn pretrain(&mut self, bit: i32) {
+        for i in 0..self.models.len() {
+            let _ = predict_model(&mut self.models[i], &self.manager);
+        }
+        for i in 0..self.models.len() {
+            perceive_model(&mut self.models[i], bit, &mut self.manager);
+        }
+        let byte_update = self.manager.bit_context >= 128;
+        let at_boundary = self.manager.update_bit(bit);
+        self.manager.update_contexts_owned(at_boundary);
+        if byte_update {
+            let just_done_byte = self.manager.bit_context as u8;
+            for i in 0..self.models.len() {
+                byte_update_model(&mut self.models[i], just_done_byte,
+                    &mut self.manager);
+            }
+            self.manager.bit_context = 1;
+            self.manager.long_bit_context = 1;
+        }
     }
 
     // ----------------- Perceive -----------------
@@ -825,17 +883,15 @@ impl CmixPredictor {
             byte_mixer_perceive(bm, bit);
         }
 
-        // 4) Train all three mixer layers.
+        // 4) Train all three mixer layers — each mixer trains on the
+        // exact `(inputs, extras)` snapshot it consumed at mix(), so
+        // the just-cleared layer-0/1 extras don't strip the signal.
         for layer in 0..3 {
             for binding in self.mixers[layer].iter_mut() {
-                // Use the inputs cached during predict() — but we
-                // don't keep them around per-mixer. We can re-derive
-                // from the layer's current inputs (they haven't been
-                // cleared except for extras).
-                let inputs = self.layers[layer].inputs().to_vec();
-                let extras = self.layers[layer].extra_inputs().to_vec();
                 let ctx = self.manager.resolve(binding.ctx_src);
-                binding.mixer.perceive(bit, &inputs, &extras, ctx);
+                binding.mixer.perceive(
+                    bit, &binding.last_inputs, &binding.last_extras, ctx,
+                );
             }
         }
 
@@ -871,6 +927,16 @@ impl CmixPredictor {
             for bm in &mut self.byte_mixers {
                 bm.byte_update(just_done_byte as u32);
             }
+            // Reset bit_context for the NEXT byte before the FXCM
+            // cross-feed runs — `byte_mixer_bit_p` reads bit_context
+            // via `bit_context_range`, which only yields `(0, 255)`
+            // when bit_context == 1. Upstream's `bit_context_ = 1`
+            // happens at the very end of Perceive but its byte_mixer
+            // ->Predict() reads internal bot/top fields (already
+            // reset by ByteMixer::byte_update) so it sees the same
+            // (0, 255) partition.
+            self.manager.bit_context = 1;
+            self.manager.long_bit_context = 1;
         }
         // 10) Byte-mixer output drives FXCM training (upstream
         // `predictor.cpp:462-467`). For each byte_mixer:
@@ -895,14 +961,6 @@ impl CmixPredictor {
             if self.byte_mixers.is_empty() {
                 perceive_model(&mut self.models[fxi], bit, &mut self.manager);
             }
-        }
-
-        // 11) Upstream resets bit_context_ to 1 at byte boundary; my
-        // update_bit already leaves bit_context as the just-completed
-        // byte for byte_update use, so reset it now.
-        if byte_update {
-            self.manager.bit_context = 1;
-            self.manager.long_bit_context = 1;
         }
     }
 }

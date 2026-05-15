@@ -135,9 +135,45 @@ pub fn decode_leveled<R: Read, W: Write>(
 // Full-orchestrator entry points
 // ============================================================
 
+/// Build the 256-bit vocab bitmap from a byte slice — `vocab[i] =
+/// true` iff `bytes` contains byte `i`. Tightening the vocab shrinks
+/// the LSTM ByteMixer (`vocab_size × vocab_size` per layer) and zeros
+/// out impossible byte positions in every byte-aware model. Header
+/// layout for the encoded stream stores the vocab as a 32-byte
+/// bitmask after the length.
+fn discover_vocab(bytes: &[u8]) -> [bool; 256] {
+    let mut v = [false; 256];
+    for &b in bytes { v[b as usize] = true; }
+    // Empty input → default to ASCII so the predictor builds something.
+    if bytes.is_empty() {
+        for i in 0..128 { v[i] = true; }
+    }
+    v
+}
+
+fn vocab_to_bitmask(v: &[bool; 256]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for i in 0..256 {
+        if v[i] { out[i / 8] |= 1 << (i % 8); }
+    }
+    out
+}
+
+fn vocab_from_bitmask(bm: &[u8; 32]) -> [bool; 256] {
+    let mut v = [false; 256];
+    for i in 0..256 {
+        if (bm[i / 8] >> (i % 8)) & 1 != 0 { v[i] = true; }
+    }
+    v
+}
+
+const VOCAB_HEADER_LEN: usize = 32;
+
 /// Encode `bytes` into `output` using the full [`CmixPredictor`]
 /// orchestrator (3-layer mixer tree + SSE + LSTM byte mixer + every
-/// upstream sub-model). Memory profile is set by `config`.
+/// upstream sub-model). Memory profile is set by `config`. The
+/// vocab is derived from `bytes` and written into the header so the
+/// decoder reconstructs an identical predictor.
 pub fn encode_bytes_full<W: Write>(
     bytes: &[u8], output: &mut W, config: Config,
 ) -> IoResult<u64> {
@@ -148,9 +184,12 @@ pub fn encode_bytes_full<W: Write>(
     }
     output.write_all(&hdr)?;
 
-    let vocab = vec![true; 256];
+    let vocab256 = discover_vocab(bytes);
+    let bitmask = vocab_to_bitmask(&vocab256);
+    output.write_all(&bitmask)?;
+
     let sink = WriteSink { w: &mut *output };
-    let mut enc = Encoder::new(sink, CmixPredictor::new(vocab, config));
+    let mut enc = Encoder::new(sink, CmixPredictor::new(vocab256.to_vec(), config));
     for &byte in bytes {
         for i in (0..8).rev() {
             enc.encode(((byte >> i) & 1) as i32);
@@ -162,7 +201,9 @@ pub fn encode_bytes_full<W: Write>(
 
 /// Decode a stream produced by [`encode_bytes_full`]. `config` must
 /// match the encode-time configuration exactly — it is *not* stored
-/// in the header, like upstream cmix.
+/// in the header, like upstream cmix. The vocab IS stored (32-byte
+/// bitmask after the 8-byte length) so the predictor is reconstructed
+/// identically.
 pub fn decode_full<R: Read, W: Write>(
     mut input: R, mut output: W, config: Config,
 ) -> IoResult<u64> {
@@ -176,9 +217,12 @@ pub fn decode_full<R: Read, W: Write>(
             "decoded length implausibly large — likely corrupted header",
         ));
     }
-    let vocab = vec![true; 256];
+    let mut vbm = [0u8; VOCAB_HEADER_LEN];
+    input.read_exact(&mut vbm)?;
+    let vocab256 = vocab_from_bitmask(&vbm);
+
     let src = ReadSource { r: input };
-    let mut dec = Decoder::new(src, CmixPredictor::new(vocab, config));
+    let mut dec = Decoder::new(src, CmixPredictor::new(vocab256.to_vec(), config));
     let mut byte_buf = [0u8; 1];
     for _ in 0..length {
         let mut byte: u8 = 0;

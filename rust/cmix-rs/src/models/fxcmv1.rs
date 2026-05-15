@@ -5037,11 +5037,24 @@ impl Predictor {
             self.block.c4 = (self.block.c4 << 8) + ((self.block.c0 & 0xff) as u32);
             self.block.c0 = 1;
             self.block.blpos += 1;
-            // Failure-tracker rate scheduling (upstream:
-            // `mxA[i].elim` ramped up/down based on `fails & 255`).
-            // Skipped — those parameters are baked into Mixer1 at
-            // construction in our port; live retuning would need a
-            // setter we haven't ported.
+            // Failure-tracker live retuning of mixer elimination
+            // threshold — upstream fxcmv1.cpp:4768-4772:
+            //   good byte: elim = max(256, elim + 1) (floors at 256,
+            //              otherwise monotone up)
+            //   bad  byte: elim = max(0, min(16, elim - 1)) (clamps
+            //              into [0, 16] — large elims snap back to 16)
+            // Affects the first 10 mixers only.
+            if (self.state.fails & 255) == 0 {
+                for i in 0..10 {
+                    let e = self.mixers[i].elim.saturating_add(1);
+                    self.mixers[i].elim = e.max(256);
+                }
+            } else {
+                for i in 0..10 {
+                    let e = self.mixers[i].elim.saturating_sub(1).min(16).max(0);
+                    self.mixers[i].elim = e;
+                }
+            }
             self.state.sscm_rate = if self.block.blpos > 14 * 256 * 1024 { 1 } else { 0 };
             self.state.rate = 6 + (self.block.blpos > 14 * 256 * 1024) as i32
                                 + (self.block.blpos > 28 * 512 * 1024) as i32;
